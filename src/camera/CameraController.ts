@@ -87,6 +87,13 @@ async function acquireStream(): Promise<MediaStream> {
 export function createCameraController(options: CameraControllerOptions): CameraController {
   const { video, fallbackCanvas, onStateChange } = options;
   const fallback: FallbackBackground = createFallbackBackground(fallbackCanvas);
+  // `#glassy-video` and `#glassy-fallback` share the same z-index (see
+  // styles.css) — the fallback canvas is later in DOM order, so it paints on
+  // top of the video. FallbackBackground's canvas is opaque and, once
+  // painted, is never repainted-away by stop() alone, so it must be
+  // explicitly hidden whenever it isn't the active layer or it permanently
+  // occludes the live camera feed.
+  fallbackCanvas.hidden = true;
 
   let state: CameraState = { status: 'idle' };
   let stream: MediaStream | null = null;
@@ -139,8 +146,26 @@ export function createCameraController(options: CameraControllerOptions): Camera
     stopStream();
     video.pause();
     video.srcObject = null;
+    fallbackCanvas.hidden = false;
     fallback.start();
     const next: CameraState = { status: 'fallback', failure };
+    setState(next);
+    return next;
+  }
+
+  /**
+   * Deliberate fallback — the user chose to play without the camera, so we
+   * must NOT call getUserMedia (that would raise the very prompt they
+   * declined). Same teardown as `enterFallback`, but the resulting state
+   * carries no `failure`, because nothing failed.
+   */
+  function useFallback(): CameraState {
+    stopStream();
+    video.pause();
+    video.srcObject = null;
+    fallbackCanvas.hidden = false;
+    fallback.start();
+    const next: CameraState = { status: 'fallback' };
     setState(next);
     return next;
   }
@@ -167,6 +192,7 @@ export function createCameraController(options: CameraControllerOptions): Camera
     }
 
     fallback.stop();
+    fallbackCanvas.hidden = true;
     const next: CameraState = { status: 'live' };
     setState(next);
     return next;
@@ -204,6 +230,7 @@ export function createCameraController(options: CameraControllerOptions): Camera
   function stop(): void {
     suspended = false;
     fallback.stop();
+    fallbackCanvas.hidden = true;
     stopStream();
     video.pause();
     video.srcObject = null;
@@ -262,6 +289,7 @@ export function createCameraController(options: CameraControllerOptions): Camera
       return state;
     },
     start,
+    useFallback,
     stop,
     suspend,
     resume,

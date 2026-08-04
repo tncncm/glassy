@@ -90,6 +90,12 @@ export interface CameraController {
    * fallback has taken over — it never rejects and never throws.
    */
   start(): Promise<CameraState>;
+  /**
+   * Enter fallback deliberately, WITHOUT attempting getUserMedia — the user
+   * chose "play without camera", so no permission prompt may be raised. The
+   * resulting state carries no `failure`: this is a choice, not an error.
+   */
+  useFallback(): CameraState;
   /** Release the track and stop the fallback animation. Idempotent. */
   stop(): void;
   /** Backgrounded / paused: pause playback and the fallback RAF to save power. */

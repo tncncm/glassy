@@ -1,0 +1,432 @@
+/**
+ * App — the ONE state machine in Glassy.
+ *
+ * Camera, game, audio, preferences and UI are dumb collaborators. They never
+ * reach into each other; every interaction is routed through here via the
+ * typed callbacks declared in src/types.ts.
+ *
+ *   loading → home → requestingCamera → playing ⇄ paused ⇄ rotate → gameOver
+ *
+ * `rotate` is an interrupt rather than a peer state: portrait can strike from
+ * `playing` or `paused`, so we remember what to return to (`resumeStateAfterRotate`)
+ * instead of encoding every edge.
+ */
+
+import { createCameraController } from '../camera/CameraController.ts';
+import { createGame } from '../game/Game.ts';
+import { createAudioSystem } from '../game/systems/AudioSystem.ts';
+import { createPreferences } from '../storage/Preferences.ts';
+import {
+  DOM_IDS,
+  type AudioSystem,
+  type CameraController,
+  type CameraState,
+  type Game,
+  type GameOverResult,
+  type Preferences,
+  type SoundName,
+  type UIController,
+  type UIIntents,
+} from '../types.ts';
+import { createUIController } from '../ui/UIController.ts';
+
+/**
+ * Internal app state. Distinct from `ScreenName`: `requestingCamera` is a real
+ * state (getUserMedia is in flight) that shares the `permission` screen, and
+ * `rotate` is an interrupt overlaying whatever we were doing.
+ */
+type AppState =
+  | 'loading'
+  | 'home'
+  | 'requestingCamera'
+  | 'playing'
+  | 'paused'
+  | 'rotate'
+  | 'gameOver';
+
+/**
+ * Below this height in landscape we're almost certainly in portrait on a phone.
+ * Measured, not `screen.orientation` — iOS Safari's orientation APIs are not
+ * dependable and `lock()` is unsupported there entirely.
+ */
+const MIN_LANDSCAPE_ASPECT = 1.0;
+/** Desktop/tablet windows can be tall without being a phone held upright. */
+const ROTATE_PROMPT_MAX_SHORT_EDGE = 820;
+
+export interface App {
+  start(): Promise<void>;
+  destroy(): void;
+}
+
+export async function createApp(root: HTMLElement): Promise<App> {
+  /* ---------------------------------------------------------------- */
+  /* Collaborators                                                     */
+  /* ---------------------------------------------------------------- */
+
+  const video = requireElement<HTMLVideoElement>(DOM_IDS.video);
+  const fallbackCanvas = requireElement<HTMLCanvasElement>(DOM_IDS.fallback);
+  const stage = requireElement<HTMLElement>(DOM_IDS.stage);
+
+  const preferences: Preferences = createPreferences();
+  const audio: AudioSystem = createAudioSystem(preferences.getMuted());
+
+  let state: AppState = 'loading';
+  /** Where to go back to once the device is rotated back to landscape. */
+  let resumeStateAfterRotate: AppState = 'home';
+  /** True once a play gesture has unlocked audio; iOS needs a real gesture. */
+  let audioUnlocked = false;
+  let destroyed = false;
+
+  const ui: UIController = createUIController(root, createIntents());
+
+  const camera: CameraController = createCameraController({
+    video,
+    fallbackCanvas,
+    onStateChange: handleCameraStateChange,
+  });
+
+  const game: Game = await createGame({
+    container: stage,
+    preferences,
+    debug: isDebugEnabled(),
+    callbacks: {
+      onScoreChange(score: number): void {
+        ui.setScore(score);
+      },
+      onGameOver(result: GameOverResult): void {
+        handleGameOver(result);
+      },
+      onSound(name: SoundName): void {
+        audio.play(name);
+      },
+    },
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Intents from the UI                                               */
+  /* ---------------------------------------------------------------- */
+
+  function createIntents(): UIIntents {
+    return {
+      onPlay(): void {
+        // Deliberately context-sensitive: types.ts has no separate "continue"
+        // intent, and the permission screen's Continue button must ITSELF be
+        // the user gesture that calls getUserMedia. So from `home` this only
+        // shows the explainer; from the explainer it actually asks.
+        audio.play('click');
+        unlockAudio();
+        if (state === 'home') {
+          ui.setCameraFailure(null);
+          go('requestingCamera', { requestCamera: false });
+          return;
+        }
+        if (state === 'requestingCamera') {
+          void requestCameraThenPlay();
+        }
+      },
+      onPause(): void {
+        audio.play('click');
+        if (state === 'playing') go('paused');
+      },
+      onResume(): void {
+        audio.play('click');
+        if (state === 'paused') go('playing');
+      },
+      onRestart(): void {
+        audio.play('click');
+        unlockAudio();
+        beginRun();
+      },
+      onQuitToHome(): void {
+        audio.play('click');
+        go('home');
+      },
+      onToggleMute(): void {
+        const muted = !audio.isMuted();
+        audio.setMuted(muted);
+        preferences.setMuted(muted);
+        ui.setMuted(muted);
+        // Played after unmuting so the user gets confirmation it worked.
+        audio.play('click');
+      },
+      onPlayWithoutCamera(): void {
+        audio.play('click');
+        unlockAudio();
+        // Never re-attempt getUserMedia here — the user has explicitly opted
+        // out, and a prompt would be a betrayal of that choice.
+        camera.useFallback();
+        beginRun();
+      },
+      onRetryCamera(): void {
+        audio.play('click');
+        unlockAudio();
+        ui.setCameraFailure(null);
+        void requestCameraThenPlay();
+      },
+    };
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Camera                                                            */
+  /* ---------------------------------------------------------------- */
+
+  async function requestCameraThenPlay(): Promise<void> {
+    go('requestingCamera', { requestCamera: false });
+    // start() never rejects; it resolves with whatever state it reached.
+    const result = await camera.start();
+    if (destroyed) return;
+
+    if (result.status === 'live') {
+      beginRun();
+      return;
+    }
+    // Fallback: stay on the permission screen and explain what happened, so
+    // the user can retry or knowingly continue without the camera.
+    ui.setCameraFailure(result.failure ?? 'unavailable');
+    ui.show('permission');
+  }
+
+  function handleCameraStateChange(next: CameraState): void {
+    // A camera that dies mid-run (unplugged, seized by another app, iOS
+    // reclaiming it) must degrade into a playable game, never a black screen.
+    // The fallback background is already painting by the time we get here.
+    if (next.status === 'fallback' && (state === 'playing' || state === 'paused')) {
+      console.warn('[glassy] camera lost mid-run, continuing on fallback', next.failure);
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Run lifecycle                                                     */
+  /* ---------------------------------------------------------------- */
+
+  function beginRun(): void {
+    ui.setScore(0);
+    if (isPortrait()) {
+      // Start the run anyway but hold it paused behind the rotate prompt, so
+      // rotating back drops straight into play.
+      game.start();
+      game.pause();
+      resumeStateAfterRotate = 'playing';
+      go('rotate');
+      return;
+    }
+    game.start();
+    go('playing');
+  }
+
+  function handleGameOver(result: GameOverResult): void {
+    ui.setBest(result.best);
+    ui.setGameOver(result);
+    go('gameOver');
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* State machine                                                     */
+  /* ---------------------------------------------------------------- */
+
+  function go(next: AppState, options?: { requestCamera: boolean }): void {
+    if (destroyed) return;
+    const previous = state;
+    state = next;
+
+    switch (next) {
+      case 'loading':
+        ui.show('loading');
+        break;
+
+      case 'home':
+        // Leaving a run entirely: stop the game and release the camera so the
+        // hardware indicator goes out while the user sits on the home screen.
+        if (previous === 'playing' || previous === 'paused' || previous === 'gameOver') {
+          game.reset();
+          camera.stop();
+        }
+        ui.setBest(preferences.getBestScore());
+        ui.show('home');
+        break;
+
+      case 'requestingCamera':
+        ui.show('permission');
+        if (options?.requestCamera) void requestCameraThenPlay();
+        break;
+
+      case 'playing':
+        if (previous === 'paused' || previous === 'rotate') {
+          game.resume();
+          void camera.resume();
+        } else if (previous === 'gameOver') {
+          // beginRun() already called game.start() for the fresh run, but the
+          // camera was suspended by go('gameOver') below and is not resumed
+          // by any other path — without this, restarting from the Game Over
+          // screen leaves the live feed frozen on its last frame (or the
+          // fallback animation stopped) for the entire new run.
+          void camera.resume();
+        }
+        ui.show('playing');
+        break;
+
+      case 'paused':
+        game.pause();
+        camera.suspend();
+        ui.show('paused');
+        break;
+
+      case 'rotate':
+        game.pause();
+        ui.show('rotate');
+        break;
+
+      case 'gameOver':
+        camera.suspend();
+        ui.show('gameOver');
+        break;
+    }
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Orientation, visibility, resize                                   */
+  /* ---------------------------------------------------------------- */
+
+  function isPortrait(): boolean {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    if (w >= h * MIN_LANDSCAPE_ASPECT) return false;
+    // A tall desktop window is not a phone held upright — don't nag.
+    return Math.min(w, h) <= ROTATE_PROMPT_MAX_SHORT_EDGE;
+  }
+
+  function handleOrientation(): void {
+    if (destroyed) return;
+    const portrait = isPortrait();
+
+    if (portrait && (state === 'playing' || state === 'paused')) {
+      resumeStateAfterRotate = state;
+      go('rotate');
+      return;
+    }
+    if (!portrait && state === 'rotate') {
+      go(resumeStateAfterRotate === 'paused' ? 'paused' : 'playing');
+    }
+  }
+
+  function handleResize(): void {
+    if (destroyed) return;
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    game.resize(width, height);
+    camera.resize(width, height);
+    handleOrientation();
+  }
+
+  function handleVisibility(): void {
+    if (destroyed) return;
+    if (document.hidden) {
+      audio.suspend();
+      camera.suspend();
+      // Auto-pause a live run rather than letting the player die offscreen.
+      if (state === 'playing') go('paused');
+      return;
+    }
+    audio.resume();
+    // Only wake the camera where it's actually on screen. `paused` deliberately
+    // stays suspended until the user resumes.
+    if (state === 'playing') void camera.resume();
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Helpers                                                           */
+  /* ---------------------------------------------------------------- */
+
+  function unlockAudio(): void {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    // Fire-and-forget: unlock() never throws, and a browser without audio must
+    // not block the game from starting.
+    void audio.unlock();
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Wiring                                                            */
+  /* ---------------------------------------------------------------- */
+
+  const orientationQuery = window.matchMedia('(orientation: portrait)');
+
+  window.addEventListener('resize', handleResize);
+  window.addEventListener('orientationchange', handleResize);
+  orientationQuery.addEventListener('change', handleOrientation);
+  document.addEventListener('visibilitychange', handleVisibility);
+
+  async function start(): Promise<void> {
+    ui.setMuted(audio.isMuted());
+    ui.setBest(preferences.getBestScore());
+    ui.setScore(0);
+    handleResize();
+
+    // Opportunistic only — unsupported on iOS Safari and must never be
+    // load-bearing. The measured rotate screen is the real mechanism.
+    tryLockLandscape();
+
+    go('loading');
+    // One frame of loading so the shell paints before the home screen lands.
+    await nextFrame();
+    if (destroyed) return;
+    go('home');
+  }
+
+  function destroy(): void {
+    if (destroyed) return;
+    destroyed = true;
+    window.removeEventListener('resize', handleResize);
+    window.removeEventListener('orientationchange', handleResize);
+    orientationQuery.removeEventListener('change', handleOrientation);
+    document.removeEventListener('visibilitychange', handleVisibility);
+    game.destroy();
+    camera.stop();
+    audio.dispose();
+  }
+
+  return { start, destroy };
+}
+
+/* ------------------------------------------------------------------ */
+/* Module-level helpers                                                */
+/* ------------------------------------------------------------------ */
+
+function requireElement<T extends Element>(id: string): T {
+  const element = document.getElementById(id);
+  if (!element) throw new Error(`[glassy] missing required element #${id}`);
+  return element as unknown as T;
+}
+
+function nextFrame(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    requestAnimationFrame(() => resolve());
+  });
+}
+
+/** Dev-only: `?debug` or `#debug` turns on the in-canvas FPS readout. */
+function isDebugEnabled(): boolean {
+  try {
+    return (
+      new URLSearchParams(window.location.search).has('debug') ||
+      window.location.hash === '#debug'
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `screen.orientation.lock()` is unsupported on iOS Safari and rejects on most
+ * desktop browsers. Purely opportunistic — every failure is swallowed.
+ */
+function tryLockLandscape(): void {
+  try {
+    const orientation = screen.orientation as ScreenOrientation & {
+      lock?: (o: string) => Promise<void>;
+    };
+    void orientation.lock?.('landscape').catch(() => {});
+  } catch {
+    /* not supported — the rotate screen handles it */
+  }
+}

@@ -15,7 +15,10 @@ export default defineConfig({
   plugins: [
     VitePWA({
       registerType: 'autoUpdate',
-      injectRegister: 'auto',
+      // `null`, not 'auto': main.ts registers via `virtual:pwa-register` so a
+      // registration failure can be caught explicitly instead of surfacing as
+      // an unhandled rejection. 'auto' would double-register.
+      injectRegister: null,
       // No dev-mode service worker: it only ever gets in the way of the
       // dev server's own HMR/live reload, and `npm run dev` must stay fast.
       devOptions: {
