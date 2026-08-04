@@ -2,11 +2,41 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, user-scalable=no"
+    />
     <title>Glassy</title>
+    <meta name="description" content="A tiny endless runner that plays on top of your car window." />
+
+    <meta name="theme-color" content="#05060a" />
+
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Glassy" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
+    <!-- Layer 0: live camera feed, or the animated no-camera gradient. -->
+    <video
+      id="glassy-video"
+      playsinline
+      muted
+      autoplay
+      disablepictureinpicture
+    ></video>
+    <canvas id="glassy-fallback"></canvas>
+
+    <!-- Layer 1: transparent PixiJS canvas is appended here by the game layer. -->
+    <div id="glassy-stage"></div>
+
+    <!-- Layer 2: all DOM screens. -->
     <div id="glassy-ui"></div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>
