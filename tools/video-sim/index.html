@@ -36,7 +36,8 @@
       const ctx = overlay.getContext('2d');
 
       /** Everything observed, drained by the Node runner at the end. */
-      const log = { horizon: [], detections: [], detectorStates: [], errors: [] };
+      const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [] };
+      let tracked = [];
       window.__simLog = log;
       window.__simDone = false;
 
@@ -62,7 +63,26 @@
           ctx.fillText(`horizon ${h.y.toFixed(2)} conf ${h.confidence.toFixed(2)}`, 6, h.y * overlay.height - 5);
         }
 
-        // Detections.
+        // Tracked objects — the thing platforms are actually built from.
+        for (const o of tracked) {
+          const x = (o.x - o.width / 2) * overlay.width;
+          const y = (o.y - o.height / 2) * overlay.height;
+          const w = o.width * overlay.width;
+          const hh = o.height * overlay.height;
+          ctx.strokeStyle = o.stable ? '#39ff88' : 'rgba(255,255,255,0.35)';
+          ctx.lineWidth = o.stable ? 3 : 1;
+          ctx.setLineDash(o.stable ? [] : [4, 4]);
+          ctx.strokeRect(x, y, w, hh);
+          ctx.setLineDash([]);
+          if (o.stable) {
+            ctx.fillStyle = '#39ff88';
+            ctx.fillRect(x, y - 3, w, 4);       // the landing surface
+            ctx.font = 'bold 12px monospace';
+            ctx.fillText(`#${o.id} ${o.kind}`, x + 3, y - 8);
+          }
+        }
+
+        // Raw detections.
         for (const d of latest) {
           const x = (d.x - d.width / 2) * overlay.width;
           const y = (d.y - d.height / 2) * overlay.height;
@@ -84,11 +104,22 @@
         if (!window.__simDone) requestAnimationFrame(draw);
       }
 
+      const MODE = new URLSearchParams(location.search).get('mode') === 'windscreen'
+        ? 'windscreen' : 'window';
       const analyser = createSceneAnalyser({ video, sampleHz: 6 });
       const detector = createObjectDetector({
         video,
+        mode: MODE,
         sampleHz: 4,
         onStateChange: (s) => log.detectorStates.push({ t: video.currentTime, ...s }),
+        onTrackedObjects: (objs) => {
+          tracked = objs.map((o) => ({ ...o }));
+          for (const o of tracked) {
+            log.tracked.push({ t: +video.currentTime.toFixed(2), id: o.id, kind: o.kind,
+              x: +o.x.toFixed(3), y: +o.y.toFixed(3), w: +o.width.toFixed(3),
+              h: +o.height.toFixed(3), stable: o.stable });
+          }
+        },
         onDetections: (dets) => {
           // The array is reused — copy what we keep.
           latest = dets.map((d) => ({ ...d }));

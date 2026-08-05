@@ -31,6 +31,7 @@ const flag = (name, fallback) => {
 const playbackRate = flag('rate', 1);
 const maxSeconds = flag('seconds', 60);
 const shotCount = flag('shots', 8);
+const mode = args.includes('--windscreen') ? 'windscreen' : 'window';
 
 if (!videoArg) {
   console.error('Usage: node tools/video-sim/run.mjs <video.mp4> [--rate 2] [--seconds 60]');
@@ -76,7 +77,7 @@ const page = await (await browser.newContext({ viewport: { width: 1280, height: 
 page.on('pageerror', (e) => console.error('  page error:', e.message));
 page.on('console', (m) => { if (m.type() === 'error') console.error('  console:', m.text().slice(0, 200)); });
 
-await page.goto(`${base}/tools/video-sim/index.html`, { waitUntil: 'load' });
+await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}`, { waitUntil: 'load' });
 
 const meta = await page.evaluate(
   ([src, rate]) => window.__simStart(src, rate),
@@ -150,5 +151,21 @@ if (Object.keys(byKind).length === 0) {
 }
 if (log.errors?.length) console.log(`\n  page errors: ${log.errors.slice(0, 5).join(' | ')}`);
 
+// Tracking report
+const tracked = log.tracked ?? [];
+const ids = new Map();
+for (const t of tracked) {
+  const e = ids.get(t.id) ?? { n: 0, stable: 0, kind: t.kind, first: t.t, last: t.t };
+  e.n++; if (t.stable) e.stable++; e.last = t.t; ids.set(t.id, e);
+}
+console.log('\n══════════ TRACKING (' + mode + ') ══════════');
+console.log(`  oggetti distinti     : ${ids.size}`);
+const stableIds = [...ids.entries()].filter(([, e]) => e.stable > 0);
+console.log(`  di cui STABILI       : ${stableIds.length}  (usabili come piattaforma)`);
+const durations = stableIds.map(([, e]) => e.last - e.first).sort((a, b) => b - a);
+if (durations.length) {
+  console.log(`  durata traccia stabile: max ${durations[0].toFixed(1)}s  mediana ${durations[Math.floor(durations.length/2)].toFixed(1)}s`);
+  console.log(`  tracce >2s            : ${durations.filter((d) => d > 2).length}`);
+}
 console.log(`\nAnnotated frames: ${outDir}/frame-*.png`);
 console.log(`Raw log:          ${outDir}/log.json`);
