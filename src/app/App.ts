@@ -25,11 +25,15 @@ import {
   type GameOverResult,
   type Preferences,
   type SoundName,
+  type Detection,
+  type DetectorState,
+  type ObjectDetector,
   type SceneAnalyser,
   type UIController,
   type UIIntents,
 } from '../types.ts';
 import { createUIController } from '../ui/UIController.ts';
+import { createObjectDetector } from '../vision/ObjectDetector.ts';
 import { createSceneAnalyser } from '../vision/SceneAnalyser.ts';
 
 /**
@@ -103,6 +107,23 @@ export async function createApp(root: HTMLElement): Promise<App> {
   const scene: SceneAnalyser = createSceneAnalyser({ video });
   /** Pushes the latest estimate into the game. The game decides whether to use it. */
   let horizonTimer: number | null = null;
+
+  /**
+   * Optional on-device object detection. Opt-in, default off: it costs a
+   * multi-megabyte download and real battery, so it is never turned on for
+   * someone who didn't ask. Everything about the game works without it.
+   */
+  const detector: ObjectDetector = createObjectDetector({
+    video,
+    onStateChange(next: DetectorState): void {
+      ui.setDetectorState(next);
+    },
+    onDetections(detections: readonly Detection[]): void {
+      // The array is reused by the detector — hand it straight on, and the
+      // game reads it synchronously. Neither side retains it.
+      game.onSceneDetections(detections);
+    },
+  });
 
   const game: Game = await createGame({
     container: stage,
@@ -186,6 +207,24 @@ export async function createApp(root: HTMLElement): Promise<App> {
         ui.setCameraFailure(null);
         void requestCameraThenPlay();
       },
+      onToggleVision(): void {
+        audio.play('click');
+        const enabled = !preferences.getVisionEnabled();
+        preferences.setVisionEnabled(enabled);
+        if (!enabled) {
+          detector.stop();
+          ui.setDetectorState({ status: 'disabled' });
+          return;
+        }
+        // Prefetch immediately rather than waiting for the first run. Two
+        // reasons: a ~16MB download should not begin the moment the player
+        // taps Play, and without it the toggle would sit visually "off" until
+        // a camera run started, which reads as broken. start() then stop()
+        // loads the model without leaving inference running.
+        void detector.start().then(() => {
+          if (!destroyed) syncDetector();
+        });
+      },
     };
   }
 
@@ -237,9 +276,33 @@ export async function createApp(root: HTMLElement): Promise<App> {
     game.setHorizonHint(estimate.y, estimate.confidence);
   }
 
+  /**
+   * Detection runs only when the user opted in AND we're actually playing with
+   * a live camera. Same rule as the horizon analyser: no frames are examined
+   * for any state where there's no gameplay reason to examine them.
+   */
+  function syncDetector(): void {
+    if (!preferences.getVisionEnabled()) {
+      detector.stop();
+      return;
+    }
+    // Stop only when there is something to stop: a live camera we're not
+    // playing over. With no live camera the detector cannot read a frame
+    // anyway (it skips every tick), so leaving it loaded costs nothing and
+    // keeps the opt-in toggle showing the state the user actually chose.
+    if (camera.state.status === 'live' && state !== 'playing') {
+      detector.stop();
+      return;
+    }
+    void detector.start();
+  }
+
   function handleCameraStateChange(next: CameraState): void {
     // A camera that drops out must also stop the analyser.
-    if (next.status !== 'live') syncSceneAnalysis();
+    if (next.status !== 'live') {
+      syncSceneAnalysis();
+      syncDetector();
+    }
     // A camera that dies mid-run (unplugged, seized by another app, iOS
     // reclaiming it) must degrade into a playable game, never a black screen.
     // The fallback background is already painting by the time we get here.
@@ -337,6 +400,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
 
     // Every transition re-evaluates whether we should be reading frames at all.
     syncSceneAnalysis();
+    syncDetector();
   }
 
   /* ---------------------------------------------------------------- */
@@ -418,6 +482,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.setScore(0);
     // Only nag where it's the only option and isn't already done.
     ui.setInstallHintVisible(isIPhoneSafari() && !isStandalone());
+    // Reflect the stored opt-in without starting a download on load.
+    ui.setDetectorState({ status: preferences.getVisionEnabled() ? 'idle' : 'disabled' });
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be
@@ -439,6 +505,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     orientationQuery.removeEventListener('change', handleOrientation);
     document.removeEventListener('visibilitychange', handleVisibility);
     scene.stop();
+    detector.dispose();
     if (horizonTimer !== null) {
       window.clearInterval(horizonTimer);
       horizonTimer = null;

@@ -4,13 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "dev": "npm run vision-assets && vite",
+    "build": "npm run vision-assets && tsc --noEmit && vite build",
+    "vision-assets": "node scripts/fetch-vision-assets.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "generate-icons": "node scripts/generate-icons.mjs"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
     "pixi.js": "^8.6.6"
   },
   "devDependencies": {

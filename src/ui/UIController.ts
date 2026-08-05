@@ -8,6 +8,8 @@
 
 import type {
   CameraFailure,
+  DetectorState,
+  DetectorStatus,
   GameOverResult,
   ScreenName,
   UIController,
@@ -62,6 +64,23 @@ const MUTE_LABEL_OFF = 'Unmute sound';
 const MUTE_ICON_ON = '\u{1F50A}'; // speaker
 const MUTE_ICON_OFF = '\u{1F507}'; // muted speaker
 
+const VISION_TITLE = 'Spot real things out the window';
+const VISION_DESC = 'On-device AI: one-time ~9 MB download, more battery.';
+const VISION_ARIA_LABEL =
+  'Spot real things out the window. Uses on-device AI: one-time about 9 megabyte download, more battery. Off by default.';
+const VISION_ICON = '\u{1F50D}'; // magnifying glass
+
+/**
+ * Whether the opt-in toggle should render as ON. `idle` (never asked to
+ * load) and `disabled` (user switched it off) both read as OFF; `loading`,
+ * `ready` and `unavailable` all mean the user opted in — `unavailable` is a
+ * failed *attempt*, not an off state, so the switch stays on and the status
+ * line explains what happened.
+ */
+function isVisionOn(status: DetectorStatus): boolean {
+  return status === 'loading' || status === 'ready' || status === 'unavailable';
+}
+
 function requireElement<T extends Element>(root: ParentNode, selector: string): T {
   const el = root.querySelector<T>(selector);
   if (!el) {
@@ -88,7 +107,29 @@ const TEMPLATE = `
         <span class="safety-line__icon" aria-hidden="true">⚠️</span>
         <span>Passenger use only. Do not use while driving.</span>
       </div>
-      <p class="privacy-line">Your camera is the backdrop. Glassy reads a heavily shrunken frame a few times a second, on this device only, to guess where the horizon is and line the ground up with it. Frames are never recorded, uploaded or stored, and nothing leaves your phone.</p>
+      <p class="privacy-line">Your camera is the backdrop — shown live on your screen, never recorded. Glassy looks at the picture only on your phone, to find the horizon and, if you turn it on below, to spot real things like cars and signs. Nothing is ever uploaded or sent anywhere — no frame and no detection is ever stored. The detection model downloads once to your phone and runs there; there's no server.</p>
+      <div class="vision" data-role="vision">
+        <button
+          type="button"
+          class="vision__toggle"
+          data-action="toggle-vision"
+          data-vision-button
+          aria-pressed="false"
+          aria-label="${VISION_ARIA_LABEL}"
+        >
+          <span class="vision__switch" aria-hidden="true"></span>
+          <span class="vision__copy">
+            <span class="vision__title">${VISION_TITLE}</span>
+            <span class="vision__desc">${VISION_DESC}</span>
+          </span>
+        </button>
+        <p class="vision__status" data-role="vision-status" hidden>
+          <span data-role="vision-status-text"></span>
+        </p>
+        <div class="vision__progress" data-role="vision-progress" hidden aria-hidden="true">
+          <div class="vision__progress-fill" data-role="vision-progress-fill"></div>
+        </div>
+      </div>
       <div class="home__actions">
         <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
         <button type="button" class="btn btn--icon home__mute" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
@@ -104,7 +145,7 @@ const TEMPLATE = `
       <div class="permission__state" data-state="pre-request">
         <div class="permission__icon" aria-hidden="true">\u{1F4F7}</div>
         <h2 class="permission__title">Camera as a backdrop</h2>
-        <p class="permission__body">Glassy uses your rear camera as a live backdrop behind the game. It also reads a tiny, blurred-down version of the picture a few times a second — entirely on this device — to find the horizon and align the ground with it. Nothing is recorded, saved, or sent anywhere.</p>
+        <p class="permission__body">Glassy uses your rear camera as a live backdrop behind the game. It looks at the picture only on your phone — to find the horizon and, if you turned on real-world detection, to spot things like cars and signs. Nothing is ever recorded, saved or sent anywhere: no frame and no detection ever leaves your phone, and there's no server for it to reach.</p>
         <div class="btn-row">
           <button type="button" class="btn btn--primary" data-action="continue">Continue</button>
         </div>
@@ -153,7 +194,10 @@ const TEMPLATE = `
         <button type="button" class="btn btn--secondary" data-action="restart">Restart</button>
         <button type="button" class="btn btn--secondary" data-action="quit">Quit to home</button>
       </div>
-      <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
+      <div class="btn-row">
+        <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
+        <button type="button" class="btn btn--icon" data-action="toggle-vision" data-vision-button aria-pressed="false" aria-label="${VISION_ARIA_LABEL}">${VISION_ICON}</button>
+      </div>
     </div>
   </div>
 
@@ -204,12 +248,19 @@ class GlassyUIController implements UIController {
   private readonly retryButtonEl: HTMLElement;
 
   private readonly muteButtons: HTMLButtonElement[];
+  private readonly visionButtons: HTMLButtonElement[];
+  private readonly visionStatusEl: HTMLElement;
+  private readonly visionStatusTextEl: HTMLElement;
+  private readonly visionProgressEl: HTMLElement;
+  private readonly visionProgressFillEl: HTMLElement;
 
   private currentScreen: ScreenName = 'loading';
   private lastScore = -1;
   private lastBest = -1;
   private lastMuted: boolean | null = null;
   private hasCameraFailure = false;
+  private lastDetectorStatus: DetectorStatus | null = null;
+  private lastDetectorProgress: number | null = null;
 
   constructor(root: HTMLElement, intents: UIIntents) {
     this.root = root;
@@ -248,6 +299,13 @@ class GlassyUIController implements UIController {
     this.muteButtons = Array.from(
       this.root.querySelectorAll<HTMLButtonElement>('[data-mute-button]'),
     );
+    this.visionButtons = Array.from(
+      this.root.querySelectorAll<HTMLButtonElement>('[data-vision-button]'),
+    );
+    this.visionStatusEl = requireElement(this.root, '[data-role="vision-status"]');
+    this.visionStatusTextEl = requireElement(this.root, '[data-role="vision-status-text"]');
+    this.visionProgressEl = requireElement(this.root, '[data-role="vision-progress"]');
+    this.visionProgressFillEl = requireElement(this.root, '[data-role="vision-progress-fill"]');
 
     this.focusTargets = {
       loading: null,
@@ -271,6 +329,7 @@ class GlassyUIController implements UIController {
 
     this.applyScreen(this.currentScreen);
     this.setMuted(false);
+    this.setDetectorState({ status: 'idle' });
     this.setupViewportGuard();
   }
 
@@ -335,6 +394,60 @@ class GlassyUIController implements UIController {
     // changed under the active screen — refresh focus if we're on it.
     if (this.currentScreen === 'permission') {
       this.applyScreen('permission');
+    }
+  }
+
+  setDetectorState(state: DetectorState): void {
+    const progress = state.progress ?? null;
+    if (state.status === this.lastDetectorStatus && progress === this.lastDetectorProgress) {
+      return;
+    }
+    this.lastDetectorStatus = state.status;
+    this.lastDetectorProgress = progress;
+
+    const on = isVisionOn(state.status);
+    for (const btn of this.visionButtons) {
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+
+    switch (state.status) {
+      case 'loading': {
+        this.visionStatusEl.removeAttribute('hidden');
+        this.visionProgressEl.removeAttribute('hidden');
+        if (progress !== null) {
+          const pct = Math.round(Math.min(1, Math.max(0, progress)) * 100);
+          this.visionStatusTextEl.textContent = `Downloading on-device AI… ${pct}%`;
+          this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+          this.visionProgressFillEl.style.width = `${pct}%`;
+        } else {
+          // No progress figure yet — show real motion, never a fabricated number.
+          this.visionStatusTextEl.textContent = 'Downloading on-device AI…';
+          this.visionProgressEl.classList.add('vision__progress--indeterminate');
+          this.visionProgressFillEl.style.width = '';
+        }
+        break;
+      }
+      case 'ready':
+        this.visionStatusEl.removeAttribute('hidden');
+        this.visionProgressEl.setAttribute('hidden', '');
+        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        this.visionStatusTextEl.textContent = 'On-device AI ready.';
+        break;
+      case 'unavailable':
+        this.visionStatusEl.removeAttribute('hidden');
+        this.visionProgressEl.setAttribute('hidden', '');
+        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        this.visionStatusTextEl.textContent =
+          "Detection couldn't start — the game plays normally without it.";
+        break;
+      case 'idle':
+      case 'disabled':
+        this.visionStatusEl.setAttribute('hidden', '');
+        this.visionProgressEl.setAttribute('hidden', '');
+        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        break;
+      default:
+        break;
     }
   }
 
@@ -412,6 +525,9 @@ class GlassyUIController implements UIController {
         break;
       case 'toggle-mute':
         this.intents.onToggleMute();
+        break;
+      case 'toggle-vision':
+        this.intents.onToggleVision();
         break;
       case 'play-without-camera-pre':
       case 'play-without-camera-fail':

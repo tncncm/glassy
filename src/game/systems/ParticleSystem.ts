@@ -23,6 +23,10 @@ import {
   PARTICLE_GRAVITY,
   PARTICLE_POOL_SIZE,
   PARTICLE_RADIUS,
+  PICKUP_PARTICLE_COUNT,
+  PICKUP_PARTICLE_LIFETIME_SECONDS,
+  PICKUP_PARTICLE_SPEED_MAX,
+  PICKUP_PARTICLE_SPEED_MIN,
   SLAM_PARTICLE_COLOR,
   SLAM_PARTICLE_COUNT,
   SLAM_PARTICLE_LIFETIME_SECONDS,
@@ -127,6 +131,23 @@ export class ParticleSystem {
       const vx = Math.cos(angle) * speed;
       const vy = Math.sin(angle) * speed * SLAM_PARTICLE_VERTICAL_SQUASH;
       this.activate(slot, x, y, vx, vy, SLAM_PARTICLE_LIFETIME_SECONDS, SLAM_PARTICLE_COLOR);
+    }
+  }
+
+  /** Small upward-biased sparkle at (x, y) in a caller-supplied `color` —
+   * used for pickup collection (collectible/power-up). Kept as a separate
+   * method rather than overloading spawnDust/spawnBurst because those two
+   * bake in their own fixed palettes (DUST_COLOR, COLLISION_COLOR_A/B);
+   * this one needs a different color per pickup kind. */
+  spawnSparkle(x: number, y: number, color: number): void {
+    for (let i = 0; i < PICKUP_PARTICLE_COUNT; i++) {
+      const slot = this.acquire();
+      if (!slot) return;
+      const angle = randomRange(0, Math.PI * 2);
+      const speed = randomRange(PICKUP_PARTICLE_SPEED_MIN, PICKUP_PARTICLE_SPEED_MAX);
+      const vx = Math.cos(angle) * speed;
+      const vy = Math.sin(angle) * speed - PICKUP_PARTICLE_SPEED_MIN;
+      this.activate(slot, x, y, vx, vy, PICKUP_PARTICLE_LIFETIME_SECONDS, color);
     }
   }
 

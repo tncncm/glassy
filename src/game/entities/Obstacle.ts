@@ -12,6 +12,9 @@ import {
   OBSTACLE_COLOR_OUTLINE,
   OBSTACLE_COLOR_OVERHEAD,
   OBSTACLE_COLOR_SPIKE,
+  OBSTACLE_COLOR_VEHICLE_ACCENT,
+  OBSTACLE_COLOR_VEHICLE_BODY,
+  OBSTACLE_COLOR_VEHICLE_WHEEL,
   OBSTACLE_COLOR_WIDE,
   OBSTACLE_CORNER_RADIUS,
   OVERHEAD_HAZARD_TOOTH_WIDTH,
@@ -25,8 +28,14 @@ import { OVERHEAD_HAZARD_CLEARANCE_PX } from '../util/solvability.ts';
  * `overhead` — hangs down from off-screen-top to a fixed clearance above the
  * ground line, cleared by staying grounded; anchored to the ground line from
  * its BOTTOM edge instead of its top (see `setPosition`).
+ * `vehicle` — a `vehicle`-scene-detection-requested hazard (see
+ * ObstacleSystem.requestVehicle); jump-clearable exactly like block/spike
+ * (same solvability envelope, see OBSTACLE_VEHICLE_SIZE_BIAS_MIN in
+ * config.ts) but drawn bulkier and in a distinct palette so it visually
+ * reads as "a real vehicle rolled in", not just a recoloured block.
+ * Ground-anchored like block/spike/wide.
  */
-export type ObstacleShape = 'block' | 'spike' | 'wide' | 'overhead';
+export type ObstacleShape = 'block' | 'spike' | 'wide' | 'overhead' | 'vehicle';
 
 export class Obstacle {
   public readonly view: Graphics = new Graphics();
@@ -90,6 +99,9 @@ export class Obstacle {
       case 'overhead':
         drawOverheadHazard(this.view, width, height);
         break;
+      case 'vehicle':
+        drawVehicleHazard(this.view, width, height);
+        break;
       default:
         break;
     }
@@ -143,4 +155,35 @@ function drawOverheadHazard(view: Graphics, width: number, height: number): void
   view.lineTo(width, height).lineTo(0, height).fill({ color: OBSTACLE_COLOR_OVERHEAD });
 
   view.roundRect(0, 0, width, height, OBSTACLE_CORNER_RADIUS).stroke({ width: 2, color: OBSTACLE_COLOR_OUTLINE });
+}
+
+/** Bulky vehicle silhouette: body + a cab-window accent band + two wheel
+ * discs peeking below the body line — reads unmistakably as "a vehicle"
+ * next to the plain rounded rects/triangle of the other ground-anchored
+ * kinds, at any of the sizes this shape can spawn at (see
+ * OBSTACLE_VEHICLE_SIZE_BIAS_MIN in config.ts). Drawn once per spawn in
+ * `reset()`, same as every other shape. */
+function drawVehicleHazard(view: Graphics, width: number, height: number): void {
+  view
+    .roundRect(0, 0, width, height, OBSTACLE_CORNER_RADIUS)
+    .fill({ color: OBSTACLE_COLOR_VEHICLE_BODY })
+    .stroke({ width: 2, color: OBSTACLE_COLOR_OUTLINE });
+
+  // Cab-window accent band toward the trailing (right) side.
+  const bandLeft = width * 0.6;
+  const bandWidth = width * 0.3;
+  view
+    .roundRect(bandLeft, height * 0.14, bandWidth, height * 0.42, 2)
+    .fill({ color: OBSTACLE_COLOR_VEHICLE_ACCENT, alpha: 0.85 });
+
+  // Wheels peeking below the body's bottom edge, resting on the ground line.
+  const wheelRadius = Math.min(height * 0.24, width * 0.16);
+  const wheelY = height - wheelRadius * 0.4;
+  view
+    .circle(width * 0.26, wheelY, wheelRadius)
+    .fill({ color: OBSTACLE_COLOR_VEHICLE_WHEEL })
+    .stroke({ width: 1.5, color: OBSTACLE_COLOR_OUTLINE })
+    .circle(width * 0.78, wheelY, wheelRadius)
+    .fill({ color: OBSTACLE_COLOR_VEHICLE_WHEEL })
+    .stroke({ width: 1.5, color: OBSTACLE_COLOR_OUTLINE });
 }

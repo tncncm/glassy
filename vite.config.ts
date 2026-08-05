@@ -61,6 +61,11 @@ export default defineConfig({
         // itself. No wildcards onto anything network-shaped: there is no
         // backend, so runtimeCaching would just be dead config.
         globPatterns: ['**/*.{js,css,html,svg,png,ico,webmanifest}'],
+        // The MediaPipe wasm runtime and detector model are ~16MB and are only
+        // ever fetched by users who opt into detection. Precaching them would
+        // force that download on EVERY install, including people who never turn
+        // it on. They are served immutable and cached by the HTTP layer instead.
+        globIgnores: ['**/vision/**'],
         cleanupOutdatedCaches: true,
         clientsClaim: true,
         skipWaiting: true,

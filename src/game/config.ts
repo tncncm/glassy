@@ -344,6 +344,106 @@ export const WIDE_OBSTACLE_MAX_WIDTH_CAP = 170;
 export const OVERHEAD_CLEARANCE_MARGIN_PX = 10;
 
 /* ------------------------------------------------------------------ */
+/* Scene-detection-driven spawns                                       */
+/*                                                                      */
+/* Object detection (src/vision/ObjectDetector.ts) is a FLAVOUR input,  */
+/* never a spawn command — see Game.ts#onSceneDetections. A detection   */
+/* only ever REQUESTS a themed shape/kind; the existing pooled systems  */
+/* (ObstacleSystem for `vehicle`, PickupSystem below for `person`/      */
+/* `sign`) still decide *when* anything actually spawns, on exactly the */
+/* same solvability-derived cadence they already used before this      */
+/* feature existed. That's what makes "detection off => byte-identical  */
+/* gameplay" true almost for free: with zero requests queued, both      */
+/* systems fall back to their pre-existing behaviour untouched.         */
+/* ------------------------------------------------------------------ */
+
+/** Detections below this confidence are ignored outright — a low-score
+ * false positive (e.g. a shadow briefly read as a "sign") must never be
+ * allowed to spawn anything. */
+export const DETECTION_MIN_SCORE = 0.55;
+
+/** Per-`DetectedKind` debounce, seconds. The detector samples at ~3Hz and
+ * the same real-world object is typically visible for many samples in a
+ * row, so without this a truck sitting in frame for two seconds would
+ * queue a hazard request on nearly every sample. Only the first accepted
+ * detection of a kind within this window becomes a spawn request; this
+ * alone bounds even a pathological 20-detections-in-one-second burst (any
+ * mix of kinds) to at most one accepted request per kind — at most 3
+ * total, since there are only 3 `DetectedKind`s. */
+export const DETECTION_KIND_COOLDOWN_SECONDS = 3.5;
+
+/** Max requests allowed to sit queued, waiting for the next solvability-
+ * safe obstacle spawn slot, before further requests of that kind are
+ * simply dropped. Small on purpose: this is a second, independent cap on
+ * top of the cooldown above, not the primary defence against a burst. */
+export const DETECTION_VEHICLE_QUEUE_CAP = 2;
+export const DETECTION_PICKUP_QUEUE_CAP = 1;
+
+/* --- `vehicle` → hazard ------------------------------------------------ */
+
+/** A detection-requested `vehicle` hazard is sized within the SAME
+ * solvability-derived envelope as `block`/`spike` — see
+ * maxClearableObstacleWidth/maxClearableObstacleHeight in
+ * util/solvability.ts — so it is always jump-clearable, never a free
+ * pass. It's biased toward the upper portion of that envelope (rather
+ * than sampled across the full range like block/spike) so it reads as
+ * "bulkier", matching a real vehicle's bulk, while never exceeding the
+ * width/height a jump can already handle. Expressed as a fraction so it
+ * stays correct at any world speed without re-deriving anything. */
+export const OBSTACLE_VEHICLE_SIZE_BIAS_MIN = 0.55;
+
+export const OBSTACLE_COLOR_VEHICLE_BODY = 0x4a5568;
+export const OBSTACLE_COLOR_VEHICLE_ACCENT = 0xff6b4a;
+export const OBSTACLE_COLOR_VEHICLE_WHEEL = 0x1a1f26;
+
+/* --- `person` → collectible, `sign` → power-up ------------------------- */
+
+export const PICKUP_POOL_SIZE = 8;
+export const PICKUP_RADIUS_COLLECTIBLE = 13;
+export const PICKUP_RADIUS_POWERUP = 15;
+
+/** Minimum world-space px between one pickup spawn and the next, so two
+ * requests queued close together (e.g. a person then a sign inside the
+ * same debounce window) never spawn stacked on each other. Deliberately
+ * NOT derived from jump kinematics like minSafeGap: missing a pickup has
+ * no failure consequence, so this is a legibility choice, not a safety
+ * one — pickups never go through the same solvability gate hazards do
+ * because they cannot end the run. */
+export const PICKUP_MIN_SPACING_PX = 260;
+
+export const PICKUP_SPAWN_MARGIN = 30;
+export const PICKUP_DESPAWN_MARGIN = 80;
+
+/** Float height above the ground line, as a fraction of the primary
+ * jump's apex height (see PRIMARY_JUMP_ARC in util/solvability.ts) so a
+ * pickup always sits somewhere a full jump COULD reach — self-adjusting
+ * if JUMP_VELOCITY/GRAVITY are ever retuned, same philosophy as every
+ * other derived bound in this file. Purely a "worth chasing" placement
+ * choice, not a solvability requirement, since skipping a pickup is safe. */
+export const PICKUP_HEIGHT_APEX_FRACTION_MIN = 0.2;
+export const PICKUP_HEIGHT_APEX_FRACTION_MAX = 0.78;
+
+export const PICKUP_COLLECTIBLE_COLOR = 0xff6ec7;
+export const PICKUP_COLLECTIBLE_OUTLINE = 0x5c1440;
+export const PICKUP_POWERUP_COLOR = 0x5be8ff;
+export const PICKUP_POWERUP_OUTLINE = 0x0c3542;
+/** Small contrasting bolt icon drawn on the power-up — visual shorthand
+ * for "dash recharge" (see POWERUP_SCORE_BONUS and Player.grantDashRecharge). */
+export const PICKUP_POWERUP_BOLT_COLOR = 0x0c3542;
+
+/** Flat score bonus on pickup. Collectible pays more than the power-up
+ * because the power-up's main value is the dash recharge itself, not the
+ * points — see the choice rationale in Game.ts#onSceneDetections' doc. */
+export const COLLECTIBLE_SCORE_BONUS = 35;
+export const POWERUP_SCORE_BONUS = 15;
+
+/** Gentle bobbing so pickups read as floating collectibles, not static
+ * geometry — purely cosmetic, layered on top of the world-scroll x
+ * movement every frame; not a per-frame allocation (just a phase field). */
+export const PICKUP_BOB_SPEED = 3.2;
+export const PICKUP_BOB_AMPLITUDE_PX = 6;
+
+/* ------------------------------------------------------------------ */
 /* Particles                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -366,6 +466,15 @@ export const COLLISION_COLOR_B = 0xffce45;
 export const PARTICLE_GRAVITY = 900;
 /** Per-second velocity damping factor (higher = particles slow down faster). */
 export const PARTICLE_DRAG_PER_SECOND = 2.4;
+
+/** Pickup-collection sparkle (see ParticleSystem.spawnSparkle) — shared
+ * count/speed/lifetime for both pickup kinds; the caller supplies the color
+ * (PICKUP_COLLECTIBLE_COLOR / PICKUP_POWERUP_COLOR below) so this stays one
+ * set of tunables instead of two near-duplicates. */
+export const PICKUP_PARTICLE_COUNT = 10;
+export const PICKUP_PARTICLE_SPEED_MIN = 60;
+export const PICKUP_PARTICLE_SPEED_MAX = 220;
+export const PICKUP_PARTICLE_LIFETIME_SECONDS = 0.45;
 
 /* ------------------------------------------------------------------ */
 /* Screen shake                                                        */

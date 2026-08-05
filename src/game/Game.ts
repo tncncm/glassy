@@ -12,15 +12,18 @@
  */
 
 import { Application, Container, Graphics, Text } from 'pixi.js';
-import type { CreateGame, Game, GameOptions, GameOverResult, GameStatus } from '../types.ts';
+import type { CreateGame, Detection, Game, GameOptions, GameOverResult, GameStatus } from '../types.ts';
 import {
   BASE_WORLD_SPEED,
+  COLLECTIBLE_SCORE_BONUS,
   COLLISION_SHAKE_TRAUMA,
   DASH_THROUGH_BONUS_SCORE,
   DASH_THROUGH_SHAKE_TRAUMA,
   DEBUG_TEXT_COLOR,
   DEBUG_TEXT_SIZE,
   DEBUG_TEXT_UPDATE_INTERVAL_SECONDS,
+  DETECTION_KIND_COOLDOWN_SECONDS,
+  DETECTION_MIN_SCORE,
   GROUND_LERP_RATE,
   GROUND_LINE_ALPHA,
   GROUND_LINE_COLOR,
@@ -36,8 +39,11 @@ import {
   HORIZON_HINT_LOCKOUT_SECONDS,
   HORIZON_HINT_MIN_CONFIDENCE,
   MAX_WORLD_SPEED,
+  PICKUP_COLLECTIBLE_COLOR,
+  PICKUP_POWERUP_COLOR,
   PLAYER_HEIGHT,
   PLAYER_X_FRACTION,
+  POWERUP_SCORE_BONUS,
   SCORE_MILESTONE_STEP,
   SCORE_PER_SECOND_AT_BASE_SPEED,
   SHAKE_DECAY_RATE,
@@ -50,6 +56,7 @@ import { GameLoop } from './GameLoop.ts';
 import { InputSystem } from './systems/InputSystem.ts';
 import { ObstacleSystem } from './systems/ObstacleSystem.ts';
 import { ParticleSystem } from './systems/ParticleSystem.ts';
+import { PickupSystem } from './systems/PickupSystem.ts';
 import { aabbOverlap, clamp, expDecay, lerp } from './util/math.ts';
 
 /** Off-screen margin used to size the ground-line rects so they always
@@ -92,11 +99,13 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
 
   const groundGraphics = new Graphics();
   const obstacleLayer = new Container();
+  const pickupLayer = new Container();
   const particleLayer = new Container();
   const player = new Player();
-  worldContainer.addChild(groundGraphics, obstacleLayer, player.view, particleLayer);
+  worldContainer.addChild(groundGraphics, obstacleLayer, pickupLayer, player.view, particleLayer);
 
   const obstacles = new ObstacleSystem(obstacleLayer);
+  const pickups = new PickupSystem(pickupLayer);
   const particles = new ParticleSystem(particleLayer);
 
   let debugText: Text | null = null;
@@ -128,6 +137,14 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   /** Counts down after any manual ground-line change; the hint is ignored
    * entirely while positive — the player's own placement always wins. */
   let horizonLockoutTimer = 0;
+
+  // --- Scene detection state (see onSceneDetections on the returned Game
+  // below) — one independent debounce timer per DetectedKind, so a truck
+  // sitting in frame doesn't re-request a hazard every ~3Hz sample. Reset
+  // to 0 on every fresh run so detections are immediately available again.
+  let vehicleDetectionCooldown = 0;
+  let personDetectionCooldown = 0;
+  let signDetectionCooldown = 0;
 
   function groundTargetPx(): number {
     return groundYTargetFraction * canvasHeight;
@@ -225,7 +242,37 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     // farm; the only score effect of dashing is the explicit bonus below).
     const effectiveWorldSpeed = baseWorldSpeed * player.dashSpeedMultiplier;
     obstacles.update(dt, effectiveWorldSpeed, canvasWidth, groundY);
+    pickups.update(dt, effectiveWorldSpeed, canvasWidth, groundY);
     particles.update(dt);
+
+    // Per-kind scene-detection debounce timers — see onSceneDetections.
+    if (vehicleDetectionCooldown > 0) vehicleDetectionCooldown = Math.max(0, vehicleDetectionCooldown - dt);
+    if (personDetectionCooldown > 0) personDetectionCooldown = Math.max(0, personDetectionCooldown - dt);
+    if (signDetectionCooldown > 0) signDetectionCooldown = Math.max(0, signDetectionCooldown - dt);
+
+    // Pickups REWARD rather than kill — checked independently of the hazard
+    // collision pass below (and regardless of dash invulnerability, which
+    // has nothing to do with picking something up). Iterated backward
+    // because pickups.remove() swap-pops the active array.
+    const activePickups = pickups.activePickups;
+    for (let i = activePickups.length - 1; i >= 0; i--) {
+      const pickup = activePickups[i]!;
+      if (
+        aabbOverlap(player.left, player.top, player.right, player.bottom, pickup.left, pickup.top, pickup.right, pickup.bottom)
+      ) {
+        if (pickup.shape === 'collectible') {
+          scoreAccumulator += COLLECTIBLE_SCORE_BONUS;
+          particles.spawnSparkle(pickup.x, pickup.y, PICKUP_COLLECTIBLE_COLOR);
+          callbacks.onSound('score');
+        } else {
+          player.grantDashRecharge();
+          scoreAccumulator += POWERUP_SCORE_BONUS;
+          particles.spawnSparkle(pickup.x, pickup.y, PICKUP_POWERUP_COLOR);
+          callbacks.onSound('dash');
+        }
+        pickups.remove(i);
+      }
+    }
 
     const active = obstacles.activeObstacles;
     let collided = false;
@@ -306,7 +353,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         const fps = dt > 0 ? 1 / dt : 0;
         debugText.text =
           `fps ${fps.toFixed(0)}  score ${scoreInt}  speed ${effectiveWorldSpeed.toFixed(0)}` +
-          `  obstacles ${active.length}  ground ${groundY.toFixed(0)}`;
+          `  obstacles ${active.length}  pickups ${activePickups.length}  ground ${groundY.toFixed(0)}`;
       }
     }
 
@@ -363,11 +410,15 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       groundY = groundTargetPx();
       player.resetToIdle(groundY);
       obstacles.reset();
+      pickups.reset();
       particles.reset();
       shakeTrauma = 0;
       worldContainer.x = 0;
       worldContainer.y = 0;
       groundGraphics.y = groundY;
+      vehicleDetectionCooldown = 0;
+      personDetectionCooldown = 0;
+      signDetectionCooldown = 0;
       status = 'running';
       loop.start();
     },
@@ -390,6 +441,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       scoreAccumulator = 0;
       scoreInt = 0;
       obstacles.reset();
+      pickups.reset();
       particles.reset();
       shakeTrauma = 0;
       worldContainer.x = 0;
@@ -397,6 +449,9 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       groundY = groundTargetPx();
       groundGraphics.y = groundY;
       player.resetToIdle(groundY);
+      vehicleDetectionCooldown = 0;
+      personDetectionCooldown = 0;
+      signDetectionCooldown = 0;
       app.render();
     },
 
@@ -412,6 +467,75 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       // that ever reads these two fields.
       horizonHintFraction = y;
       horizonHintConfidence = confidence;
+    },
+
+    /**
+     * Scene detection is a FLAVOUR input, never a spawn command — see the
+     * "Scene-detection-driven spawns" section of config.ts. This method
+     * only ever does two things per accepted detection: (1) start that
+     * DetectedKind's debounce timer, and (2) hand a themed REQUEST to the
+     * relevant pooled system (ObstacleSystem.requestVehicle /
+     * PickupSystem.requestCollectible / requestPowerup). Those systems
+     * decide entirely on their own — via the same solvability-derived
+     * cadence (ObstacleSystem) or spacing cadence (PickupSystem) they
+     * already used before this feature existed — whether and when a
+     * request actually turns into a spawn. That's what guarantees a burst
+     * of detections can never produce a burst of spawns, and what makes
+     * "detection off" byte-identical to the pre-detection game: with zero
+     * requests ever queued, both systems just fall back to their original
+     * behaviour.
+     *
+     * `vehicle` → ObstacleSystem hazard (jump-clearable, bulkier palette).
+     * `person` → PickupSystem collectible (chased for a score bonus).
+     * `sign` → PickupSystem power-up. Chosen effect: an INSTANT DASH
+     * RECHARGE (Player.grantDashRecharge), not a shield or score
+     * multiplier. Rationale: the existing moveset's only defensive/offense
+     * tool beyond jump/slam is the dash (brief invulnerability + a
+     * dash-through bonus for `wide` obstacles) gated by
+     * DASH_COOLDOWN_SECONDS — a shield would just be a second, redundant
+     * flavour of invulnerability, and a score multiplier doesn't interact
+     * with player *action* at all. Recharging the dash on demand instead
+     * removes exactly the cooldown friction the existing dash-ready
+     * indicator already visualises, so the reward is legible immediately
+     * (the indicator dot flips to its ready cyan the same frame) and it
+     * directly feeds the pre-existing DASH_THROUGH_BONUS_SCORE loop rather
+     * than adding an unrelated mechanic.
+     *
+     * Safe to call in ANY GameStatus — a single field read (`status`) and
+     * an early return covers idle/paused/over, since nothing here should
+     * act while the loop isn't stepping. Cheap and allocation-free: a
+     * plain indexed `for` loop and primitive comparisons only; `detections`
+     * is read synchronously and never retained past this call, per the
+     * `Game` interface's contract.
+     */
+    onSceneDetections(detections: readonly Detection[]): void {
+      if (status !== 'running') return;
+      for (let i = 0; i < detections.length; i++) {
+        const detection = detections[i]!;
+        if (detection.score < DETECTION_MIN_SCORE) continue;
+        switch (detection.kind) {
+          case 'vehicle':
+            if (vehicleDetectionCooldown <= 0) {
+              obstacles.requestVehicle();
+              vehicleDetectionCooldown = DETECTION_KIND_COOLDOWN_SECONDS;
+            }
+            break;
+          case 'person':
+            if (personDetectionCooldown <= 0) {
+              pickups.requestCollectible();
+              personDetectionCooldown = DETECTION_KIND_COOLDOWN_SECONDS;
+            }
+            break;
+          case 'sign':
+            if (signDetectionCooldown <= 0) {
+              pickups.requestPowerup();
+              signDetectionCooldown = DETECTION_KIND_COOLDOWN_SECONDS;
+            }
+            break;
+          default:
+            break;
+        }
+      }
     },
 
     destroy(): void {

@@ -12,6 +12,7 @@
 
 import type { Container } from 'pixi.js';
 import {
+  DETECTION_VEHICLE_QUEUE_CAP,
   GAP_RANDOM_EXTRA_MAX,
   GAP_RANDOM_EXTRA_MIN,
   OBSTACLE_DESPAWN_MARGIN,
@@ -20,6 +21,7 @@ import {
   OBSTACLE_MIN_WIDTH,
   OBSTACLE_POOL_SIZE,
   OBSTACLE_SPAWN_MARGIN,
+  OBSTACLE_VEHICLE_SIZE_BIAS_MIN,
   OBSTACLE_WEIGHT_BLOCK,
   OBSTACLE_WEIGHT_OVERHEAD,
   OBSTACLE_WEIGHT_SPIKE,
@@ -44,6 +46,13 @@ export class ObstacleSystem {
   private readonly pool: Obstacle[] = [];
   private readonly active: Obstacle[] = [];
   private distanceToNextSpawn = OBSTACLE_INITIAL_SPAWN_DISTANCE;
+  /** Queued `vehicle`-scene-detection requests, capped at
+   * DETECTION_VEHICLE_QUEUE_CAP — see that constant's comment in config.ts.
+   * Consumed one at a time by `spawn()`, which otherwise falls back to the
+   * ordinary weighted `pickShape()`; `vehicle` never appears in
+   * `pickShape()`'s own weights, so with zero requests queued this system's
+   * behaviour is byte-identical to before scene detection existed. */
+  private pendingVehicle = 0;
 
   constructor(container: Container) {
     for (let i = 0; i < OBSTACLE_POOL_SIZE; i++) {
@@ -70,6 +79,14 @@ export class ObstacleSystem {
     }
     this.active.length = 0;
     this.distanceToNextSpawn = OBSTACLE_INITIAL_SPAWN_DISTANCE;
+    this.pendingVehicle = 0;
+  }
+
+  /** Queue a `vehicle`-scene-detection hazard request. Debounced upstream
+   * in Game.ts (per-DetectedKind cooldown) — this only additionally caps
+   * how many can pile up waiting for a solvability-safe spawn slot. */
+  requestVehicle(): void {
+    this.pendingVehicle = Math.min(DETECTION_VEHICLE_QUEUE_CAP, this.pendingVehicle + 1);
   }
 
   update(dt: number, worldSpeed: number, canvasWidth: number, groundY: number): void {
@@ -103,12 +120,37 @@ export class ObstacleSystem {
       return;
     }
 
-    const shape = pickShape();
+    // A queued detection request always wins over the random weighted pick
+    // — it is still gated by the very same solvability envelope as
+    // block/spike below (case 'vehicle'), it just skips the dice roll for
+    // *which* shape spawns this cycle. `pickShape()` never produces
+    // 'vehicle' on its own, so with nothing queued this is exactly the
+    // pre-existing random pick.
+    let shape: ObstacleShape;
+    if (this.pendingVehicle > 0) {
+      this.pendingVehicle--;
+      shape = 'vehicle';
+    } else {
+      shape = pickShape();
+    }
     let width: number;
     let height: number;
     let topY: number;
 
     switch (shape) {
+      case 'vehicle': {
+        // Same envelope as block/spike (jump-clearable), biased toward the
+        // upper portion of it so it reads as bulkier — see
+        // OBSTACLE_VEHICLE_SIZE_BIAS_MIN's comment in config.ts.
+        const maxWidth = maxClearableObstacleWidth(worldSpeed);
+        const minWidth = OBSTACLE_MIN_WIDTH + (maxWidth - OBSTACLE_MIN_WIDTH) * OBSTACLE_VEHICLE_SIZE_BIAS_MIN;
+        width = randomRange(Math.min(minWidth, maxWidth), maxWidth);
+        const maxHeight = maxClearableObstacleHeight(width, worldSpeed);
+        const minHeight = OBSTACLE_MIN_HEIGHT + (maxHeight - OBSTACLE_MIN_HEIGHT) * OBSTACLE_VEHICLE_SIZE_BIAS_MIN;
+        height = randomRange(Math.min(minHeight, maxHeight), maxHeight);
+        topY = groundY - height;
+        break;
+      }
       case 'wide': {
         const minWidth = minWideObstacleWidth(worldSpeed);
         const maxWidth = Math.max(minWidth, maxDashClearableObstacleWidth(worldSpeed));

@@ -11,11 +11,17 @@ object detection** — those would need external assets and blow the frame budge
 
 Primary target: **iPhone Safari + installed iOS PWA, landscape**. Secondary: Chrome, Edge, Android Chrome.
 
-## Stack — fixed, do not expand
+## Stack — fixed, do not expand further
 
-Vite · TypeScript (strict) · PixiJS v8 · vite-plugin-pwa. No backend, no login, no cloud, no
-analytics, no React, no game engine, no physics engine, no state library. Plain TypeScript and
-DOM APIs. All visuals are Pixi primitives and all audio is synthesised — **zero external media assets**.
+Vite · TypeScript (strict) · PixiJS v8 · vite-plugin-pwa · **`@mediapipe/tasks-vision`**.
+No backend, no login, no cloud, no analytics, no React, no game engine, no physics engine, no
+state library. Plain TypeScript and DOM APIs. All visuals are Pixi primitives and all audio is
+synthesised.
+
+**Asset rule (relaxed 2026-08-05, once and deliberately):** the ONLY permitted binary assets are
+the MediaPipe vision wasm runtime and the EfficientDet-Lite0 int8 detector model, both
+**self-hosted from `public/`** — never a CDN, never fetched from Google at runtime. No images,
+no fonts, no audio files, no other models. Everything else stays procedural.
 
 ## Commands
 
@@ -29,12 +35,17 @@ npm run preview    # serve dist/
 
 ## Non-negotiable invariants
 
-- **Privacy:** camera frames are **read on-device only**, and only by
-  `src/vision/SceneAnalyser.ts`, which downscales to a few dozen pixels, reduces to per-row
-  gradient sums, and discards the pixels the same tick. Nothing is recorded, uploaded,
-  transmitted or persisted — no frame, crop, thumbnail or fingerprint may outlive the current
-  tick. `localStorage` holds only `bestScore` and `muted`. Nothing else is persisted, ever.
-  If this boundary moves again, the user-facing privacy copy must change first.
+- **Privacy:** camera frames are **read and analysed on-device only**, by `src/vision/**` —
+  a tiny gradient pass for the horizon, and an EfficientDet-Lite0 detector that returns object
+  labels and boxes. **Inference is local; there is no network call in the inference path and no
+  backend to call.** Nothing is recorded, uploaded, transmitted or persisted: no frame, crop,
+  thumbnail, embedding, fingerprint or detection result may outlive the current tick, and no
+  detection is ever written to storage. `localStorage` holds only `bestScore`, `muted` and
+  `visionEnabled`. Nothing else is persisted, ever.
+  **If this boundary moves again, the user-facing privacy copy must change first.**
+- **Detection is strictly additive.** The game must play identically well with detection off,
+  unsupported, still downloading, or failing. It only *flavours* what spawns; it never gates
+  the loop, and detection-driven spawns still go through `util/solvability.ts`.
 - **Safety copy:** the home screen must always carry "Passenger use only. Do not use while driving."
   Nothing in the UI may imply driver use is safe.
 - **Camera permission** is requested only from a direct user gesture, after Play — never on load.

@@ -208,6 +208,18 @@ export class Player {
     this.dashRequested = true;
   }
 
+  /** Instantly clears the dash cooldown — the effect of the `sign`-
+   * detection power-up (see PickupSystem / Game.ts). A no-op-ish call if
+   * dash is already ready (cooldown can't go negative); the indicator is
+   * re-synced immediately so a "ready" cyan reads the very same frame the
+   * pickup was collected, not one frame later. Deliberately does NOT touch
+   * dashBoost/dashInvulnTimer — this recharges the *resource*, it doesn't
+   * trigger a dash itself. */
+  grantDashRecharge(): void {
+    this.dashCooldownTimer = 0;
+    this.syncDashIndicator();
+  }
+
   /** Buffers a slam request; consumed on the next update(). A no-op there if
    * the player has since landed (or was never airborne) — callers should
    * still gate on `isGrounded` themselves so the gesture never even reaches

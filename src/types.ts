@@ -42,6 +42,13 @@ export interface Preferences {
   setBestScore(score: number): number;
   getMuted(): boolean;
   setMuted(muted: boolean): void;
+  /**
+   * Whether the user has opted into on-device object detection. Defaults to
+   * FALSE: it costs a multi-megabyte download and real battery, so it must be
+   * a deliberate choice, never a default-on surprise.
+   */
+  getVisionEnabled(): boolean;
+  setVisionEnabled(enabled: boolean): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -159,6 +166,81 @@ export interface SceneAnalyser {
 }
 
 /* ------------------------------------------------------------------ */
+/* Object detection — src/vision/ObjectDetector.ts                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The subset of EfficientDet-Lite0's COCO labels Glassy reacts to. Everything
+ * else the model reports is discarded immediately.
+ */
+export type DetectedKind =
+  /** car, truck, bus, motorcycle → a hazard rolls in */
+  | 'vehicle'
+  /** person, bicycle → a collectible */
+  | 'person'
+  /** traffic light, stop sign, parking meter, bench → a power-up */
+  | 'sign';
+
+/**
+ * One detection, normalised. Positions are 0..1 fractions of the frame so the
+ * game never has to know the model's input resolution.
+ */
+export interface Detection {
+  kind: DetectedKind;
+  /** Centre of the box, 0..1 of frame width/height. */
+  x: number;
+  y: number;
+  /** Box size, 0..1. */
+  width: number;
+  height: number;
+  /** Model confidence, 0..1. */
+  score: number;
+}
+
+export type DetectorStatus =
+  /** Never asked to load. */
+  | 'idle'
+  /** Fetching the wasm runtime and model. Can take a while on mobile data. */
+  | 'loading'
+  /** Loaded and inferring. */
+  | 'ready'
+  /** Deliberately switched off by the user. */
+  | 'disabled'
+  /** Browser can't run it, or loading failed. The game is unaffected. */
+  | 'unavailable';
+
+export interface DetectorState {
+  status: DetectorStatus;
+  /** 0..1 while `loading`, for the UI. */
+  progress?: number;
+}
+
+export interface ObjectDetectorOptions {
+  video: HTMLVideoElement;
+  /** Inferences per second. Keep low — this is a neural net on a phone. */
+  sampleHz?: number;
+  onStateChange?: (state: DetectorState) => void;
+  /**
+   * Fires per accepted detection, at most a few times a second. The array is
+   * REUSED between calls — read it synchronously, never retain it.
+   */
+  onDetections?: (detections: readonly Detection[]) => void;
+}
+
+export interface ObjectDetector {
+  readonly state: DetectorState;
+  /**
+   * Download the runtime + model and begin inferring. Never rejects: failure
+   * lands in `unavailable` and the game carries on. Safe to call twice.
+   */
+  start(): Promise<DetectorState>;
+  /** Stop inferring. Keeps the loaded model so a restart is instant. */
+  stop(): void;
+  /** Stop and release the model entirely. */
+  dispose(): void;
+}
+
+/* ------------------------------------------------------------------ */
 /* Audio — src/game/systems/AudioSystem.ts                             */
 /* ------------------------------------------------------------------ */
 
@@ -242,6 +324,14 @@ export interface Game {
    * whatever the player last chose.
    */
   setHorizonHint(y: number | null, confidence: number): void;
+  /**
+   * Something real was spotted out the window. The game MAY turn this into a
+   * themed spawn — a hazard, a collectible, a power-up — but it is free to
+   * ignore it, and MUST keep every spawn inside the solvability envelope. The
+   * array is reused by the caller: read it synchronously, never retain it.
+   * Never required for the game to function.
+   */
+  onSceneDetections(detections: readonly Detection[]): void;
   /** Tear down Pixi and remove all listeners. */
   destroy(): void;
 }
@@ -281,6 +371,8 @@ export interface UIIntents {
   onPlayWithoutCamera(): void;
   /** Permission screen → try getUserMedia again. */
   onRetryCamera(): void;
+  /** The user flipped the on-device object-detection opt-in. */
+  onToggleVision(): void;
 }
 
 export interface UIController {
@@ -298,6 +390,11 @@ export interface UIController {
   setCameraFailure(failure: CameraFailure | null): void;
   /** Dev-only FPS readout; ignored when the debug flag is off. */
   setDebugText(text: string): void;
+  /**
+   * Reflect the detector in the UI: the opt-in toggle's position, and a
+   * download//status line while `loading` or after failure.
+   */
+  setDetectorState(state: DetectorState): void;
   /**
    * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
    * the Fullscreen API does not exist and installing the PWA is the only way
