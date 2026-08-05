@@ -13,6 +13,7 @@
  */
 
 import { createCameraController } from '../camera/CameraController.ts';
+import { attachDevVideo, devVideoSource } from '../dev/videoBackdrop.ts';
 import { createGame } from '../game/Game.ts';
 import { createAudioSystem } from '../game/systems/AudioSystem.ts';
 import { createPreferences } from '../storage/Preferences.ts';
@@ -92,6 +93,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
   /** True once a play gesture has unlocked audio; iOS needs a real gesture. */
   let audioUnlocked = false;
   let destroyed = false;
+  /** Dev-only: true when a recorded clip is standing in for the camera. */
+  let usingDevVideo = false;
 
   const ui: UIController = createUIController(root, createIntents());
 
@@ -237,6 +240,27 @@ export async function createApp(root: HTMLElement): Promise<App> {
 
   async function requestCameraThenPlay(): Promise<void> {
     go('requestingCamera', { requestCamera: false });
+
+    // Dev-only: ?video=<path> plays over a recorded clip instead of the
+    // camera, so the vision stack can be judged on real footage.
+    //
+    // The `import.meta.env.DEV` test must be the OUTER guard, written
+    // literally like this: Vite substitutes it with `false` in a production
+    // build, so Rollup eliminates the whole branch and then tree-shakes
+    // videoBackdrop.ts away entirely. Testing a runtime helper instead would
+    // leave the dev code sitting in the shipped bundle.
+    if (import.meta.env.DEV) {
+      const devSrc = devVideoSource();
+      if (devSrc) {
+        usingDevVideo = await attachDevVideo(video, fallbackCanvas, devSrc);
+        if (destroyed) return;
+        if (usingDevVideo) {
+          beginRun();
+          return;
+        }
+      }
+    }
+
     // start() never rejects; it resolves with whatever state it reached.
     const result = await camera.start();
     if (destroyed) return;
@@ -271,8 +295,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
     //
     // The game still treats this as a hint only: a manual drag overrides it
     // for 4s and low confidence is ignored.
-    const shouldRun =
-      HORIZON_HINT_ENABLED && state === 'playing' && camera.state.status === 'live';
+    const liveSource = camera.state.status === 'live' || usingDevVideo;
+    const shouldRun = HORIZON_HINT_ENABLED && state === 'playing' && liveSource;
     if (shouldRun) {
       scene.start();
       if (horizonTimer === null) {
@@ -308,7 +332,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     // playing over. With no live camera the detector cannot read a frame
     // anyway (it skips every tick), so leaving it loaded costs nothing and
     // keeps the opt-in toggle showing the state the user actually chose.
-    if (camera.state.status === 'live' && state !== 'playing') {
+    if ((camera.state.status === 'live' || usingDevVideo) && state !== 'playing') {
       detector.stop();
       return;
     }
