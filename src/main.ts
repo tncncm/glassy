@@ -3,6 +3,12 @@
  * Every recoverable failure below degrades instead of crashing.
  */
 
+// MUST be imported before anything touches Pixi. By default Pixi generates
+// shader-sync code with `new Function()`, which our Content-Security-Policy
+// forbids (script-src has no 'unsafe-eval' — see nginx-security-headers.conf).
+// This module swaps in runtime polyfills instead, so the CSP stays strict
+// rather than being weakened to accommodate the renderer.
+import 'pixi.js/unsafe-eval';
 import { registerSW } from 'virtual:pwa-register';
 import { createApp } from './app/App.ts';
 import { DOM_IDS } from './types.ts';
