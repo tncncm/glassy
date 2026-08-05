@@ -107,6 +107,58 @@ export interface CameraController {
 }
 
 /* ------------------------------------------------------------------ */
+/* Scene analysis — src/vision/SceneAnalyser.ts                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * PRIVACY — the boundary moved here, read carefully.
+ *
+ * As of the horizon feature, Glassy DOES read camera frames. It draws the
+ * <video> into a tiny offscreen canvas (a few dozen pixels wide), reduces it to
+ * per-row gradient sums, and discards the pixels immediately. That is the whole
+ * extent of it:
+ *
+ *   - nothing is recorded, uploaded, transmitted or persisted — there is no
+ *     backend to send it to and no code that could
+ *   - no frame, and no image derived from one, ever reaches localStorage
+ *   - the only values that survive a single animation frame are a couple of
+ *     numbers: an estimated horizon height and a confidence
+ *   - analysis stops whenever the camera is suspended or stopped
+ *
+ * If you add anything here that keeps a frame, a crop, a thumbnail or a
+ * fingerprint beyond the current tick, the user-facing privacy copy in
+ * `UIController` becomes a lie. Change the copy first, or don't do it.
+ */
+export interface HorizonEstimate {
+  /**
+   * Estimated horizon as a 0..1 fraction of frame height, or `null` when no
+   * row stood out enough to be worth trusting.
+   */
+  y: number | null;
+  /** 0..1. Consumers should ignore estimates below their own threshold. */
+  confidence: number;
+}
+
+export interface SceneAnalyserOptions {
+  /** The live camera element. Never mutated, only sampled. */
+  video: HTMLVideoElement;
+  /** Analyses per second. Keep low — this competes with the render loop. */
+  sampleHz?: number;
+}
+
+export interface SceneAnalyser {
+  /** Begin sampling. Safe to call twice; a no-op without a live video. */
+  start(): void;
+  /** Stop sampling and drop the working buffers. Idempotent. */
+  stop(): void;
+  /**
+   * Latest estimate. A cheap field read — safe to call every frame. Returns a
+   * stable object; never allocates.
+   */
+  readonly horizon: HorizonEstimate;
+}
+
+/* ------------------------------------------------------------------ */
 /* Audio — src/game/systems/AudioSystem.ts                             */
 /* ------------------------------------------------------------------ */
 
@@ -116,7 +168,9 @@ export type SoundName =
   | 'collide'
   | 'score'
   | 'gameOver'
-  | 'click';
+  | 'click'
+  | 'dash'
+  | 'slam';
 
 export interface AudioSystem {
   /**
@@ -180,6 +234,14 @@ export interface Game {
   reset(): void;
   /** Viewport changed. */
   resize(width: number, height: number): void;
+  /**
+   * Suggest where the running surface should sit, as a 0..1 fraction of screen
+   * height, from the camera's estimated horizon. This is a HINT, not a command:
+   * a recent player drag always wins, and the game is free to ignore a
+   * low-confidence estimate. `null` means "no usable estimate" — revert to
+   * whatever the player last chose.
+   */
+  setHorizonHint(y: number | null, confidence: number): void;
   /** Tear down Pixi and remove all listeners. */
   destroy(): void;
 }

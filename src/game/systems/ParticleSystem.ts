@@ -23,6 +23,12 @@ import {
   PARTICLE_GRAVITY,
   PARTICLE_POOL_SIZE,
   PARTICLE_RADIUS,
+  SLAM_PARTICLE_COLOR,
+  SLAM_PARTICLE_COUNT,
+  SLAM_PARTICLE_LIFETIME_SECONDS,
+  SLAM_PARTICLE_SPEED_MAX,
+  SLAM_PARTICLE_SPEED_MIN,
+  SLAM_PARTICLE_VERTICAL_SQUASH,
 } from '../config.ts';
 import { randomRange } from '../util/math.ts';
 
@@ -104,6 +110,23 @@ export class ParticleSystem {
       const vy = Math.sin(angle) * speed;
       const color = i % 2 === 0 ? COLLISION_COLOR_A : COLLISION_COLOR_B;
       this.activate(slot, x, y, vx, vy, COLLISION_LIFETIME_SECONDS, color);
+    }
+  }
+
+  /** Flattened, evenly-spaced ring at (x, y) — the slam landing shockwave.
+   * Unlike `spawnBurst`'s random full-circle scatter, an even angular spread
+   * reads as a coherent shockwave rather than debris, and the vertical
+   * component is squashed so it hugs the ground line instead of ballooning
+   * upward. */
+  spawnRing(x: number, y: number): void {
+    for (let i = 0; i < SLAM_PARTICLE_COUNT; i++) {
+      const slot = this.acquire();
+      if (!slot) return;
+      const angle = (i / SLAM_PARTICLE_COUNT) * Math.PI * 2;
+      const speed = randomRange(SLAM_PARTICLE_SPEED_MIN, SLAM_PARTICLE_SPEED_MAX);
+      const vx = Math.cos(angle) * speed;
+      const vy = Math.sin(angle) * speed * SLAM_PARTICLE_VERTICAL_SQUASH;
+      this.activate(slot, x, y, vx, vy, SLAM_PARTICLE_LIFETIME_SECONDS, SLAM_PARTICLE_COLOR);
     }
   }
 

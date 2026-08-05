@@ -335,6 +335,85 @@ export function createAudioSystem(initialMuted: boolean): AudioSystem {
     }
   }
 
+  function playDash(context: AudioContext, destination: GainNode, startTime: number, buffer: AudioBuffer): void {
+    // Filtered noise whoosh: bandpass center sweeps upward for the forward-rush feel.
+    const noise = context.createBufferSource();
+    noise.buffer = buffer;
+    const filter = context.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.setValueAtTime(0.6, startTime);
+    filter.frequency.setValueAtTime(600, startTime);
+    filter.frequency.exponentialRampToValueAtTime(2600, startTime + 0.16);
+    const noiseGain = context.createGain();
+    applyEnvelope(noiseGain, startTime, 0.42, 0.012, startTime + 0.17);
+    noise.connect(filter);
+    filter.connect(noiseGain);
+    noiseGain.connect(destination);
+    noise.start(startTime);
+    noise.stop(startTime + 0.18);
+
+    // A quiet touch of rising pitch riding under the whoosh, for forward motion.
+    const osc = context.createOscillator();
+    const oscGain = context.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(500, startTime);
+    osc.frequency.exponentialRampToValueAtTime(1000, startTime + 0.15);
+    applyEnvelope(oscGain, startTime, 0.2, 0.01, startTime + 0.16);
+    osc.connect(oscGain);
+    oscGain.connect(destination);
+    osc.start(startTime);
+    osc.stop(startTime + 0.17);
+
+    noise.onended = (): void => {
+      noise.disconnect();
+      filter.disconnect();
+      noiseGain.disconnect();
+      osc.disconnect();
+      oscGain.disconnect();
+      releaseVoice();
+    };
+  }
+
+  function playSlam(context: AudioContext, destination: GainNode, startTime: number, buffer: AudioBuffer): void {
+    // Low triangle thump, lower and longer than `land` — weight lives at 90-180Hz,
+    // not below it, since a phone speaker reproduces nothing down there.
+    const osc = context.createOscillator();
+    const oscGain = context.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(180, startTime);
+    osc.frequency.exponentialRampToValueAtTime(95, startTime + 0.2);
+    applyEnvelope(oscGain, startTime, 0.62, 0.006, startTime + 0.27);
+    osc.connect(oscGain);
+    oscGain.connect(destination);
+    osc.start(startTime);
+    osc.stop(startTime + 0.28);
+
+    // Short filtered-noise crack for the impact transient.
+    const noise = context.createBufferSource();
+    noise.buffer = buffer;
+    const filter = context.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.setValueAtTime(1.2, startTime);
+    filter.frequency.setValueAtTime(2500, startTime);
+    filter.frequency.exponentialRampToValueAtTime(350, startTime + 0.09);
+    const noiseGain = context.createGain();
+    applyEnvelope(noiseGain, startTime, 0.32, 0.002, startTime + 0.1);
+    noise.connect(filter);
+    filter.connect(noiseGain);
+    noiseGain.connect(destination);
+    noise.start(startTime);
+    noise.stop(startTime + 0.11);
+
+    osc.onended = (): void => {
+      osc.disconnect();
+      oscGain.disconnect();
+      noise.disconnect();
+      filter.disconnect();
+      noiseGain.disconnect();
+      releaseVoice();
+    };
+  }
+
   function playClick(context: AudioContext, destination: GainNode, startTime: number): void {
     const osc = context.createOscillator();
     const gain = context.createGain();
@@ -386,6 +465,12 @@ export function createAudioSystem(initialMuted: boolean): AudioSystem {
           break;
         case 'click':
           playClick(context, destination, t);
+          break;
+        case 'dash':
+          playDash(context, destination, t, buffer);
+          break;
+        case 'slam':
+          playSlam(context, destination, t, buffer);
           break;
         default: {
           // Exhaustiveness guard — SoundName is a closed union.

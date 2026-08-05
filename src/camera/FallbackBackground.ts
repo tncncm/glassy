@@ -84,8 +84,11 @@ export function createFallbackBackground(canvas: HTMLCanvasElement): FallbackBac
 
       context.fillStyle = band.fill;
       context.beginPath();
+      // Drifts LEFT -> RIGHT to match the real view out a right-hand car
+      // window: "ahead" is to the left, so stationary scenery approaches from
+      // the left and recedes to the right. The game world scrolls the same way.
       // One extra shape on each side so the wrap is seamless at the edges.
-      for (let x = -spacing - offset; x < backingWidth + spacing; x += spacing) {
+      for (let x = -spacing + offset; x < backingWidth + spacing; x += spacing) {
         context.moveTo(x + radius, baseline);
         context.arc(x, baseline, radius, 0, Math.PI, true);
         context.lineTo(x - radius, baseline + relief);

@@ -20,10 +20,25 @@ import {
   OBSTACLE_MIN_WIDTH,
   OBSTACLE_POOL_SIZE,
   OBSTACLE_SPAWN_MARGIN,
+  OBSTACLE_WEIGHT_BLOCK,
+  OBSTACLE_WEIGHT_OVERHEAD,
+  OBSTACLE_WEIGHT_SPIKE,
+  OVERHEAD_HAZARD_DRAW_HEIGHT,
+  OVERHEAD_HAZARD_MAX_WIDTH,
+  OVERHEAD_HAZARD_MIN_WIDTH,
+  WIDE_OBSTACLE_MAX_HEIGHT,
+  WIDE_OBSTACLE_MIN_HEIGHT,
 } from '../config.ts';
 import { Obstacle, type ObstacleShape } from '../entities/Obstacle.ts';
 import { randomRange } from '../util/math.ts';
-import { maxClearableObstacleHeight, maxClearableObstacleWidth, minSafeGap } from '../util/solvability.ts';
+import {
+  maxClearableObstacleHeight,
+  maxClearableObstacleWidth,
+  maxDashClearableObstacleWidth,
+  minSafeGap,
+  minWideObstacleWidth,
+  OVERHEAD_HAZARD_CLEARANCE_PX,
+} from '../util/solvability.ts';
 
 export class ObstacleSystem {
   private readonly pool: Obstacle[] = [];
@@ -60,13 +75,16 @@ export class ObstacleSystem {
   update(dt: number, worldSpeed: number, canvasWidth: number, groundY: number): void {
     this.distanceToNextSpawn -= worldSpeed * dt;
     if (this.distanceToNextSpawn <= 0) {
-      this.spawn(worldSpeed, canvasWidth, groundY);
+      this.spawn(worldSpeed, groundY);
     }
 
     for (let i = this.active.length - 1; i >= 0; i--) {
       const obstacle = this.active[i]!;
-      obstacle.setPosition(obstacle.x - worldSpeed * dt, groundY);
-      if (obstacle.x + obstacle.width < -OBSTACLE_DESPAWN_MARGIN) {
+      // Obstacles travel left → right (see PLAYER_X_FRACTION's comment in
+      // config.ts), so they advance in +x and are recycled once their
+      // leading (left) edge has passed fully off the right side.
+      obstacle.setPosition(obstacle.x + worldSpeed * dt, groundY);
+      if (obstacle.x > canvasWidth + OBSTACLE_DESPAWN_MARGIN) {
         obstacle.deactivate();
         this.active[i] = this.active[this.active.length - 1]!;
         this.active.pop();
@@ -75,7 +93,7 @@ export class ObstacleSystem {
     }
   }
 
-  private spawn(worldSpeed: number, canvasWidth: number, groundY: number): void {
+  private spawn(worldSpeed: number, groundY: number): void {
     const obstacle = this.pool.pop();
     if (!obstacle) {
       // Pool exhausted (shouldn't happen at OBSTACLE_POOL_SIZE=14 with our
@@ -85,15 +103,59 @@ export class ObstacleSystem {
       return;
     }
 
-    const width = randomRange(OBSTACLE_MIN_WIDTH, maxClearableObstacleWidth(worldSpeed));
-    const height = randomRange(OBSTACLE_MIN_HEIGHT, maxClearableObstacleHeight(width, worldSpeed));
-    const shape: ObstacleShape = Math.random() < 0.5 ? 'block' : 'spike';
-    const spawnX = canvasWidth + OBSTACLE_SPAWN_MARGIN;
+    const shape = pickShape();
+    let width: number;
+    let height: number;
+    let topY: number;
 
-    obstacle.reset(width, height, shape, spawnX, groundY - height);
+    switch (shape) {
+      case 'wide': {
+        const minWidth = minWideObstacleWidth(worldSpeed);
+        const maxWidth = Math.max(minWidth, maxDashClearableObstacleWidth(worldSpeed));
+        width = randomRange(minWidth, maxWidth);
+        height = randomRange(WIDE_OBSTACLE_MIN_HEIGHT, WIDE_OBSTACLE_MAX_HEIGHT);
+        topY = groundY - height;
+        break;
+      }
+      case 'overhead': {
+        width = randomRange(OVERHEAD_HAZARD_MIN_WIDTH, OVERHEAD_HAZARD_MAX_WIDTH);
+        height = OVERHEAD_HAZARD_DRAW_HEIGHT;
+        topY = groundY - OVERHEAD_HAZARD_CLEARANCE_PX - height;
+        break;
+      }
+      case 'block':
+      case 'spike':
+      default: {
+        width = randomRange(OBSTACLE_MIN_WIDTH, maxClearableObstacleWidth(worldSpeed));
+        height = randomRange(OBSTACLE_MIN_HEIGHT, maxClearableObstacleHeight(width, worldSpeed));
+        topY = groundY - height;
+        break;
+      }
+    }
+
+    // Spawn fully off the LEFT edge — obstacles travel left → right (see
+    // PLAYER_X_FRACTION's comment in config.ts) — so the obstacle's trailing
+    // (right) edge sits OBSTACLE_SPAWN_MARGIN px short of x=0, i.e. its
+    // whole body is comfortably off-screen.
+    const spawnX = -OBSTACLE_SPAWN_MARGIN - width;
+    obstacle.reset(width, height, shape, spawnX, topY);
     this.active.push(obstacle);
 
+    // Spacing uses the same jump-flight-time-derived minimum for every kind:
+    // it's generous enough to also cover the (much shorter) reaction a
+    // wide/overhead obstacle actually demands, so reusing it here keeps the
+    // spacing derivation in one place rather than forking it per kind.
     const gap = minSafeGap(worldSpeed) * randomRange(GAP_RANDOM_EXTRA_MIN, GAP_RANDOM_EXTRA_MAX);
     this.distanceToNextSpawn = width + gap;
   }
+}
+
+/** Cumulative-weight pick across the four obstacle kinds — see the
+ * OBSTACLE_WEIGHT_* comment in config.ts for why these particular weights. */
+function pickShape(): ObstacleShape {
+  const roll = Math.random();
+  if (roll < OBSTACLE_WEIGHT_BLOCK) return 'block';
+  if (roll < OBSTACLE_WEIGHT_BLOCK + OBSTACLE_WEIGHT_SPIKE) return 'spike';
+  if (roll < OBSTACLE_WEIGHT_BLOCK + OBSTACLE_WEIGHT_SPIKE + OBSTACLE_WEIGHT_OVERHEAD) return 'overhead';
+  return 'wide';
 }

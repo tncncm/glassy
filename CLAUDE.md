@@ -1,9 +1,13 @@
 # Glassy
 
 Mobile-first PWA: the phone's rear camera is a live "car side window" background, and a
-transparent PixiJS canvas renders a tiny endless-runner character above it. The prototype
-exists to validate whether the interaction *feels fun* — there is deliberately **no computer
-vision**; the camera is only a moving backdrop and gameplay is fully independent of it.
+transparent PixiJS canvas renders a tiny endless-runner character above it.
+
+The core-loop prototype validated (2026-08-05: "è divertente"). The camera is still primarily a
+moving backdrop, but there is now **one deliberately minimal piece of scene analysis**: a
+horizon estimate that *biases* the running surface. It is a hint only — the player's drag always
+wins, and the game stays fully playable when the estimate is absent or wrong. **No ML models, no
+object detection** — those would need external assets and blow the frame budget on iPhone.
 
 Primary target: **iPhone Safari + installed iOS PWA, landscape**. Secondary: Chrome, Edge, Android Chrome.
 
@@ -25,8 +29,12 @@ npm run preview    # serve dist/
 
 ## Non-negotiable invariants
 
-- **Privacy:** camera frames are never read, recorded, uploaded or stored. `localStorage` holds
-  only `bestScore` and `muted`. Nothing else is persisted, ever.
+- **Privacy:** camera frames are **read on-device only**, and only by
+  `src/vision/SceneAnalyser.ts`, which downscales to a few dozen pixels, reduces to per-row
+  gradient sums, and discards the pixels the same tick. Nothing is recorded, uploaded,
+  transmitted or persisted — no frame, crop, thumbnail or fingerprint may outlive the current
+  tick. `localStorage` holds only `bestScore` and `muted`. Nothing else is persisted, ever.
+  If this boundary moves again, the user-facing privacy copy must change first.
 - **Safety copy:** the home screen must always carry "Passenger use only. Do not use while driving."
   Nothing in the UI may imply driver use is safe.
 - **Camera permission** is requested only from a direct user gesture, after Play — never on load.

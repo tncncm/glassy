@@ -25,10 +25,12 @@ import {
   type GameOverResult,
   type Preferences,
   type SoundName,
+  type SceneAnalyser,
   type UIController,
   type UIIntents,
 } from '../types.ts';
 import { createUIController } from '../ui/UIController.ts';
+import { createSceneAnalyser } from '../vision/SceneAnalyser.ts';
 
 /**
  * Internal app state. Distinct from `ScreenName`: `requestingCamera` is a real
@@ -52,6 +54,13 @@ type AppState =
 const MIN_LANDSCAPE_ASPECT = 1.0;
 /** Desktop/tablet windows can be tall without being a phone held upright. */
 const ROTATE_PROMPT_MAX_SHORT_EDGE = 820;
+
+/**
+ * How often the latest horizon estimate is handed to the game. The analyser
+ * samples at its own (low) rate; this only reads the value it already computed,
+ * so it is cheap — but there is no point pushing faster than the analyser moves.
+ */
+const HORIZON_PUSH_INTERVAL_MS = 200;
 
 export interface App {
   start(): Promise<void>;
@@ -84,6 +93,16 @@ export async function createApp(root: HTMLElement): Promise<App> {
     fallbackCanvas,
     onStateChange: handleCameraStateChange,
   });
+
+  /**
+   * Reads shrunken frames to estimate the horizon. Runs ONLY while the camera
+   * is live and the game is actually being played — never on the menus, never
+   * on the fallback background (there is no real scene to analyse), never while
+   * backgrounded. See the privacy note in types.ts.
+   */
+  const scene: SceneAnalyser = createSceneAnalyser({ video });
+  /** Pushes the latest estimate into the game. The game decides whether to use it. */
+  let horizonTimer: number | null = null;
 
   const game: Game = await createGame({
     container: stage,
@@ -190,7 +209,37 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.show('permission');
   }
 
+  /**
+   * Analysis is tied to "camera live AND actively playing". Anything else —
+   * menus, pause, fallback, backgrounded — stops it, so we never read frames
+   * we have no gameplay reason to read.
+   */
+  function syncSceneAnalysis(): void {
+    const shouldRun = state === 'playing' && camera.state.status === 'live';
+    if (shouldRun) {
+      scene.start();
+      if (horizonTimer === null) {
+        horizonTimer = window.setInterval(pushHorizonHint, HORIZON_PUSH_INTERVAL_MS);
+      }
+      return;
+    }
+    scene.stop();
+    if (horizonTimer !== null) {
+      window.clearInterval(horizonTimer);
+      horizonTimer = null;
+    }
+    // Drop any stale bias so the ground returns to the player's own choice.
+    game.setHorizonHint(null, 0);
+  }
+
+  function pushHorizonHint(): void {
+    const estimate = scene.horizon;
+    game.setHorizonHint(estimate.y, estimate.confidence);
+  }
+
   function handleCameraStateChange(next: CameraState): void {
+    // A camera that drops out must also stop the analyser.
+    if (next.status !== 'live') syncSceneAnalysis();
     // A camera that dies mid-run (unplugged, seized by another app, iOS
     // reclaiming it) must degrade into a playable game, never a black screen.
     // The fallback background is already painting by the time we get here.
@@ -285,6 +334,9 @@ export async function createApp(root: HTMLElement): Promise<App> {
         ui.show('gameOver');
         break;
     }
+
+    // Every transition re-evaluates whether we should be reading frames at all.
+    syncSceneAnalysis();
   }
 
   /* ---------------------------------------------------------------- */
@@ -386,6 +438,11 @@ export async function createApp(root: HTMLElement): Promise<App> {
     window.removeEventListener('orientationchange', handleResize);
     orientationQuery.removeEventListener('change', handleOrientation);
     document.removeEventListener('visibilitychange', handleVisibility);
+    scene.stop();
+    if (horizonTimer !== null) {
+      window.clearInterval(horizonTimer);
+      horizonTimer = null;
+    }
     game.destroy();
     camera.stop();
     audio.dispose();

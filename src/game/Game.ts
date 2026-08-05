@@ -16,6 +16,8 @@ import type { CreateGame, Game, GameOptions, GameOverResult, GameStatus } from '
 import {
   BASE_WORLD_SPEED,
   COLLISION_SHAKE_TRAUMA,
+  DASH_THROUGH_BONUS_SCORE,
+  DASH_THROUGH_SHAKE_TRAUMA,
   DEBUG_TEXT_COLOR,
   DEBUG_TEXT_SIZE,
   DEBUG_TEXT_UPDATE_INTERVAL_SECONDS,
@@ -30,6 +32,9 @@ import {
   GROUND_Y_DEFAULT_FRACTION,
   GROUND_Y_MAX_FRACTION,
   GROUND_Y_MIN_FRACTION,
+  HORIZON_HINT_BIAS_RATE,
+  HORIZON_HINT_LOCKOUT_SECONDS,
+  HORIZON_HINT_MIN_CONFIDENCE,
   MAX_WORLD_SPEED,
   PLAYER_HEIGHT,
   PLAYER_X_FRACTION,
@@ -37,6 +42,7 @@ import {
   SCORE_PER_SECOND_AT_BASE_SPEED,
   SHAKE_DECAY_RATE,
   SHAKE_MAGNITUDE_PX,
+  SLAM_SHAKE_TRAUMA,
   SPEED_RAMP_SCORE_CONSTANT,
 } from './config.ts';
 import { Player } from './entities/Player.ts';
@@ -115,6 +121,14 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   let shakeTrauma = 0;
   let debugAccumulator = 0;
 
+  // --- Horizon hint state (see setHorizonHint on the returned Game) --------
+  /** Latest estimate from setHorizonHint; null = no usable estimate. */
+  let horizonHintFraction: number | null = null;
+  let horizonHintConfidence = 0;
+  /** Counts down after any manual ground-line change; the hint is ignored
+   * entirely while positive — the player's own placement always wins. */
+  let horizonLockoutTimer = 0;
+
   function groundTargetPx(): number {
     return groundYTargetFraction * canvasHeight;
   }
@@ -168,44 +182,97 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   function update(dt: number): void {
     if (status !== 'running') return;
 
+    // --- Horizon hint: locked out for a while after any manual drag, and
+    // even when accepted only ever nudges the TARGET a small fraction of
+    // the way per second — GROUND_LERP_RATE below still owns the visual
+    // line's own chase of that target, so this can never read as a snap.
+    if (horizonLockoutTimer > 0) {
+      horizonLockoutTimer = Math.max(0, horizonLockoutTimer - dt);
+    } else if (horizonHintFraction !== null && horizonHintConfidence >= HORIZON_HINT_MIN_CONFIDENCE) {
+      const clampedHint = clamp(horizonHintFraction, GROUND_Y_MIN_FRACTION, GROUND_Y_MAX_FRACTION);
+      groundYTargetFraction = lerp(groundYTargetFraction, clampedHint, expDecay(HORIZON_HINT_BIAS_RATE, dt));
+    }
+
     groundY = lerp(groundY, groundTargetPx(), expDecay(GROUND_LERP_RATE, dt));
     groundGraphics.y = groundY;
 
-    const worldSpeed =
+    const baseWorldSpeed =
       BASE_WORLD_SPEED + (MAX_WORLD_SPEED - BASE_WORLD_SPEED) * (1 - Math.exp(-scoreInt / SPEED_RAMP_SCORE_CONSTANT));
-    const speedRatio = worldSpeed / BASE_WORLD_SPEED;
+    const speedRatio = baseWorldSpeed / BASE_WORLD_SPEED;
 
     player.update(dt, groundY, speedRatio);
     if (player.justJumped || player.justDoubleJumped) {
       particles.spawnDust(player.x, player.groundContactY);
       callbacks.onSound('jump');
     }
-    if (player.justLanded) {
+    if (player.justDashed) {
+      callbacks.onSound('dash');
+    }
+    if (player.justSlamLanded) {
+      // Slam landing supersedes the ordinary landing dust/sound below —
+      // justLanded is also true this same frame, but the shockwave is the
+      // more specific, more impactful event.
+      particles.spawnRing(player.x, player.groundContactY);
+      shakeTrauma = Math.min(1, shakeTrauma + SLAM_SHAKE_TRAUMA);
+      callbacks.onSound('slam');
+    } else if (player.justLanded) {
       particles.spawnDust(player.x, player.groundContactY);
       callbacks.onSound('land');
     }
 
-    obstacles.update(dt, worldSpeed, canvasWidth, groundY);
+    // Dash boosts the world's scroll speed only (obstacles, not scoring —
+    // score keeps accruing off the base ramp so dash isn't a passive score
+    // farm; the only score effect of dashing is the explicit bonus below).
+    const effectiveWorldSpeed = baseWorldSpeed * player.dashSpeedMultiplier;
+    obstacles.update(dt, effectiveWorldSpeed, canvasWidth, groundY);
     particles.update(dt);
 
     const active = obstacles.activeObstacles;
     let collided = false;
-    for (let i = 0; i < active.length; i++) {
-      const obstacle = active[i]!;
-      if (
-        aabbOverlap(
-          player.left,
-          player.top,
-          player.right,
-          player.bottom,
-          obstacle.x,
-          obstacle.top,
-          obstacle.x + obstacle.width,
-          obstacle.top + obstacle.height,
-        )
-      ) {
-        collided = true;
-        break;
+    if (player.isInvulnerable) {
+      // No collision at all during the dash invulnerability window — instead,
+      // award the dash-through bonus once per obstacle actually passed
+      // through (not once per frame of overlap).
+      for (let i = 0; i < active.length; i++) {
+        const obstacle = active[i]!;
+        if (
+          !obstacle.dashBonusAwarded &&
+          aabbOverlap(
+            player.left,
+            player.top,
+            player.right,
+            player.bottom,
+            obstacle.x,
+            obstacle.top,
+            obstacle.x + obstacle.width,
+            obstacle.top + obstacle.height,
+          )
+        ) {
+          obstacle.dashBonusAwarded = true;
+          scoreAccumulator += DASH_THROUGH_BONUS_SCORE;
+          particles.spawnBurst(obstacle.x + obstacle.width * 0.5, obstacle.top + obstacle.height * 0.5);
+          shakeTrauma = Math.min(1, shakeTrauma + DASH_THROUGH_SHAKE_TRAUMA);
+          callbacks.onSound('score');
+        }
+      }
+    } else {
+      for (let i = 0; i < active.length; i++) {
+        const obstacle = active[i]!;
+        if (
+          aabbOverlap(
+            player.left,
+            player.top,
+            player.right,
+            player.bottom,
+            obstacle.x,
+            obstacle.top,
+            obstacle.x + obstacle.width,
+            obstacle.top + obstacle.height,
+          )
+        ) {
+          collided = true;
+          break;
+        }
       }
     }
 
@@ -238,7 +305,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         debugAccumulator = 0;
         const fps = dt > 0 ? 1 / dt : 0;
         debugText.text =
-          `fps ${fps.toFixed(0)}  score ${scoreInt}  speed ${worldSpeed.toFixed(0)}` +
+          `fps ${fps.toFixed(0)}  score ${scoreInt}  speed ${effectiveWorldSpeed.toFixed(0)}` +
           `  obstacles ${active.length}  ground ${groundY.toFixed(0)}`;
       }
     }
@@ -251,14 +318,29 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   const inputSystem = new InputSystem({
     canvas: app.canvas,
     getGroundTargetY: groundTargetPx,
+    getIsAirborne: () => !player.isGrounded,
     callbacks: {
       onJump(): void {
         if (status === 'running') {
           player.requestJump();
         }
       },
+      onDash(): void {
+        if (status === 'running') {
+          player.requestDash();
+        }
+      },
+      onSlam(): void {
+        if (status === 'running') {
+          player.requestSlam();
+        }
+      },
       onGroundDragTo(targetY: number): void {
         groundYTargetFraction = clamp(targetY / canvasHeight, GROUND_Y_MIN_FRACTION, GROUND_Y_MAX_FRACTION);
+        // The player's own placement always wins over the horizon hint —
+        // lock the hint out for a while rather than let it immediately
+        // start pulling the target back the instant this drag ends.
+        horizonLockoutTimer = HORIZON_HINT_LOCKOUT_SECONDS;
       },
     },
   });
@@ -322,12 +404,34 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       applyLayout(width, height);
     },
 
+    setHorizonHint(y: number | null, confidence: number): void {
+      // Deliberately just two primitive field writes — safe from any game
+      // state (idle/paused/over/running) and from any call frequency; the
+      // gating (confidence floor, manual-drag lockout, slow bias-only
+      // application) all happens inside update(), which is the only place
+      // that ever reads these two fields.
+      horizonHintFraction = y;
+      horizonHintConfidence = confidence;
+    },
+
     destroy(): void {
       loop.stop();
       inputSystem.destroy();
       app.destroy(true, { children: true });
     },
   };
+
+  // Dev-only test seam, same gating as the debugText FPS overlay above: the
+  // vision layer (src/vision/**) is the only production caller of
+  // setHorizonHint, and it isn't wired up in every environment this runs in
+  // (e.g. an automated harness with no camera). Exposing the already-public
+  // Game handle on `window` behind the same `?debug`/`#debug` flag lets such
+  // a harness *drive* setHorizonHint directly — it grants no capability
+  // beyond what the real Game contract already exposes, and every assertion
+  // still has to come from rendered pixels, not from this handle.
+  if (debug === true) {
+    (window as unknown as { __glassyGame?: Game }).__glassyGame = game;
+  }
 
   return game;
 };

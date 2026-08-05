@@ -9,8 +9,10 @@
  * recomputes automatically instead of silently going stale.
  *
  * THE PHYSICAL MODEL — this is a fixed-player runner, not a side-scroller.
- * `Player.view.x` never changes; the world (ground, obstacles) scrolls left
- * under it at `worldSpeed`. So clearing an obstacle is *not* about covering
+ * `Player.view.x` never changes; the world (ground, obstacles) scrolls
+ * (left → right, matching the passing-scenery direction — see
+ * PLAYER_X_FRACTION's comment in config.ts) under it at `worldSpeed`. So
+ * clearing an obstacle is *not* about covering
  * more horizontal ground than the obstacle is wide — the player doesn't
  * move horizontally at all. It's about staying airborne, with feet above
  * the obstacle's height, for the entire time the obstacle's box overlaps
@@ -58,6 +60,7 @@
  */
 
 import {
+  DASH_INVULN_SECONDS,
   GAP_REACTION_TIME_SECONDS,
   GAP_SAFETY_FACTOR,
   GRAVITY,
@@ -67,7 +70,12 @@ import {
   OBSTACLE_MAX_WIDTH_CAP,
   OBSTACLE_MIN_HEIGHT,
   OBSTACLE_MIN_WIDTH,
+  OVERHEAD_CLEARANCE_MARGIN_PX,
+  PLAYER_COLLISION_INSET_TOP,
+  PLAYER_HEIGHT,
   PLAYER_WIDTH,
+  WIDE_OBSTACLE_MAX_WIDTH_CAP,
+  WIDE_OBSTACLE_WIDTH_MARGIN_PX,
 } from '../config.ts';
 import { clamp } from './math.ts';
 
@@ -132,3 +140,77 @@ export function minSafeGap(worldSpeed: number): number {
   const requiredSeconds = PRIMARY_JUMP_ARC.flightTimeSeconds + GAP_REACTION_TIME_SECONDS;
   return worldSpeed * requiredSeconds * GAP_SAFETY_FACTOR;
 }
+
+/* ------------------------------------------------------------------ */
+/* Wide obstacle — cleared by dash, not by jump                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Narrowest a `wide` obstacle is ever allowed to be: strictly wider than any
+ * jump can clear. `maxClearableObstacleWidth()` above always clamps to
+ * OBSTACLE_MAX_WIDTH_CAP as its own ceiling, so "OBSTACLE_MAX_WIDTH_CAP plus
+ * a margin" is a width no jump can ever clear *by construction* — this
+ * doesn't even need to know the current `worldSpeed`. We still take it and
+ * compare against the live jump-clearable width defensively (belt and
+ * suspenders: if a future change ever let `maxClearableObstacleWidth`
+ * exceed the cap, this stays correct instead of silently going stale).
+ */
+export function minWideObstacleWidth(worldSpeed: number): number {
+  const marginOverCap = OBSTACLE_MAX_WIDTH_CAP + WIDE_OBSTACLE_WIDTH_MARGIN_PX;
+  const marginOverLiveJumpMax = maxClearableObstacleWidth(worldSpeed) + WIDE_OBSTACLE_WIDTH_MARGIN_PX;
+  return Math.max(marginOverCap, marginOverLiveJumpMax);
+}
+
+/**
+ * Widest a `wide` obstacle is allowed to be at `worldSpeed` such that
+ * DASH_INVULN_SECONDS of invulnerability is still guaranteed to cover its
+ * full pass time — see DASH_INVULN_SECONDS' doc comment in config.ts for why
+ * *unboosted* `worldSpeed` is the right (conservative) input here rather
+ * than the live dash-boosted speed.
+ *
+ * Inverting `passTime(width) = (width + PLAYER_WIDTH) / worldSpeed <=
+ * DASH_INVULN_SECONDS` gives `width <= DASH_INVULN_SECONDS * worldSpeed -
+ * PLAYER_WIDTH`. Clamped below by `minWideObstacleWidth` (so the range is
+ * never inverted/empty even if a future tuning change made the two bounds
+ * cross) and above by WIDE_OBSTACLE_MAX_WIDTH_CAP (visual sanity ceiling).
+ */
+export function maxDashClearableObstacleWidth(worldSpeed: number): number {
+  const width = DASH_INVULN_SECONDS * worldSpeed - PLAYER_WIDTH;
+  const floor = minWideObstacleWidth(worldSpeed);
+  return clamp(width, floor, Math.max(floor, WIDE_OBSTACLE_MAX_WIDTH_CAP));
+}
+
+/* ------------------------------------------------------------------ */
+/* Overhead hazard — cleared by staying grounded                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fixed px clearance an `overhead` hazard's lower edge keeps above the
+ * ground line. Independent of `worldSpeed` — this is a geometric fit, not a
+ * timed arc, so unlike the jump/dash bounds above it's a module-level
+ * constant rather than a function.
+ *
+ * A grounded player's own AABB top sits at `groundY - PLAYER_HEIGHT +
+ * PLAYER_COLLISION_INSET_TOP` (see Player.top). For the hazard to never
+ * overlap a grounded player, its bottom edge (`groundY -
+ * OVERHEAD_HAZARD_CLEARANCE_PX`) must sit at or above that, i.e. clearance
+ * >= `PLAYER_HEIGHT - PLAYER_COLLISION_INSET_TOP`, plus
+ * OVERHEAD_CLEARANCE_MARGIN_PX of slack so it isn't a pixel-perfect squeeze.
+ *
+ * This also has to be well below PRIMARY_JUMP_ARC.apexHeightPx so that
+ * jumping into the hazard is a real, legible risk (the "reward" for staying
+ * grounded is only meaningful if the alternative — jumping — actually
+ * fails), which holds by a wide margin for every PLAYER_HEIGHT/JUMP_VELOCITY
+ * pairing this game has shipped with.
+ *
+ * Solvability guarantee: the player is never *forced* to be airborne when an
+ * overhead hazard's leading edge arrives, because obstacle spacing
+ * (`minSafeGap`) already reserves the jump's full flight time plus a
+ * reaction buffer after any preceding obstacle — so a player who jumped to
+ * clear a block/spike, or dashed through a wide wall, has always landed
+ * again before the next obstacle (of any kind) reaches them. Staying
+ * grounded is therefore always an available, deterministic way to clear
+ * every overhead hazard — no timing luck required.
+ */
+export const OVERHEAD_HAZARD_CLEARANCE_PX =
+  PLAYER_HEIGHT - PLAYER_COLLISION_INSET_TOP + OVERHEAD_CLEARANCE_MARGIN_PX;

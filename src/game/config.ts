@@ -31,6 +31,24 @@ export const GROUND_Y_DEFAULT_FRACTION = 0.72;
  * target with — gives the platform a light, responsive-but-not-jittery feel. */
 export const GROUND_LERP_RATE = 12;
 
+/* --- Horizon hint bias (camera-estimated horizon nudging the ground target) */
+
+/** Below this confidence the horizon estimate is ignored outright — a noisy
+ * single-frame estimate must never be allowed to tug the ground line. */
+export const HORIZON_HINT_MIN_CONFIDENCE = 0.35;
+/** Seconds after any manual ground-line drag (pointer or keyboard) during
+ * which the horizon hint is ignored entirely. The player's own placement of
+ * the platform always wins over a passive camera guess. */
+export const HORIZON_HINT_LOCKOUT_SECONDS = 4;
+/** Exponential rate (1/s, used with expDecay like GROUND_LERP_RATE) at which
+ * an *accepted* hint pulls `groundYTargetFraction` toward it. This is
+ * deliberately much slower than GROUND_LERP_RATE (12): GROUND_LERP_RATE only
+ * smooths the *visual* line chasing its target, whereas this rate moves the
+ * target itself, so it must be slow enough that a noisy or drifting horizon
+ * estimate can never read as a snap or a fight with the player — at 0.15/s
+ * the target closes half the gap to the hint roughly every 4.6s. */
+export const HORIZON_HINT_BIAS_RATE = 0.15;
+
 export const GROUND_LINE_THICKNESS = 3;
 export const GROUND_LINE_GLOW_THICKNESS = 14;
 export const GROUND_LINE_COLOR = 0xffffff;
@@ -45,7 +63,14 @@ export const GROUND_SHADOW_ALPHA = 0.16;
 /* Player                                                              */
 /* ------------------------------------------------------------------ */
 
-export const PLAYER_X_FRACTION = 0.24;
+/** The passenger sits on the right of the car and looks out the right-hand
+ * window, so "ahead" (the direction of travel, and the direction the player
+ * character faces) reads as LEFT on screen, and stationary scenery in the
+ * camera feed flows left → right (approaching from the front, receding to
+ * the back). The player sits toward the right edge so incoming obstacles —
+ * spawned off the left edge, traveling left → right, matching that flow —
+ * get the ~76% of screen width to their left as runway. */
+export const PLAYER_X_FRACTION = 0.76;
 export const PLAYER_WIDTH = 34;
 export const PLAYER_HEIGHT = 46;
 export const PLAYER_LEG_LENGTH = 16;
@@ -93,6 +118,103 @@ export const PLAYER_COLOR_LIMB = 0xe6a92e;
 export const PLAYER_COLOR_EYE = 0x1a1400;
 
 /* ------------------------------------------------------------------ */
+/* Dash — forward burst + brief invulnerability                        */
+/* ------------------------------------------------------------------ */
+
+/** Extra world-speed multiplier at the instant a dash triggers (so effective
+ * speed peaks at `1 + DASH_PEAK_BOOST`, i.e. 2.2x) — chosen to read as a
+ * clear surge without being so fast the ramping-past-obstacles scenery
+ * becomes an unreadable blur. Decays via expDecay, not a hard cutoff. */
+export const DASH_PEAK_BOOST = 1.2;
+/** Exponential decay rate (1/s) of the speed boost back to 0 — at this rate
+ * the boost is ~98.5% gone by DASH_DURATION_SECONDS, which is what makes
+ * that constant a meaningful "duration" despite the decay never technically
+ * reaching exactly 0. */
+export const DASH_DECAY_RATE = 6;
+/** Nominal total duration (s) of the visible dash effect (speed trail etc.),
+ * i.e. how long DASH_DECAY_RATE takes to make the boost negligible. Must
+ * stay LARGER than DASH_INVULN_SECONDS — see that constant's comment — so
+ * the trail visibly outlasts the window where it's actually safe. */
+export const DASH_DURATION_SECONDS = 0.7;
+/**
+ * Invulnerability window (s), strictly SHORTER than DASH_DURATION_SECONDS so
+ * dashing can't be spammed as a permanent free pass — the flashy tail end of
+ * the trail is cosmetic only, not safe.
+ *
+ * This single number is also a solvability input (see util/solvability.ts):
+ * it is what lets the WIDE obstacle type exist at all. A wide obstacle is,
+ * by construction, too wide for a jump to clear (wider than
+ * OBSTACLE_MAX_WIDTH_CAP) — the ONLY way past it is to be invulnerable for
+ * its entire pass time. `maxDashClearableObstacleWidth()` inverts
+ * `passTime = (width + PLAYER_WIDTH) / worldSpeed <= DASH_INVULN_SECONDS`
+ * using the *unboosted* world speed (a deliberately conservative bound: the
+ * real dash is faster than this during the window, so this is guaranteed
+ * safe even if the boost had already fully decayed, which it hasn't). At
+ * BASE_WORLD_SPEED (the slowest — and therefore worst-case — speed the ramp
+ * ever produces) this yields a comfortably non-empty width range; see the
+ * derivation for the proof it stays non-empty as speed increases.
+ */
+export const DASH_INVULN_SECONDS = 0.5;
+/** Cooldown (s) before another dash can trigger, counted from the previous
+ * trigger. Deliberately close to but longer than DASH_DURATION_SECONDS so a
+ * dash reads as a discrete, spend-and-recover burst rather than a toggle. */
+export const DASH_COOLDOWN_SECONDS = 0.9;
+
+/** Squash/stretch target on dash trigger — elongated and flattened, reusing
+ * the existing squash spring (SQUASH_STRETCH_RATE) for the "lunge" read
+ * instead of any new relax code. */
+export const DASH_SQUASH_SCALE_X = 1.5;
+export const DASH_SQUASH_SCALE_Y = 0.72;
+
+/** Pre-created motion-trail streaks behind the player, visible only while
+ * dashBoost is active; count is small and fixed (pool, not per-frame alloc). */
+export const DASH_TRAIL_STREAK_COUNT = 4;
+export const DASH_TRAIL_STREAK_SPACING_PX = 11;
+export const DASH_TRAIL_STREAK_LENGTH_PX = 18;
+export const DASH_TRAIL_STREAK_THICKNESS_PX = 5;
+export const DASH_TRAIL_MAX_ALPHA = 0.45;
+export const DASH_TRAIL_COLOR = 0xffffff;
+
+/** Small pre-created "ready" dot above the player's head — the visual tell
+ * for ready-vs-charging cooldown state. */
+export const DASH_INDICATOR_RADIUS = 4;
+/** Extra px above the player's head (beyond PLAYER_HEIGHT) the dot floats. */
+export const DASH_INDICATOR_OFFSET_Y = 12;
+export const DASH_INDICATOR_READY_COLOR = 0x5be8ff;
+export const DASH_INDICATOR_CHARGING_COLOR = 0x2c3b45;
+export const DASH_INDICATOR_READY_ALPHA = 0.95;
+export const DASH_INDICATOR_CHARGING_ALPHA_MIN = 0.25;
+
+/** Flat score bonus for dashing through an obstacle during the
+ * invulnerability window (once per obstacle, not per frame of overlap). */
+export const DASH_THROUGH_BONUS_SCORE = 25;
+/** Screen-shake trauma added (not overwritten — see SHAKE_DECAY_RATE) when
+ * dashing through an obstacle; softer than a full collision's trauma. */
+export const DASH_THROUGH_SHAKE_TRAUMA = 0.5;
+
+/* ------------------------------------------------------------------ */
+/* Slam (ground pound)                                                 */
+/* ------------------------------------------------------------------ */
+
+/** Forced downward px/s the instant a slam triggers — roughly double
+ * JUMP_VELOCITY (980) so it reads as an unmistakably faster, more violent
+ * descent than simply falling from the jump arc's own apex ever produces. */
+export const SLAM_DROP_SPEED = 1900;
+/** Screen-shake trauma added on slam landing — stronger than a dash-through
+ * bonus, short of a full collision. */
+export const SLAM_SHAKE_TRAUMA = 0.7;
+
+export const SLAM_PARTICLE_COUNT = 18;
+export const SLAM_PARTICLE_SPEED_MIN = 120;
+export const SLAM_PARTICLE_SPEED_MAX = 340;
+export const SLAM_PARTICLE_LIFETIME_SECONDS = 0.5;
+export const SLAM_PARTICLE_COLOR = 0x8fe3ff;
+/** The shockwave should hug the ground (a flattened ring), not a full
+ * spherical burst — this multiplies the vertical component of each
+ * particle's launch velocity down after the angle is picked. */
+export const SLAM_PARTICLE_VERTICAL_SQUASH = 0.35;
+
+/* ------------------------------------------------------------------ */
 /* World speed / difficulty ramp                                       */
 /* ------------------------------------------------------------------ */
 
@@ -126,8 +248,10 @@ export const OBSTACLE_MAX_WIDTH_CAP = 72;
 export const OBSTACLE_MIN_HEIGHT = 28;
 export const OBSTACLE_MAX_HEIGHT_CAP = 108;
 
-/** How far beyond the right edge obstacles spawn, and how far beyond the
- * left edge they're recycled — both in px, both comfortably off-screen. */
+/** How far beyond the left edge obstacles spawn, and how far beyond the
+ * right edge they're recycled — both in px, both comfortably off-screen.
+ * (Obstacles travel left → right, matching the passing-scenery direction —
+ * see PLAYER_X_FRACTION's comment.) */
 export const OBSTACLE_SPAWN_MARGIN = 30;
 export const OBSTACLE_DESPAWN_MARGIN = 80;
 
@@ -137,8 +261,45 @@ export const OBSTACLE_INITIAL_SPAWN_DISTANCE = 520;
 
 export const OBSTACLE_COLOR_BLOCK = 0x36e5c8;
 export const OBSTACLE_COLOR_SPIKE = 0xff5470;
+export const OBSTACLE_COLOR_WIDE = 0x9b6bff;
+export const OBSTACLE_COLOR_OVERHEAD = 0xff9d3d;
 export const OBSTACLE_COLOR_OUTLINE = 0x08251f;
 export const OBSTACLE_CORNER_RADIUS = 6;
+
+/** Selection weights for the four obstacle kinds, sampled by
+ * cumulative-sum — must sum to 1. `block`/`spike` are the original
+ * jump-clearable kinds; `wide` rewards a dash, `overhead` rewards staying
+ * grounded (or slamming back down promptly). Kept a minority of spawns each
+ * so the core jump loop — already validated as fun — stays the backbone of
+ * the run rather than being diluted. */
+export const OBSTACLE_WEIGHT_BLOCK = 0.4;
+export const OBSTACLE_WEIGHT_SPIKE = 0.3;
+export const OBSTACLE_WEIGHT_WIDE = 0.15;
+export const OBSTACLE_WEIGHT_OVERHEAD = 0.15;
+
+/** Low/wide "wall" obstacle — too wide for any jump to clear (see
+ * WIDE_OBSTACLE_WIDTH_MARGIN_PX in the solvability section below), meant to
+ * be dashed through during invulnerability. Height is a visual choice only
+ * (clearing it is about timing the dash, not height) but kept low so it
+ * reads as a wall to blast through rather than something to jump at. */
+export const WIDE_OBSTACLE_MIN_HEIGHT = OBSTACLE_MIN_HEIGHT;
+export const WIDE_OBSTACLE_MAX_HEIGHT = 56;
+
+/** Overhead hazard — hangs down from off the top of the screen to a fixed
+ * clearance above the ground line (see OVERHEAD_HAZARD_CLEARANCE_PX in
+ * util/solvability.ts), cleared by staying grounded. Width is a visual
+ * choice only, same reasoning as the wide obstacle above. */
+export const OVERHEAD_HAZARD_MIN_WIDTH = 60;
+export const OVERHEAD_HAZARD_MAX_WIDTH = 120;
+/** Generous fixed draw height so the hazard's body always reaches off the
+ * top of the viewport regardless of device height or where the ground line
+ * has been dragged to — pure overdraw, not a gameplay tunable (compare
+ * GROUND_LINE_OVERDRAW_PX in Game.ts, same idea). */
+export const OVERHEAD_HAZARD_DRAW_HEIGHT = 1400;
+/** Width of each triangular "icicle" tooth along the hazard's bottom edge —
+ * purely decorative, sized to always divide evenly-ish into the hazard's
+ * width range above. */
+export const OVERHEAD_HAZARD_TOOTH_WIDTH = 16;
 
 /* ------------------------------------------------------------------ */
 /* Solvability safety margins — see util/solvability.ts for the derivation. */
@@ -161,6 +322,26 @@ export const GAP_SAFETY_FACTOR = 1.2;
  * expressed as a multiplier range so spacing doesn't feel metronomic. */
 export const GAP_RANDOM_EXTRA_MIN = 1;
 export const GAP_RANDOM_EXTRA_MAX = 1.5;
+
+/** Minimum px a `wide` obstacle's width must exceed OBSTACLE_MAX_WIDTH_CAP
+ * by. `maxClearableObstacleWidth()` is architecturally bounded above by
+ * OBSTACLE_MAX_WIDTH_CAP no matter what the jump kinematics are (its own
+ * `clamp` upper bound), so `OBSTACLE_MAX_WIDTH_CAP + this` is a width no
+ * jump can ever clear, by construction, without needing to re-derive
+ * anything if JUMP_VELOCITY/GRAVITY ever change. */
+export const WIDE_OBSTACLE_WIDTH_MARGIN_PX = 20;
+/** Absolute upper bound on a `wide` obstacle's width, regardless of how much
+ * headroom `maxDashClearableObstacleWidth()` would otherwise allow at high
+ * world speed — keeps the wall from growing absurdly long late in a run. */
+export const WIDE_OBSTACLE_MAX_WIDTH_CAP = 170;
+
+/** Extra px of clearance, beyond the player's own standing collision
+ * height, an `overhead` hazard's danger edge sits above the ground line —
+ * see `OVERHEAD_HAZARD_CLEARANCE_PX` in util/solvability.ts, which derives
+ * the base requirement from PLAYER_HEIGHT/PLAYER_COLLISION_INSET_TOP; this
+ * is just the safety margin on top, same role as JUMP_ARC_SAFETY_FACTOR's
+ * slack but for a fixed geometric fit instead of a timed arc. */
+export const OVERHEAD_CLEARANCE_MARGIN_PX = 10;
 
 /* ------------------------------------------------------------------ */
 /* Particles                                                           */
@@ -202,8 +383,13 @@ export const COLLISION_SHAKE_TRAUMA = 1;
 export const TAP_MAX_DURATION_MS = 220;
 export const TAP_MAX_MOVEMENT_PX = 12;
 /** Vertical movement, px, past which a pointer gesture commits to "drag the
- * platform" and can no longer resolve as a tap-jump. */
+ * platform" (grounded) or "slam" (airborne, downward only) and can no longer
+ * resolve as a tap-jump. */
 export const DRAG_THRESHOLD_PX = 16;
+/** Horizontal movement, px, past which a pointer gesture commits to "dash"
+ * and can no longer resolve as a tap-jump or a ground drag — same magnitude
+ * as DRAG_THRESHOLD_PX so the two axes feel equally sensitive to commit to. */
+export const SWIPE_THRESHOLD_PX = 24;
 export const KEYBOARD_GROUND_STEP_PX = 28;
 
 /* ------------------------------------------------------------------ */

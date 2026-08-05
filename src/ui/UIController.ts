@@ -88,7 +88,7 @@ const TEMPLATE = `
         <span class="safety-line__icon" aria-hidden="true">⚠️</span>
         <span>Passenger use only. Do not use while driving.</span>
       </div>
-      <p class="privacy-line">Your camera is used only as a live backdrop — frames are never read, recorded, uploaded or stored.</p>
+      <p class="privacy-line">Your camera is the backdrop. Glassy reads a heavily shrunken frame a few times a second, on this device only, to guess where the horizon is and line the ground up with it. Frames are never recorded, uploaded or stored, and nothing leaves your phone.</p>
       <div class="home__actions">
         <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
         <button type="button" class="btn btn--icon home__mute" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
@@ -104,7 +104,7 @@ const TEMPLATE = `
       <div class="permission__state" data-state="pre-request">
         <div class="permission__icon" aria-hidden="true">\u{1F4F7}</div>
         <h2 class="permission__title">Camera as a backdrop</h2>
-        <p class="permission__body">Glassy uses your rear camera as a live backdrop behind the game. Nothing is recorded, saved, or sent anywhere.</p>
+        <p class="permission__body">Glassy uses your rear camera as a live backdrop behind the game. It also reads a tiny, blurred-down version of the picture a few times a second — entirely on this device — to find the horizon and align the ground with it. Nothing is recorded, saved, or sent anywhere.</p>
         <div class="btn-row">
           <button type="button" class="btn btn--primary" data-action="continue">Continue</button>
         </div>
