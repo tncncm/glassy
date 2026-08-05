@@ -13,7 +13,11 @@
  */
 
 import { createCameraController } from '../camera/CameraController.ts';
-import { attachDevVideo, devVideoSource } from '../dev/videoBackdrop.ts';
+import {
+  attachVideoBackdrop,
+  devVideoSource,
+  DEMO_VIDEO_SRC,
+} from '../video/VideoBackdrop.ts';
 import { createGame } from '../game/Game.ts';
 import { createAudioSystem } from '../game/systems/AudioSystem.ts';
 import { createPreferences } from '../storage/Preferences.ts';
@@ -95,7 +99,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
   /** True once a play gesture has unlocked audio; iOS needs a real gesture. */
   let audioUnlocked = false;
   let destroyed = false;
-  /** Dev-only: true when a recorded clip is standing in for the camera. */
+  /** True when a recorded clip (demo or dev override) stands in for the camera. */
   let usingDevVideo = false;
 
   const ui: UIController = createUIController(root, createIntents());
@@ -214,6 +218,30 @@ export async function createApp(root: HTMLElement): Promise<App> {
         camera.useFallback();
         beginRun();
       },
+      onPlayDemoVideo(): void {
+        audio.play('click');
+        unlockAudio();
+        requestFullscreenIfSupported();
+        // The demo clip is forward-facing dashcam footage, so force windscreen
+        // framing — running it in side-window mode would demo the wrong thing.
+        preferences.setVisionMode('windscreen');
+        ui.setVisionMode('windscreen');
+        detector.setMode('windscreen');
+        game.setVisionMode('windscreen');
+        void (async () => {
+          // Never re-attempt getUserMedia here: the point of the demo is to
+          // work without a camera at all.
+          camera.stop();
+          usingDevVideo = await attachVideoBackdrop(video, fallbackCanvas, DEMO_VIDEO_SRC);
+          if (destroyed) return;
+          if (!usingDevVideo) {
+            // Clip missing or undecodable — fall back to the gradient rather
+            // than stranding the user on a dead screen.
+            camera.useFallback();
+          }
+          beginRun();
+        })();
+      },
       onRetryCamera(): void {
         audio.play('click');
         unlockAudio();
@@ -266,7 +294,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     if (import.meta.env.DEV) {
       const devSrc = devVideoSource();
       if (devSrc) {
-        usingDevVideo = await attachDevVideo(video, fallbackCanvas, devSrc);
+        usingDevVideo = await attachVideoBackdrop(video, fallbackCanvas, devSrc);
         if (destroyed) return;
         if (usingDevVideo) {
           beginRun();

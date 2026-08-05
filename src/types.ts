@@ -438,6 +438,12 @@ export interface UIIntents {
   onPlayWithoutCamera(): void;
   /** Permission screen → try getUserMedia again. */
   onRetryCamera(): void;
+  /**
+   * Play against a bundled demo clip instead of the camera. Exists so the
+   * windscreen mode can be tried on a phone without being in a moving car —
+   * the vision stack runs on the clip exactly as it would on a live feed.
+   */
+  onPlayDemoVideo(): void;
   /** The user flipped the on-device object-detection opt-in. */
   onToggleVision(): void;
   /** The user switched between side-window and windscreen framing. */

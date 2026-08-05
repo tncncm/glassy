@@ -12,3 +12,7 @@ public/vision/
 tools/video-sim/.tmp/
 tools/video-sim/out/
 tools/video-sim/node_modules/
+
+# Demo clip: the user places their own footage here deliberately (it becomes
+# publicly downloadable). Not committed.
+public/demo/

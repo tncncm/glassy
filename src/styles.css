@@ -1053,3 +1053,37 @@ body {
   white-space: pre;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Demo-drive button                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Lets someone try windscreen mode on a phone without being in a moving car:
+ * it plays a bundled dashcam clip through the real vision stack.
+ */
+.btn--demo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  line-height: 1.2;
+  border-color: rgba(125, 211, 252, 0.4);
+}
+
+.btn__hint {
+  font-size: clamp(10px, 1.9vh, 11.5px);
+  font-weight: 500;
+  color: var(--glassy-ink-dim);
+  letter-spacing: 0;
+}
+
+@media (max-height: 420px) {
+  .btn--demo {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+  .btn__hint {
+    display: none;
+  }
+}

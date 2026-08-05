@@ -225,6 +225,10 @@ const TEMPLATE = `
           <button type="button" class="btn btn--primary" data-action="continue">Continue</button>
         </div>
         <button type="button" class="btn btn--secondary" data-action="play-without-camera-pre">Play without camera</button>
+        <button type="button" class="btn btn--secondary btn--demo" data-action="play-demo">
+          Try the demo drive
+          <span class="btn__hint">Dashcam clip, no camera needed</span>
+        </button>
       </div>
       <div class="permission__state" data-state="failure" hidden>
         <div class="permission__icon" aria-hidden="true">\u{1F6AB}</div>
@@ -234,6 +238,10 @@ const TEMPLATE = `
           <button type="button" class="btn btn--primary" data-action="retry">Try again</button>
           <button type="button" class="btn btn--secondary" data-action="play-without-camera-fail">Play without camera</button>
         </div>
+        <button type="button" class="btn btn--secondary btn--demo" data-action="play-demo">
+          Try the demo drive
+          <span class="btn__hint">Dashcam clip, no camera needed</span>
+        </button>
       </div>
     </div>
   </div>
@@ -644,6 +652,9 @@ class GlassyUIController implements UIController {
         break;
       case 'retry':
         this.intents.onRetryCamera();
+        break;
+      case 'play-demo':
+        this.intents.onPlayDemoVideo();
         break;
       default:
         break;
