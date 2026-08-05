@@ -40,10 +40,12 @@
  * user-facing copy before you change this.
  */
 
+import { createDetectionTracker, type DetectionTracker } from './DetectionTracker.ts';
 import type {
   ObjectDetector,
   ObjectDetectorOptions,
   DetectorState,
+  VisionMode,
   DetectedKind,
   Detection,
 } from '../types.ts';
@@ -166,8 +168,21 @@ function environmentSupportsWorkerPipeline(): boolean {
 export function createObjectDetector(options: ObjectDetectorOptions): ObjectDetector {
   const { video } = options;
   const sampleHz = options.sampleHz ?? DEFAULT_SAMPLE_HZ;
+  /**
+   * Windscreen framing holds objects still in frame, so it both benefits from
+   * and can afford a faster rate: inference is on the CPU delegate in a worker
+   * and costs the main thread nothing measurable.
+   */
+  const WINDSCREEN_SAMPLE_HZ = 6;
+  let mode: VisionMode = options.mode ?? 'window';
   const baseIntervalMs = 1000 / Math.max(1, sampleHz);
-  let intervalMs = baseIntervalMs;
+  function intervalForMode(): number {
+    return mode === 'windscreen' ? 1000 / WINDSCREEN_SAMPLE_HZ : baseIntervalMs;
+  }
+  let intervalMs = intervalForMode();
+
+  const tracker: DetectionTracker = createDetectionTracker();
+  let lastTrackUpdateMs = 0;
 
   let currentState: DetectorState = { status: 'idle' };
   function setState(next: DetectorState): void {
@@ -300,7 +315,20 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       output.push(slot);
     }
 
+    emitTracked();
     options.onDetections?.(output);
+  }
+
+  /**
+   * Fold the current detections through the tracker and hand the result out.
+   * Both arrays are reused; consumers read them synchronously.
+   */
+  function emitTracked(): void {
+    if (!options.onTrackedObjects) return;
+    const now = performance.now();
+    const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
+    lastTrackUpdateMs = now;
+    options.onTrackedObjects(tracker.update(output, dt));
   }
 
   function handleDetectResult(data: Extract<WorkerToMainMessage, { type: 'result' }>): void {
@@ -564,7 +592,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
 
       consecutiveErrors = 0;
       slowStreak = 0;
-      intervalMs = baseIntervalMs;
+      intervalMs = intervalForMode();
       lastTimestamp = -1;
       setState({ status: 'ready' });
       scheduleNext();
@@ -598,6 +626,16 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       return currentState;
     },
 
+    setMode(next: VisionMode): void {
+      if (next === mode) return;
+      mode = next;
+      // Tracks describe a different scene now — carrying them over would let
+      // a side-window vehicle become a windscreen platform.
+      tracker.reset();
+      lastTrackUpdateMs = 0;
+      intervalMs = intervalForMode();
+    },
+
     start(): Promise<DetectorState> {
       if (currentState.status === 'ready') {
         return Promise.resolve(currentState);
@@ -610,7 +648,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         stopRequested = false;
         consecutiveErrors = 0;
         slowStreak = 0;
-        intervalMs = baseIntervalMs;
+        intervalMs = intervalForMode();
         lastTimestamp = -1;
         setState({ status: 'ready' });
         scheduleNext();

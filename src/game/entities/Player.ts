@@ -415,6 +415,33 @@ export class Player {
     return this.grounded;
   }
 
+  /** Signed vertical velocity, px/s (positive = upward, i.e. same sign
+   * convention as JUMP_VELOCITY). Exposed only so Game.ts's windscreen-
+   * platform one-way resolution can gate candidacy on "not currently
+   * rising" — a platform must never be able to catch/stop an ascending
+   * jump, only be landed on while falling (or already resting). */
+  get verticalVelocity(): number {
+    return this.velocityY;
+  }
+
+  /**
+   * Re-expresses the player's CURRENT on-screen foot position relative to a
+   * NEW ground/platform reference, without changing that position or any
+   * momentum — purely a continuity rebase so a later switch of WHICH
+   * surface `update()`'s `groundY` argument refers to (ground ↔ a
+   * windscreen platform, or platform ↔ platform — see Game.ts) can never
+   * show up as a visual pop, regardless of how far apart the two surfaces
+   * are. Must be called, if at all, only once per frame, strictly BEFORE
+   * the `update()` call that first passes `newGroundY`. Callers must NOT
+   * call this for the ordinary case of the SAME surface continuing to move
+   * smoothly (e.g. the ground line's own drag/horizon-hint lerp) — doing so
+   * would subtly perturb that surface's already-correct continuous
+   * behaviour; it exists only for genuine surface-identity switches.
+   */
+  syncGroundReference(newGroundY: number): void {
+    this.airborneHeight = newGroundY - this.footY;
+  }
+
   /** Effective world-speed multiplier from the dash boost — 1 when no dash
    * is active, decaying back to 1 exponentially after one triggers. */
   get dashSpeedMultiplier(): number {

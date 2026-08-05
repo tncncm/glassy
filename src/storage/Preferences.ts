@@ -1,17 +1,18 @@
 /**
- * localStorage wrapper — the ONLY three values Glassy ever persists:
- * `bestScore`, `muted`, `visionEnabled`. Nothing else.
+ * localStorage wrapper — the ONLY four values Glassy ever persists:
+ * `bestScore`, `muted`, `visionEnabled`, `visionMode`. Nothing else.
  *
  * Every read and write is wrapped in try/catch: Safari private mode throws on
  * write (and some private-mode configurations throw on read too). On any
  * failure we fall back to an in-memory value so the app keeps working.
  */
 
-import type { Preferences } from '../types.ts';
+import type { Preferences, VisionMode } from '../types.ts';
 
 const BEST_SCORE_KEY = 'bestScore';
 const MUTED_KEY = 'muted';
 const VISION_ENABLED_KEY = 'visionEnabled';
+const VISION_MODE_KEY = 'visionMode';
 
 function parseBestScore(raw: string | null): number {
   if (raw === null) return 0;
@@ -31,6 +32,13 @@ function parseVisionEnabled(raw: string | null): boolean {
   return raw === 'true';
 }
 
+// Defensive parsing: anything that isn't exactly one of the two known modes
+// (missing key, corrupted value, a future/former variant) falls back to the
+// 'window' default rather than propagating garbage into the game layer.
+function parseVisionMode(raw: string | null): VisionMode {
+  return raw === 'windscreen' ? 'windscreen' : 'window';
+}
+
 export function createPreferences(): Preferences {
   // In-memory fallback, used whenever localStorage is unavailable or throws.
   let memoryBestScore = 0;
@@ -38,6 +46,10 @@ export function createPreferences(): Preferences {
   // Defaults to false: object detection costs a multi-megabyte download and
   // real battery, so it must be a deliberate opt-in, never default-on.
   let memoryVisionEnabled = false;
+  // Defaults to 'window': the side-window framing is the original, better-
+  // understood behaviour, so an unset preference must not silently switch a
+  // returning user to windscreen mode.
+  let memoryVisionMode: VisionMode = 'window';
 
   function readBestScore(): number {
     try {
@@ -90,6 +102,23 @@ export function createPreferences(): Preferences {
     }
   }
 
+  function readVisionMode(): VisionMode {
+    try {
+      return parseVisionMode(window.localStorage.getItem(VISION_MODE_KEY));
+    } catch {
+      return memoryVisionMode;
+    }
+  }
+
+  function writeVisionMode(value: VisionMode): void {
+    memoryVisionMode = value;
+    try {
+      window.localStorage.setItem(VISION_MODE_KEY, value);
+    } catch {
+      // Safari private mode (or any storage failure): keep the in-memory copy.
+    }
+  }
+
   return {
     getBestScore(): number {
       return readBestScore();
@@ -114,6 +143,12 @@ export function createPreferences(): Preferences {
     },
     setVisionEnabled(enabled: boolean): void {
       writeVisionEnabled(enabled);
+    },
+    getVisionMode(): VisionMode {
+      return readVisionMode();
+    },
+    setVisionMode(mode: VisionMode): void {
+      writeVisionMode(mode);
     },
   };
 }

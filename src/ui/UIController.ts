@@ -14,6 +14,7 @@ import type {
   ScreenName,
   UIController,
   UIIntents,
+  VisionMode,
 } from '../types.ts';
 
 const SCREEN_NAMES: readonly ScreenName[] = [
@@ -69,6 +70,79 @@ const VISION_DESC = 'On-device AI: one-time ~9 MB download, more battery.';
 const VISION_ARIA_LABEL =
   'Spot real things out the window. Uses on-device AI: one-time about 9 megabyte download, more battery. Off by default.';
 const VISION_ICON = '\u{1F50D}'; // magnifying glass
+
+interface VisionModeOption {
+  mode: VisionMode;
+  label: string;
+  desc: string;
+}
+
+// Copy is deliberately concrete about the physical action ("phone pointed")
+// and the consequence (what the camera sees / what the game does with it) —
+// the two modes must be legible without trying both.
+const VISION_MODE_OPTIONS: readonly VisionModeOption[] = [
+  {
+    mode: 'window',
+    label: 'Side window',
+    desc: 'Phone pointed out the side. Scenery rushes past.',
+  },
+  {
+    mode: 'windscreen',
+    label: 'Windscreen',
+    desc: 'Phone pointed forward. Jump onto the vehicle ahead.',
+  },
+];
+
+/** Narrows a raw dataset string to VisionMode, or null if it isn't one. */
+function parseVisionMode(value: string | undefined): VisionMode | null {
+  return value === 'window' || value === 'windscreen' ? value : null;
+}
+
+/**
+ * One radio option. `aria-label` always carries the full "label. consequence"
+ * sentence, independent of whether the description is visually shown — CSS
+ * (the paused screen's compact layout, and the short-height media query on
+ * the home screen) is free to hide `.vision-mode__desc` to save vertical
+ * space without ever taking the consequence away from screen reader users.
+ */
+function visionModeOptionHtml(option: VisionModeOption): string {
+  const checked = option.mode === 'window';
+  return `
+    <button
+      type="button"
+      class="vision-mode__option"
+      data-action="select-vision-mode"
+      data-vision-mode-button
+      data-mode="${option.mode}"
+      role="radio"
+      aria-checked="${checked ? 'true' : 'false'}"
+      tabindex="${checked ? '0' : '-1'}"
+      aria-label="${option.label}. ${option.desc}"
+    >
+      <span class="vision-mode__dot" aria-hidden="true"></span>
+      <span class="vision-mode__text">
+        <span class="vision-mode__label">${option.label}</span>
+        <span class="vision-mode__desc">${option.desc}</span>
+      </span>
+    </button>`;
+}
+
+/**
+ * A full radiogroup, rendered once per screen that hosts it (home + paused)
+ * so both can toggle by class with no per-transition DOM churn, same as every
+ * other screen element.
+ */
+function visionModeGroupHtml(compact: boolean): string {
+  const options = VISION_MODE_OPTIONS.map((opt) => visionModeOptionHtml(opt)).join('');
+  return `
+    <div
+      class="vision-mode${compact ? ' vision-mode--compact' : ''}"
+      data-role="vision-mode-group"
+      role="radiogroup"
+      aria-label="Camera framing"
+    >${options}
+    </div>`;
+}
 
 /**
  * Whether the opt-in toggle should render as ON. `idle` (never asked to
@@ -129,6 +203,7 @@ const TEMPLATE = `
         <div class="vision__progress" data-role="vision-progress" hidden aria-hidden="true">
           <div class="vision__progress-fill" data-role="vision-progress-fill"></div>
         </div>
+        ${visionModeGroupHtml(false)}
       </div>
       <div class="home__actions">
         <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
@@ -198,6 +273,7 @@ const TEMPLATE = `
         <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
         <button type="button" class="btn btn--icon" data-action="toggle-vision" data-vision-button aria-pressed="false" aria-label="${VISION_ARIA_LABEL}">${VISION_ICON}</button>
       </div>
+      ${visionModeGroupHtml(true)}
     </div>
   </div>
 
@@ -253,6 +329,8 @@ class GlassyUIController implements UIController {
   private readonly visionStatusTextEl: HTMLElement;
   private readonly visionProgressEl: HTMLElement;
   private readonly visionProgressFillEl: HTMLElement;
+  private readonly visionModeButtons: HTMLButtonElement[];
+  private readonly visionModeGroups: HTMLElement[];
 
   private currentScreen: ScreenName = 'loading';
   private lastScore = -1;
@@ -261,6 +339,7 @@ class GlassyUIController implements UIController {
   private hasCameraFailure = false;
   private lastDetectorStatus: DetectorStatus | null = null;
   private lastDetectorProgress: number | null = null;
+  private lastVisionMode: VisionMode | null = null;
 
   constructor(root: HTMLElement, intents: UIIntents) {
     this.root = root;
@@ -306,6 +385,12 @@ class GlassyUIController implements UIController {
     this.visionStatusTextEl = requireElement(this.root, '[data-role="vision-status-text"]');
     this.visionProgressEl = requireElement(this.root, '[data-role="vision-progress"]');
     this.visionProgressFillEl = requireElement(this.root, '[data-role="vision-progress-fill"]');
+    this.visionModeButtons = Array.from(
+      this.root.querySelectorAll<HTMLButtonElement>('[data-vision-mode-button]'),
+    );
+    this.visionModeGroups = Array.from(
+      this.root.querySelectorAll<HTMLElement>('[data-role="vision-mode-group"]'),
+    );
 
     this.focusTargets = {
       loading: null,
@@ -326,10 +411,12 @@ class GlassyUIController implements UIController {
     };
 
     this.root.addEventListener('click', this.handleClick);
+    this.root.addEventListener('keydown', this.handleKeydown);
 
     this.applyScreen(this.currentScreen);
     this.setMuted(false);
     this.setDetectorState({ status: 'idle' });
+    this.setVisionMode('window');
     this.setupViewportGuard();
   }
 
@@ -409,6 +496,13 @@ class GlassyUIController implements UIController {
     for (const btn of this.visionButtons) {
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     }
+    // The framing choice only matters once detection is actually on — read it
+    // as inactive/secondary rather than hiding it (the user may want to
+    // preset it before opting in) or disabling it (which would need its own
+    // explanation for why a control it can plainly reach doesn't respond).
+    for (const group of this.visionModeGroups) {
+      group.classList.toggle('vision-mode--inactive', !on);
+    }
 
     switch (state.status) {
       case 'loading': {
@@ -448,6 +542,16 @@ class GlassyUIController implements UIController {
         break;
       default:
         break;
+    }
+  }
+
+  setVisionMode(mode: VisionMode): void {
+    if (mode === this.lastVisionMode) return;
+    this.lastVisionMode = mode;
+    for (const btn of this.visionModeButtons) {
+      const checked = parseVisionMode(btn.dataset['mode']) === mode;
+      btn.setAttribute('aria-checked', checked ? 'true' : 'false');
+      btn.tabIndex = checked ? 0 : -1;
     }
   }
 
@@ -529,6 +633,11 @@ class GlassyUIController implements UIController {
       case 'toggle-vision':
         this.intents.onToggleVision();
         break;
+      case 'select-vision-mode': {
+        const mode = parseVisionMode(actionEl.dataset['mode']);
+        if (mode) this.intents.onSelectVisionMode(mode);
+        break;
+      }
       case 'play-without-camera-pre':
       case 'play-without-camera-fail':
         this.intents.onPlayWithoutCamera();
@@ -538,6 +647,38 @@ class GlassyUIController implements UIController {
         break;
       default:
         break;
+    }
+  };
+
+  /**
+   * Roving-tabindex arrow-key navigation for the vision-mode radiogroups.
+   * Individual radios are already reachable and activatable via Tab +
+   * Enter/Space (native `<button>` behaviour); this adds the conventional
+   * left/right (and up/down) radio-group navigation on top.
+   */
+  private readonly handleKeydown = (event: KeyboardEvent): void => {
+    if (
+      event.key !== 'ArrowLeft' &&
+      event.key !== 'ArrowRight' &&
+      event.key !== 'ArrowUp' &&
+      event.key !== 'ArrowDown'
+    ) {
+      return;
+    }
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'radio') return;
+    const group = target.closest<HTMLElement>('[role="radiogroup"]');
+    if (!group || !this.root.contains(group)) return;
+    const options = Array.from(group.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
+    const index = options.indexOf(target as HTMLButtonElement);
+    if (index === -1) return;
+    event.preventDefault();
+    const delta = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
+    const next = options[(index + delta + options.length) % options.length];
+    const mode = parseVisionMode(next?.dataset['mode']);
+    if (next && mode) {
+      next.focus();
+      this.intents.onSelectVisionMode(mode);
     }
   };
 

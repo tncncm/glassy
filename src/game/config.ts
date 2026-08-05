@@ -510,6 +510,104 @@ export const SWIPE_THRESHOLD_PX = 24;
 export const KEYBOARD_GROUND_STEP_PX = 28;
 
 /* ------------------------------------------------------------------ */
+/* Windscreen platforms — src/game/systems/PlatformSystem.ts           */
+/*                                                                      */
+/* VisionMode 'windscreen' turns each STABLE TrackedObject into a real  */
+/* landing surface (see Game.ts's onTrackedObjects and the one-way      */
+/* surface-resolution block in Game.ts's update()). Nothing here is a   */
+/* solvability concern in the util/solvability.ts sense: a platform can */
+/* only ever ADD a place to stand, never a hazard (touching one never   */
+/* ends the run, unlike an Obstacle) and never a barrier (one-way:      */
+/* landable only from above, so it can never block the only route or    */
+/* trap the player — see the one-way selection rule in Game.ts).        */
+/* ------------------------------------------------------------------ */
+
+/** Max simultaneous platforms — "a handful", per the brief. The pool is
+ * fixed size and never grows; a track arriving once the pool is full is
+ * simply ignored until a slot frees up (see PlatformSystem.onTrackedObjects). */
+export const PLATFORM_POOL_SIZE = 6;
+
+/** Exponential follow rate (1/s, used with expDecay like GROUND_LERP_RATE)
+ * a platform's rendered/collidable box chases its latest tracked position
+ * at. The tracker only reports "a few times a second" (types.ts), so this
+ * is deliberately much slower than GROUND_LERP_RATE (12): at that rate the
+ * box would all but snap to each new sample within a frame or two, which —
+ * given how sparse the samples are — would read as a stepped jump wearing a
+ * thin coat of smoothing, not the continuous glide the brief asks for. At
+ * 5/s the box is still visibly gliding when the next sample lands (assuming
+ * ~3-5Hz), so consecutive updates blend into one continuous motion instead
+ * of a series of catch-up snaps. */
+export const PLATFORM_FOLLOW_LERP_RATE = 5;
+
+/** Seconds a platform survives with no matching TrackedObject update before
+ * being fully retired to the pool. Deliberately generous — a real detector
+ * dropping a track for a frame or two (occlusion, a momentary bad frame)
+ * must not yank the ground out from under a standing player. This is a
+ * separate, much longer grace period than the jump/ground-line's own
+ * COYOTE_TIME_SECONDS, which stays tiny and input-focused as before. The
+ * platform remains fully SOLID for this entire window — only its visual
+ * fades (see PLATFORM_FADE_SECONDS) — so "solid" and "visible" never
+ * disagree with each other. */
+export const PLATFORM_GRACE_SECONDS = 0.9;
+
+/** Portion of PLATFORM_GRACE_SECONDS, at its tail end, during which the
+ * platform's alpha ramps from 1 to 0 — the visual warning that a track is
+ * about to disappear, so a player standing on it sees it going before it's
+ * gone, rather than a platform vanishing (or a player falling) with no cue.
+ * Kept strictly <= PLATFORM_GRACE_SECONDS. */
+export const PLATFORM_FADE_SECONDS = 0.45;
+
+/** Small px epsilon around "the player's previous foot position is at or
+ * above a platform's top edge" — the one-way landing test in Game.ts. Just
+ * large enough to absorb interpolation jitter for a player standing still on
+ * a platform (so they don't spuriously fall through it), but far too small
+ * to let a player standing on the ground "snap" onto a platform that
+ * appears meaningfully above their current feet — that must still be
+ * reached by actually jumping, same as any other elevated surface. This is
+ * also what guarantees a platform spawning exactly under/at a standing
+ * player is harmless: it can only become their ground if its top is
+ * essentially where their feet already are. */
+export const PLATFORM_ONE_WAY_TOLERANCE_PX = 6;
+
+/** Forgiving horizontal inset added to a platform's landing X-span before
+ * testing whether the player's column overlaps it — same "players hate
+ * pixel-perfect collision" reasoning as PLAYER_COLLISION_INSET_X. */
+export const PLATFORM_LANDING_MARGIN_PX = 10;
+
+/** Flat, modest score bonus awarded once per landing on a real vehicle
+ * (checked via Player.justLanded — covers both an ordinary landing and a
+ * slam-landing onto one). Deliberately a flat one-time award rather than a
+ * per-second rate, so riding a platform can't be passively farmed for score
+ * — same "reward the event, not the dwell time" choice as
+ * DASH_THROUGH_BONUS_SCORE. */
+export const PLATFORM_LANDING_SCORE_BONUS = 20;
+
+/* --- Platform visuals — legible over arbitrary camera video, reusing the */
+/* ground line's "bright core + soft glow" language so a platform reads as */
+/* "the same kind of thing as the ground" at a glance. */
+
+/** Low-alpha fill so the camera feed (the real vehicle) stays visible
+ * through the platform's body — this is an outline drawn over reality, not
+ * an opaque shape replacing it. Reuses the cyan already used for the dash
+ * indicator/power-up pickup, consistent with this palette's existing
+ * "cyan = helpful/interactive" association. */
+export const PLATFORM_FILL_COLOR = 0x5be8ff;
+export const PLATFORM_FILL_ALPHA = 0.14;
+export const PLATFORM_OUTLINE_COLOR = 0x0c3542;
+export const PLATFORM_OUTLINE_ALPHA = 0.9;
+export const PLATFORM_OUTLINE_WIDTH = 2;
+/** The actual landing-surface indicator: a bright bar along the top edge,
+ * mirroring GROUND_LINE_COLOR/GROUND_LINE_GLOW_THICKNESS's core+glow pair. */
+export const PLATFORM_TOP_BAR_COLOR = 0x5be8ff;
+export const PLATFORM_TOP_BAR_THICKNESS = 3;
+export const PLATFORM_TOP_BAR_GLOW_THICKNESS = 14;
+export const PLATFORM_TOP_BAR_ALPHA = 0.85;
+export const PLATFORM_TOP_BAR_GLOW_ALPHA = 0.22;
+/** How far the top bar extends past the box's own left/right edges — pure
+ * legibility, same idea as GROUND_LINE_OVERDRAW_PX in Game.ts. */
+export const PLATFORM_TOP_BAR_OVERHANG_PX = 6;
+
+/* ------------------------------------------------------------------ */
 /* Debug overlay                                                       */
 /* ------------------------------------------------------------------ */
 

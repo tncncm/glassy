@@ -30,6 +30,8 @@ import {
   type DetectorState,
   type ObjectDetector,
   type SceneAnalyser,
+  type TrackedObject,
+  type VisionMode,
   type UIController,
   type UIIntents,
 } from '../types.ts';
@@ -121,6 +123,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
    */
   const detector: ObjectDetector = createObjectDetector({
     video,
+    mode: preferences.getVisionMode(),
     onStateChange(next: DetectorState): void {
       ui.setDetectorState(next);
     },
@@ -128,6 +131,10 @@ export async function createApp(root: HTMLElement): Promise<App> {
       // The array is reused by the detector — hand it straight on, and the
       // game reads it synchronously. Neither side retains it.
       game.onSceneDetections(detections);
+    },
+    onTrackedObjects(objects: readonly TrackedObject[]): void {
+      // Windscreen mode: these become platforms. Reused array on both sides.
+      game.onTrackedObjects(objects);
     },
   });
 
@@ -212,6 +219,13 @@ export async function createApp(root: HTMLElement): Promise<App> {
         unlockAudio();
         ui.setCameraFailure(null);
         void requestCameraThenPlay();
+      },
+      onSelectVisionMode(mode: VisionMode): void {
+        audio.play('click');
+        preferences.setVisionMode(mode);
+        ui.setVisionMode(mode);
+        detector.setMode(mode);
+        game.setVisionMode(mode);
       },
       onToggleVision(): void {
         audio.play('click');
@@ -526,6 +540,9 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.setInstallHintVisible(isIPhoneSafari() && !isStandalone());
     // Reflect the stored opt-in without starting a download on load.
     ui.setDetectorState({ status: preferences.getVisionEnabled() ? 'idle' : 'disabled' });
+    const savedMode = preferences.getVisionMode();
+    ui.setVisionMode(savedMode);
+    game.setVisionMode(savedMode);
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be

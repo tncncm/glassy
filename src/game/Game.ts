@@ -12,7 +12,7 @@
  */
 
 import { Application, Container, Graphics, Text } from 'pixi.js';
-import type { CreateGame, Detection, Game, GameOptions, GameOverResult, GameStatus } from '../types.ts';
+import type { CreateGame, Detection, Game, GameOptions, GameOverResult, GameStatus, TrackedObject, VisionMode } from '../types.ts';
 import {
   BASE_WORLD_SPEED,
   COLLECTIBLE_SCORE_BONUS,
@@ -41,6 +41,9 @@ import {
   MAX_WORLD_SPEED,
   PICKUP_COLLECTIBLE_COLOR,
   PICKUP_POWERUP_COLOR,
+  PLATFORM_LANDING_MARGIN_PX,
+  PLATFORM_LANDING_SCORE_BONUS,
+  PLATFORM_ONE_WAY_TOLERANCE_PX,
   PLAYER_HEIGHT,
   PLAYER_X_FRACTION,
   POWERUP_SCORE_BONUS,
@@ -52,11 +55,13 @@ import {
   SPEED_RAMP_SCORE_CONSTANT,
 } from './config.ts';
 import { Player } from './entities/Player.ts';
+import type { Platform } from './entities/Platform.ts';
 import { GameLoop } from './GameLoop.ts';
 import { InputSystem } from './systems/InputSystem.ts';
 import { ObstacleSystem } from './systems/ObstacleSystem.ts';
 import { ParticleSystem } from './systems/ParticleSystem.ts';
 import { PickupSystem } from './systems/PickupSystem.ts';
+import { PlatformSystem } from './systems/PlatformSystem.ts';
 import { aabbOverlap, clamp, expDecay, lerp } from './util/math.ts';
 
 /** Off-screen margin used to size the ground-line rects so they always
@@ -98,15 +103,20 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   app.stage.addChild(worldContainer);
 
   const groundGraphics = new Graphics();
+  const platformLayer = new Container();
   const obstacleLayer = new Container();
   const pickupLayer = new Container();
   const particleLayer = new Container();
   const player = new Player();
-  worldContainer.addChild(groundGraphics, obstacleLayer, pickupLayer, player.view, particleLayer);
+  // platformLayer sits above the ground line but below obstacles/player, so
+  // a windscreen platform reads as part of the "ground" the player can
+  // stand on rather than something floating in front of the action.
+  worldContainer.addChild(groundGraphics, platformLayer, obstacleLayer, pickupLayer, player.view, particleLayer);
 
   const obstacles = new ObstacleSystem(obstacleLayer);
   const pickups = new PickupSystem(pickupLayer);
   const particles = new ParticleSystem(particleLayer);
+  const platforms = new PlatformSystem(platformLayer);
 
   let debugText: Text | null = null;
   if (debug === true) {
@@ -121,6 +131,10 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
 
   // --- Mutable game state ------------------------------------------------
   let status: GameStatus = 'idle';
+  // Defaults to 'window', matching Preferences.getVisionMode()'s own default
+  // (types.ts) — 'window' is exactly today's already-validated-as-fun
+  // behaviour, so onTrackedObjects is a no-op until App explicitly opts in.
+  let visionMode: VisionMode = 'window';
   let canvasWidth = initialWidth;
   let canvasHeight = initialHeight;
   let groundYTargetFraction = GROUND_Y_DEFAULT_FRACTION;
@@ -129,6 +143,10 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   let scoreInt = 0;
   let shakeTrauma = 0;
   let debugAccumulator = 0;
+  // Which platform (if any) the player's `groundY` reference currently
+  // tracks — see the one-way surface-resolution block in update() and
+  // Player.syncGroundReference's doc. `null` means "the real ground line".
+  let currentSurfacePlatform: Platform | null = null;
 
   // --- Horizon hint state (see setHorizonHint on the returned Game) --------
   /** Latest estimate from setHorizonHint; null = no usable estimate. */
@@ -171,6 +189,11 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     redrawGround(width);
     groundY = groundTargetPx();
     groundGraphics.y = groundY;
+    // Re-project every active platform's box against the NEW canvas size
+    // right away (dt=0, so no timer advances) — otherwise a platform would
+    // sit at a stale pixel rect from before the resize/orientation-change
+    // until the next running update() call ticks it forward.
+    platforms.update(0, width, height, groundY);
     if (status !== 'running') {
       // Keep the idle/paused/game-over frame visually in sync with the new
       // size instead of waiting for a step that will never come.
@@ -213,11 +236,76 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     groundY = lerp(groundY, groundTargetPx(), expDecay(GROUND_LERP_RATE, dt));
     groundGraphics.y = groundY;
 
+    // --- Windscreen platforms: glide/expire every frame regardless of
+    // visionMode. In 'window' mode (or with nothing currently tracked)
+    // `platforms.activePlatforms` is always empty, so the resolution loop
+    // below leaves effectiveGroundY === groundY untouched and player.update
+    // receives EXACTLY what it always has — that's what keeps 'window' mode
+    // byte-for-byte unchanged rather than needing an if/else fork here.
+    platforms.update(dt, canvasWidth, canvasHeight, groundY);
+
+    // One-way ("land from above only") surface resolution: among every
+    // active platform whose horizontal span covers the player's fixed x,
+    // and whose top the player's PREVIOUS foot position was already at or
+    // above (within PLATFORM_ONE_WAY_TOLERANCE_PX), pick the highest
+    // (smallest-Y) qualifying top; otherwise fall back to the real ground
+    // line. Candidacy additionally requires the player is NOT currently
+    // rising (verticalVelocity <= 0) — without that, an ascending jump could
+    // get caught on a platform's underside mid-flight, which is exactly the
+    // "blocked from below" behaviour one-way platforms must never have. That
+    // pair of checks is what gives BOTH one-way behaviours for free: a
+    // player rising up through a platform's box never qualifies and passes
+    // straight through, while the same player falling back down through the
+    // exact same box does qualify and lands on it. It's also what makes a
+    // platform spawning at/under a standing player harmless — a GROUNDED
+    // player has verticalVelocity === 0 (passes the guard), but can only be
+    // claimed by a platform whose top is essentially where their feet
+    // already are (see PLATFORM_ONE_WAY_TOLERANCE_PX's comment) — one
+    // meaningfully above their current feet is simply not selected.
+    //
+    // This is the ONLY thing that changes what "groundY" means to
+    // Player.update() below — Player itself needs no platform-awareness
+    // beyond the one-off continuity rebase right below. It just lands on
+    // whatever surface Y it's handed each frame, exactly as it already does
+    // for the draggable ground line.
+    const prevFootY = player.groundContactY;
+    let selectedPlatform: Platform | null = null;
+    let effectiveGroundY = groundY;
+    if (player.verticalVelocity <= 0) {
+      const activePlatforms = platforms.activePlatforms;
+      for (let i = 0; i < activePlatforms.length; i++) {
+        const platform = activePlatforms[i]!;
+        if (player.x < platform.left - PLATFORM_LANDING_MARGIN_PX || player.x > platform.right + PLATFORM_LANDING_MARGIN_PX) continue;
+        if (prevFootY > platform.top + PLATFORM_ONE_WAY_TOLERANCE_PX) continue;
+        if (selectedPlatform === null || platform.top < effectiveGroundY) {
+          selectedPlatform = platform;
+          effectiveGroundY = platform.top;
+        }
+      }
+    }
+    // Rebase airborneHeight ONLY on a genuine surface-IDENTITY switch
+    // (ground→platform landing, platform→ground detachment/expiry,
+    // platform→platform) — never for the ordinary case of the SAME surface
+    // continuing to move smoothly (the ground line's own drag/horizon-hint
+    // lerp, or a platform's own follow-glide), which must keep working
+    // exactly as it already does. Gating on identity is also what makes
+    // 'window' mode provably untouched: with zero platforms ever active,
+    // `selectedPlatform` and `currentSurfacePlatform` are permanently both
+    // null, this branch never runs, and player.update() below receives
+    // exactly `groundY` — byte-for-byte the pre-existing call. See
+    // Player.syncGroundReference's doc for why this rebase can never itself
+    // introduce a pop, no matter how far apart the two surfaces are.
+    if (selectedPlatform !== currentSurfacePlatform) {
+      player.syncGroundReference(effectiveGroundY);
+      currentSurfacePlatform = selectedPlatform;
+    }
+    const wasOnPlatformThisFrame = selectedPlatform !== null;
+
     const baseWorldSpeed =
       BASE_WORLD_SPEED + (MAX_WORLD_SPEED - BASE_WORLD_SPEED) * (1 - Math.exp(-scoreInt / SPEED_RAMP_SCORE_CONSTANT));
     const speedRatio = baseWorldSpeed / BASE_WORLD_SPEED;
 
-    player.update(dt, groundY, speedRatio);
+    player.update(dt, effectiveGroundY, speedRatio);
     if (player.justJumped || player.justDoubleJumped) {
       particles.spawnDust(player.x, player.groundContactY);
       callbacks.onSound('jump');
@@ -235,6 +323,12 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     } else if (player.justLanded) {
       particles.spawnDust(player.x, player.groundContactY);
       callbacks.onSound('land');
+    }
+    // Modest bonus for landing on a real vehicle specifically — covers both
+    // an ordinary landing and a slam-landing onto one (Player.justLanded is
+    // true in both cases; see its doc comment).
+    if (player.justLanded && wasOnPlatformThisFrame) {
+      scoreAccumulator += PLATFORM_LANDING_SCORE_BONUS;
     }
 
     // Dash boosts the world's scroll speed only (obstacles, not scoring —
@@ -353,7 +447,8 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         const fps = dt > 0 ? 1 / dt : 0;
         debugText.text =
           `fps ${fps.toFixed(0)}  score ${scoreInt}  speed ${effectiveWorldSpeed.toFixed(0)}` +
-          `  obstacles ${active.length}  pickups ${activePickups.length}  ground ${groundY.toFixed(0)}`;
+          `  obstacles ${active.length}  pickups ${activePickups.length}  ground ${groundY.toFixed(0)}` +
+          `  mode ${visionMode}  platforms ${platforms.activePlatforms.length}`;
       }
     }
 
@@ -412,6 +507,8 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       obstacles.reset();
       pickups.reset();
       particles.reset();
+      platforms.reset();
+      currentSurfacePlatform = null;
       shakeTrauma = 0;
       worldContainer.x = 0;
       worldContainer.y = 0;
@@ -443,6 +540,8 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       obstacles.reset();
       pickups.reset();
       particles.reset();
+      platforms.reset();
+      currentSurfacePlatform = null;
       shakeTrauma = 0;
       worldContainer.x = 0;
       worldContainer.y = 0;
@@ -536,6 +635,51 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
             break;
         }
       }
+    },
+
+    /**
+     * Windscreen mode: real objects ahead, tracked across frames. Purely a
+     * pass-through to PlatformSystem.onTrackedObjects (see that class's doc
+     * for the full matching/spawn/expiry logic) — gated on BOTH `status`
+     * (nothing should spawn while the loop isn't stepping, same reasoning as
+     * onSceneDetections above) and `visionMode`, so a stray call in 'window'
+     * mode (or before the player has switched modes at all) is a guaranteed
+     * no-op. That guarantee is exactly what keeps 'window' mode's gameplay
+     * byte-for-byte unchanged: PlatformSystem.onTrackedObjects is simply
+     * never reached unless the player has explicitly chosen 'windscreen'.
+     * Reads `objects` synchronously only, per the TrackedObject contract in
+     * types.ts; never retains the array or its elements past this call.
+     */
+    onTrackedObjects(objects: readonly TrackedObject[]): void {
+      if (status !== 'running' || visionMode !== 'windscreen') return;
+      platforms.onTrackedObjects(objects);
+    },
+
+    /**
+     * Switches which way the phone is pointed. 'window' is exactly today's
+     * validated-as-fun behaviour and stays fully intact — this method's only
+     * effect on it is that onTrackedObjects becomes (and remains) a no-op.
+     * Any switch also drops every active platform outright: a platform is a
+     * screen-space overlay tied to a specific real-world framing, so
+     * carrying one across a mode change (or even just re-selecting the same
+     * windscreen framing after the camera view has changed) would risk a
+     * stale box sitting somewhere no longer meaningful. Nothing else resets
+     * — score, obstacles, run state are untouched, matching how switching
+     * modes never resets an in-progress run for scene detections either.
+     */
+    setVisionMode(mode: VisionMode): void {
+      if (visionMode === mode) return;
+      visionMode = mode;
+      platforms.reset();
+      // If the player happened to be riding a platform at the moment of the
+      // switch, this intentionally does NOT rebase them back onto the real
+      // ground — with no live camera framing behind 'windscreen' mode being
+      // switched away from, there is no meaningful "where they should end
+      // up" to preserve continuity toward, and a sudden mode switch is
+      // already an abrupt context change from the player's point of view.
+      // The next update() simply resumes using the real ground line, same
+      // as if no platform had ever existed.
+      currentSurfacePlatform = null;
     },
 
     destroy(): void {

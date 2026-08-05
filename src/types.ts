@@ -49,6 +49,9 @@ export interface Preferences {
    */
   getVisionEnabled(): boolean;
   setVisionEnabled(enabled: boolean): void;
+  /** Which way the phone is pointed. Defaults to 'window'. */
+  getVisionMode(): VisionMode;
+  setVisionMode(mode: VisionMode): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +200,52 @@ export interface Detection {
   score: number;
 }
 
+/**
+ * Where the phone is pointed. This is not cosmetic — it changes what the
+ * camera sees, how well detection works, and what the game does with it.
+ */
+export type VisionMode =
+  /**
+   * Rear camera out a SIDE window. Scenery rips past, objects are cropped,
+   * motion-blurred and side-on. Detection is sparse and unreliable here
+   * (measured: ~8 hits in 42s of motorway footage), so detections only
+   * flavour what spawns.
+   */
+  | 'window'
+  /**
+   * Rear camera out the WINDSCREEN. The vehicle ahead holds still in frame,
+   * roughly centred and at a sane scale — much closer to what the model was
+   * trained on. Detections are stable enough to become real, trackable
+   * platforms the player can land on.
+   */
+  | 'windscreen';
+
+/**
+ * A detection followed across frames. The detector runs at a few Hz with a
+ * jittery box; a platform built straight from raw detections would flicker and
+ * jump. The tracker associates each detection with the object it belongs to,
+ * smooths it, and keeps it alive briefly through missed frames.
+ */
+export interface TrackedObject {
+  /** Stable for the life of this object. Never reused. */
+  id: number;
+  kind: DetectedKind;
+  /** Smoothed box centre and size, 0..1 of frame. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  score: number;
+  /** Seconds since it was first seen. */
+  age: number;
+  /**
+   * True once it has been confirmed across enough consecutive frames to be
+   * worth building gameplay on. Consumers should ignore unstable objects for
+   * anything the player can collide with.
+   */
+  stable: boolean;
+}
+
 export type DetectorStatus =
   /** Never asked to load. */
   | 'idle'
@@ -225,6 +274,14 @@ export interface ObjectDetectorOptions {
    * REUSED between calls — read it synchronously, never retain it.
    */
   onDetections?: (detections: readonly Detection[]) => void;
+  /**
+   * Tracked, smoothed objects — the same detections associated across frames.
+   * Use this, not `onDetections`, for anything the player can stand on. The
+   * array is REUSED between calls: read it synchronously, never retain it.
+   */
+  onTrackedObjects?: (objects: readonly TrackedObject[]) => void;
+  /** Fewer, steadier frames suit 'window'; 'windscreen' wants a faster rate. */
+  mode?: VisionMode;
 }
 
 export interface ObjectDetector {
@@ -238,6 +295,8 @@ export interface ObjectDetector {
   stop(): void;
   /** Stop and release the model entirely. */
   dispose(): void;
+  /** Switch what the camera is pointed at. Safe to call while running. */
+  setMode(mode: VisionMode): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -332,6 +391,14 @@ export interface Game {
    * Never required for the game to function.
    */
   onSceneDetections(detections: readonly Detection[]): void;
+  /**
+   * Windscreen mode: real objects ahead, tracked across frames. The game turns
+   * `stable` ones into platforms the player can land on, positioned to follow
+   * the real vehicle on screen. Reused array — read synchronously.
+   */
+  onTrackedObjects(objects: readonly TrackedObject[]): void;
+  /** Changes how detections are used. See VisionMode. */
+  setVisionMode(mode: VisionMode): void;
   /** Tear down Pixi and remove all listeners. */
   destroy(): void;
 }
@@ -373,6 +440,8 @@ export interface UIIntents {
   onRetryCamera(): void;
   /** The user flipped the on-device object-detection opt-in. */
   onToggleVision(): void;
+  /** The user switched between side-window and windscreen framing. */
+  onSelectVisionMode(mode: VisionMode): void;
 }
 
 export interface UIController {
@@ -395,6 +464,8 @@ export interface UIController {
    * download//status line while `loading` or after failure.
    */
   setDetectorState(state: DetectorState): void;
+  /** Reflect the current framing choice in the mode selector. */
+  setVisionMode(mode: VisionMode): void;
   /**
    * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
    * the Fullscreen API does not exist and installing the PWA is the only way
