@@ -1,36 +1,41 @@
 /**
  * PRIVACY — read this before touching anything below.
  *
- * This file feeds the live <video> element straight into an on-device
- * MediaPipe model (`detectForVideo`) and reads back boxes + labels. That is
- * the entire extent of what happens to a frame:
+ * This file feeds the live <video> element into an on-device MediaPipe
+ * model. Inference itself runs in `detector.worker.ts` (a Web Worker), kept
+ * off the main thread purely so a ~170ms inference call never blocks a
+ * frame — the privacy boundary is unchanged by that split, just spread
+ * across two files instead of one:
  *
- *   - inference runs locally, in this tab, on-device — there is no backend
- *     and no code path that could send a frame, a crop or a tensor anywhere
- *   - MediaPipe is handed the live <video> element directly; this file never
- *     draws a frame to a canvas, never calls `toDataURL`/`toBlob`/
- *     `captureStream`/`MediaRecorder`, and never reads pixel data itself
- *   - the ONLY network calls this module ever makes are the one-time,
- *     same-origin fetches of the wasm runtime (`/vision/wasm/*`) and the
- *     detector model (`/vision/efficientdet_lite0_float16.tflite`) — both
- *     self-hosted, never a CDN, never Google, and both happen once at
- *     `start()`, never again during inference
- *   - what survives past a single inference tick is a handful of numbers
- *     (kind, box, score) written into a small object POOL that is reused
- *     forever and handed to `onDetections` — the array and its objects are
- *     mutated in place on the next tick, so nothing about a past frame is
- *     retained anywhere, and nothing is ever written to storage
- *   - `stop()` halts inference immediately; `dispose()` additionally calls
- *     MediaPipe's own `.close()` and drops every reference, including the
- *     loaded model
+ *   - this file's ONLY job with the video is `createImageBitmap(video, …)`,
+ *     a lightweight, downscaled (~320px wide) snapshot — never a full-res
+ *     copy, never drawn to a canvas, never read pixel-by-pixel here
+ *   - that bitmap is TRANSFERRED (not copied — an actual ownership handoff,
+ *     zero-copy) straight into the worker and this file never touches it
+ *     again; the worker closes it immediately after inference, on every
+ *     path, success or failure (see detector.worker.ts)
+ *   - what comes back per tick is a handful of numbers (label, box score)
+ *     written into a small object POOL that is reused forever and handed to
+ *     `onDetections` — the array and its objects are mutated in place on
+ *     the next tick, so nothing about a past frame is retained anywhere,
+ *     and nothing is ever written to storage
+ *   - the ONLY network calls in this file are the one-time, same-origin
+ *     fetch of the detector model (`/vision/efficientdet_lite0_float16.tflite`)
+ *     — self-hosted, never a CDN, never Google — which happens once at
+ *     `start()`, never again during inference. The wasm runtime fetch
+ *     happens inside the worker; see its own PRIVACY comment
+ *   - `stop()` halts inference immediately; `dispose()` additionally tells
+ *     the worker to release MediaPipe's own resources and then terminates
+ *     the worker outright, dropping every reference including the model
  *
- * MediaPipe itself is imported lazily, inside `start()`, so a user who never
- * opts into vision never downloads a byte of the wasm runtime or the model,
- * and none of it ships in the app's main bundle.
+ * MediaPipe itself never runs on the main thread and is never imported
+ * here — only the worker imports it, lazily, and only once this file
+ * actually starts one. A user who never opts into vision never spawns the
+ * worker and never downloads a byte of the wasm runtime or the model.
  *
  * If you are tempted to draw a video frame into a canvas, keep a detection
  * result beyond the tick that produced it, or add any network call outside
- * the one-time asset fetch, stop — read the matching PRIVACY comment above
+ * the one-time model fetch, stop — read the matching PRIVACY comment above
  * `DetectedKind`/`Detection` in src/types.ts first, and change the
  * user-facing copy before you change this.
  */
@@ -43,17 +48,35 @@ import type {
   Detection,
 } from '../types.ts';
 
-// Type-only — erased entirely at compile time. This does NOT pull MediaPipe
-// into the bundle; only the dynamic `import()` inside `start()` does that.
+// Type-only — erased entirely at compile time. Does NOT pull the worker or
+// MediaPipe into this file or the main bundle.
 import type {
-  ObjectDetector as MpObjectDetector,
-  ObjectDetectorResult as MpDetectionResult,
-  Category as MpCategory,
-} from '@mediapipe/tasks-vision';
+  MainToWorkerMessage,
+  WorkerToMainMessage,
+  RawDetection,
+} from './detector.worker.ts';
 
 /** Self-hosted only — see scripts/fetch-vision-assets.mjs. Never a CDN. */
 const WASM_BASE_PATH = '/vision/wasm';
 const MODEL_PATH = '/vision/efficientdet_lite0_float16.tflite';
+/**
+ * Pre-bundled by scripts/build-vision-worker.mjs (run before both `npm run
+ * dev` and `npm run build`) into a plain, classic (non-ESM) worker script —
+ * not something Vite's own worker plugin builds. MediaPipe's wasm loader
+ * only knows two ways to load its glue script: a `<script>` tag on the main
+ * thread, or `importScripts()` inside a CLASSIC worker; calling
+ * `importScripts` from a `type: 'module'` worker throws (module workers may
+ * not use it) and sends MediaPipe down a broken fallback instead. Vite's DEV
+ * SERVER always serves `new Worker(...)` scripts as ES modules — there's no
+ * dev-server option for a true classic worker — so a normal Vite-bundled
+ * worker would work in production but break under `npm run dev` specifically
+ * (which is exactly how tools/video-sim exercises this code). Pre-bundling
+ * ourselves with esbuild sidesteps that distinction entirely: the artifact
+ * at this fixed path is identical, already-classic, in dev and prod alike.
+ * Same directory, same gitignore, same "never precached" treatment (see
+ * `globIgnores` in vite.config.ts) as the wasm runtime and the model.
+ */
+const WORKER_PATH = '/vision/detector-worker.js';
 
 /** Default inferences per second. Low on purpose — a neural net on a phone. */
 const DEFAULT_SAMPLE_HZ = 3;
@@ -66,24 +89,13 @@ const DEFAULT_SCORE_THRESHOLD = 0.3;
 const DEFAULT_MAX_RESULTS = 8;
 
 /**
- * COCO labels Glassy reacts to, mapped to the coarse `DetectedKind` the game
- * consumes. Everything else the model reports is discarded immediately.
- * Passed as `categoryAllowlist` too, so the model itself filters early.
+ * The model's own input is 320x320 regardless of what we hand it, so
+ * feeding it anything bigger is pure waste — every extra pixel is CPU/GPU
+ * spent downscaling on top of what `createImageBitmap` already did for us.
+ * Kept well under 4K/1080p/720p; this is the whole frame, downscaled,
+ * before it ever reaches the worker.
  */
-const LABEL_TO_KIND: Readonly<Record<string, DetectedKind>> = {
-  car: 'vehicle',
-  truck: 'vehicle',
-  bus: 'vehicle',
-  motorcycle: 'vehicle',
-  train: 'vehicle',
-  person: 'person',
-  bicycle: 'person',
-  'traffic light': 'sign',
-  'stop sign': 'sign',
-  'parking meter': 'sign',
-  'fire hydrant': 'sign',
-};
-const ALLOWED_LABELS = Object.keys(LABEL_TO_KIND);
+const TARGET_BITMAP_WIDTH = 320;
 
 /** Give up and fall back to `unavailable` after this many inference throws
  * in a row, rather than throwing (well, warning) on every single tick. */
@@ -102,51 +114,53 @@ const MAX_INTERVAL_MS = 2000;
  * `onStateChange`. */
 const PROGRESS_REPORT_STEP = 0.05;
 
+/**
+ * COCO labels Glassy reacts to, mapped to the coarse `DetectedKind` the game
+ * consumes. Everything else the model reports is discarded immediately.
+ * Passed to the worker as `categoryAllowlist` too, so the model itself
+ * filters early, before a single extra byte crosses back to this thread.
+ */
+const LABEL_TO_KIND: Readonly<Record<string, DetectedKind>> = {
+  car: 'vehicle',
+  truck: 'vehicle',
+  bus: 'vehicle',
+  motorcycle: 'vehicle',
+  train: 'vehicle',
+  person: 'person',
+  bicycle: 'person',
+  'traffic light': 'sign',
+  'stop sign': 'sign',
+  'parking meter': 'sign',
+  'fire hydrant': 'sign',
+};
+const ALLOWED_LABELS = Object.keys(LABEL_TO_KIND);
+
 function clamp01(value: number): number {
   return value < 0 ? 0 : value > 1 ? 1 : value;
 }
 
 /**
- * PRIVACY — MediaPipe's Tasks Vision runtime has its OWN built-in usage
- * telemetry compiled into the bundle: it periodically `fetch()`s aggregated,
- * non-frame usage stats (task type, delegate, init/inference timing) to
- * `https://odml.pa.googleapis.com/v1/log`, and — as of this dependency's
- * pinned version — there is no public JS option to turn it off. That is a
- * network call this file's contract explicitly forbids ("no network call in
- * the inference path; the only fetches are the wasm + model, same-origin").
- *
- * Since it can't be configured off, it is blocked at the fetch layer: any
- * request whose host is this one specific Google logging endpoint is
- * intercepted and rejected before it leaves the tab. MediaPipe's own sender
- * already wraps that fetch in try/catch and treats any failure as
- * "logging unavailable, stop trying" — so this fails silently and permanently
- * for that logger, with zero effect on model inference or on any other
- * fetch (our own same-origin `/vision/*` fetches pass straight through).
- * Installed once, lazily, right before the dynamic MediaPipe import — never
- * touches `window.fetch` for a user who never opts into vision.
+ * Picks the downscaled bitmap size handed to the worker: capped at
+ * `TARGET_BITMAP_WIDTH` wide, aspect ratio preserved, never upscaled.
  */
-const BLOCKED_TELEMETRY_HOST_SUFFIX = '.pa.googleapis.com';
-let telemetryBlockInstalled = false;
+function computeBitmapSize(videoWidth: number, videoHeight: number): { width: number; height: number } {
+  if (videoWidth <= 0 || videoHeight <= 0) {
+    return { width: TARGET_BITMAP_WIDTH, height: TARGET_BITMAP_WIDTH };
+  }
+  const width = Math.min(TARGET_BITMAP_WIDTH, videoWidth);
+  const height = Math.max(1, Math.round((width * videoHeight) / videoWidth));
+  return { width, height };
+}
 
-function installTelemetryBlock(): void {
-  if (telemetryBlockInstalled) return;
-  telemetryBlockInstalled = true;
-  if (typeof window === 'undefined' || typeof window.fetch !== 'function') return;
-
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    let host = '';
-    try {
-      const url = typeof input === 'string' || input instanceof URL ? input : input.url;
-      host = new URL(url, window.location.href).host;
-    } catch {
-      // Unparseable input — let the real fetch deal with (and reject) it.
-    }
-    if (host === 'odml.pa.googleapis.com' || host.endsWith(BLOCKED_TELEMETRY_HOST_SUFFIX)) {
-      throw new DOMException('blocked: MediaPipe telemetry is disabled in Glassy', 'AbortError');
-    }
-    return originalFetch(input, init);
-  }) as typeof window.fetch;
+/** True only when this browser can actually run the worker pipeline at all.
+ * If any of these are missing, detection degrades to `unavailable` rather
+ * than falling back to blocking the main thread. */
+function environmentSupportsWorkerPipeline(): boolean {
+  return (
+    typeof Worker !== 'undefined' &&
+    typeof createImageBitmap === 'function' &&
+    typeof WebAssembly !== 'undefined'
+  );
 }
 
 export function createObjectDetector(options: ObjectDetectorOptions): ObjectDetector {
@@ -177,15 +191,22 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   }));
   const output: Detection[] = [];
 
-  let mpDetector: MpObjectDetector | null = null;
+  let worker: Worker | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let inflight = false;
   let lastTimestamp = -1;
+  let requestCounter = 0;
+  let pendingRequestId = -1;
+  let pendingStartedAt = 0;
   let consecutiveErrors = 0;
   let slowStreak = 0;
   let warnedSlow = false;
   let warnedUnavailable = false;
   let warnedInferenceError = false;
+
+  // Resolvers for the in-flight `init` round-trip, so `loadAndStart()` can
+  // simply `await` the worker's `ready`/`init-error` response.
+  let pendingInit: { resolve: () => void; reject: (err: Error) => void } | null = null;
 
   // Set while an in-flight start() should unwind into 'disabled' rather than
   // 'ready'/'unavailable' — stop()/dispose() called mid-load.
@@ -202,6 +223,10 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     } else {
       console.warn(`[ObjectDetector] ${message}`);
     }
+  }
+
+  function postToWorker(w: Worker, message: MainToWorkerMessage, transfer: Transferable[] = []): void {
+    w.postMessage(message, transfer);
   }
 
   function clearTimer(): void {
@@ -240,80 +265,222 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     }
   }
 
+  function terminateWorker(): void {
+    worker?.terminate();
+    worker = null;
+  }
+
   function failPermanently(): void {
     clearTimer();
-    try {
-      mpDetector?.close();
-    } catch {
-      // Already broken; nothing more we can do about it.
-    }
-    mpDetector = null;
+    inflight = false;
+    terminateWorker();
     setState({ status: 'unavailable' });
   }
 
-  function publishDetections(result: MpDetectionResult): void {
+  function publishDetections(detections: readonly RawDetection[], bitmapWidth: number, bitmapHeight: number): void {
     output.length = 0;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (vw === 0 || vh === 0) {
+    if (bitmapWidth === 0 || bitmapHeight === 0) {
       options.onDetections?.(output);
       return;
     }
 
-    for (const detection of result.detections) {
+    for (const detection of detections) {
       if (output.length >= pool.length) break;
-      const box = detection.boundingBox;
-      if (!box) continue;
-      const top: MpCategory | undefined = detection.categories[0];
-      if (!top) continue;
-      const kind = LABEL_TO_KIND[top.categoryName];
+      const kind = LABEL_TO_KIND[detection.categoryName];
       if (!kind) continue;
 
       const slot = pool[output.length];
       if (!slot) break;
       slot.kind = kind;
-      slot.x = clamp01((box.originX + box.width / 2) / vw);
-      slot.y = clamp01((box.originY + box.height / 2) / vh);
-      slot.width = clamp01(box.width / vw);
-      slot.height = clamp01(box.height / vh);
-      slot.score = top.score;
+      slot.x = clamp01((detection.originX + detection.width / 2) / bitmapWidth);
+      slot.y = clamp01((detection.originY + detection.height / 2) / bitmapHeight);
+      slot.width = clamp01(detection.width / bitmapWidth);
+      slot.height = clamp01(detection.height / bitmapHeight);
+      slot.score = detection.score;
       output.push(slot);
     }
 
     options.onDetections?.(output);
   }
 
+  function handleDetectResult(data: Extract<WorkerToMainMessage, { type: 'result' }>): void {
+    if (data.requestId !== pendingRequestId) return; // stale — a later tick already moved on
+    inflight = false;
+    if (currentState.status !== 'ready') return; // stopped/disposed while this was in flight
+    consecutiveErrors = 0;
+    publishDetections(data.detections, data.bitmapWidth, data.bitmapHeight);
+    trackTiming(performance.now() - pendingStartedAt);
+  }
+
+  function handleDetectError(data: Extract<WorkerToMainMessage, { type: 'detect-error' }>): void {
+    if (data.requestId !== pendingRequestId) return; // stale
+    inflight = false;
+    consecutiveErrors++;
+    warnOnce(
+      () => (warnedInferenceError = true),
+      warnedInferenceError,
+      'inference threw inside the worker; will retry a few times before disabling detection for this session.',
+      data.message,
+    );
+    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      failPermanently();
+    }
+  }
+
+  function handleWorkerMessage(data: WorkerToMainMessage): void {
+    switch (data.type) {
+      case 'ready':
+        pendingInit?.resolve();
+        pendingInit = null;
+        break;
+      case 'init-error':
+        pendingInit?.reject(new Error(data.message));
+        pendingInit = null;
+        break;
+      case 'result':
+        handleDetectResult(data);
+        break;
+      case 'detect-error':
+        handleDetectError(data);
+        break;
+      case 'disposed':
+        // Handled by disposeWorker()'s own one-shot listener below; nothing
+        // to do on the shared handler.
+        break;
+    }
+  }
+
+  function handleWorkerFatalError(message: string): void {
+    warnOnce(() => (warnedUnavailable = true), warnedUnavailable, `vision worker failed: ${message}`);
+    if (pendingInit) {
+      pendingInit.reject(new Error(message));
+      pendingInit = null;
+      return;
+    }
+    failPermanently();
+  }
+
+  function createWorker(): Worker | null {
+    try {
+      // Deliberately a plain classic worker (no `{ type: 'module' }`) from a
+      // fixed, pre-bundled static path — see the WORKER_PATH comment above.
+      const w = new Worker(WORKER_PATH);
+      w.onmessage = (event: MessageEvent): void => {
+        handleWorkerMessage(event.data as WorkerToMainMessage);
+      };
+      w.onerror = (event: ErrorEvent): void => {
+        handleWorkerFatalError(event.message || 'unknown worker error');
+      };
+      w.onmessageerror = (): void => {
+        handleWorkerFatalError('a worker message could not be deserialised');
+      };
+      return w;
+    } catch {
+      return null;
+    }
+  }
+
+  function initWorker(w: Worker, modelBytes: Uint8Array): Promise<void> {
+    return new Promise((resolve, reject) => {
+      pendingInit = { resolve, reject };
+      // `fetchModelWithProgress` always builds `modelBytes` via
+      // `new Uint8Array(received)`, so `.buffer` is always a fresh, plain
+      // ArrayBuffer (never a SharedArrayBuffer) — safe to assert and hand
+      // over as a transferable.
+      const buffer = modelBytes.buffer as ArrayBuffer;
+      postToWorker(
+        w,
+        {
+          type: 'init',
+          wasmBasePath: WASM_BASE_PATH,
+          modelBytes: buffer,
+          scoreThreshold: DEFAULT_SCORE_THRESHOLD,
+          maxResults,
+          categoryAllowlist: ALLOWED_LABELS,
+        },
+        [buffer],
+      );
+    });
+  }
+
+  /** Fire-and-forget best-effort teardown: tells the worker to release
+   * MediaPipe's own resources (a synchronous `.close()` call the worker can
+   * make instantly), then terminates the worker unconditionally shortly
+   * after regardless of whether it acknowledged — a worker that never
+   * responds (crashed, wedged) must not leak forever. `dispose()` itself
+   * stays synchronous per the frozen contract in types.ts; this runs after
+   * it returns. */
+  function disposeWorker(w: Worker): void {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      w.terminate();
+    };
+    w.addEventListener(
+      'message',
+      (event: MessageEvent) => {
+        if ((event.data as WorkerToMainMessage).type === 'disposed') finish();
+      },
+      { once: true },
+    );
+    try {
+      postToWorker(w, { type: 'dispose' });
+    } catch {
+      finish();
+      return;
+    }
+    setTimeout(finish, 250);
+  }
+
   function runInference(): void {
     if (inflight) return; // previous tick hasn't finished — never queue up
     if (document.hidden) return;
     if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return;
-    if (!mpDetector) return;
+    if (!worker) return;
 
     const now = Math.round(performance.now());
     if (now <= lastTimestamp) return; // MediaPipe requires strictly increasing timestamps
     lastTimestamp = now;
 
+    const { width, height } = computeBitmapSize(video.videoWidth, video.videoHeight);
+    const requestId = ++requestCounter;
     inflight = true;
-    const startedAt = performance.now();
-    try {
-      const result = mpDetector.detectForVideo(video, now);
-      consecutiveErrors = 0;
-      publishDetections(result);
-    } catch (err) {
-      consecutiveErrors++;
-      warnOnce(
-        () => (warnedInferenceError = true),
-        warnedInferenceError,
-        'inference threw; will retry a few times before disabling detection for this session.',
-        err,
-      );
-      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-        failPermanently();
-      }
-    } finally {
-      inflight = false;
-    }
-    trackTiming(performance.now() - startedAt);
+    pendingRequestId = requestId;
+    pendingStartedAt = performance.now();
+
+    // 'medium', not 'low': MediaPipe resizes again internally to its own
+    // fixed input size regardless of what we hand it, so THIS resize is the
+    // only chance to preserve detail before that — a cheap-and-blurry first
+    // pass here measurably cost small/distant detections (person, bicycle)
+    // in testing, for no measurable main-thread time saved at this target
+    // size (~320px wide).
+    createImageBitmap(video, { resizeWidth: width, resizeHeight: height, resizeQuality: 'medium' })
+      .then((bitmap) => {
+        // Stale by the time the (async) capture finished — a stop()/resume()
+        // raced ahead of us, or the worker was torn down. Drop it, never
+        // queue it up behind whatever's current now.
+        if (!worker || requestId !== pendingRequestId) {
+          bitmap.close();
+          if (requestId === pendingRequestId) inflight = false;
+          return;
+        }
+        postToWorker(worker, { type: 'detect', requestId, bitmap, timestamp: now }, [bitmap]);
+      })
+      .catch((err: unknown) => {
+        if (requestId !== pendingRequestId) return;
+        inflight = false;
+        consecutiveErrors++;
+        warnOnce(
+          () => (warnedInferenceError = true),
+          warnedInferenceError,
+          'failed to capture a frame for detection; will retry a few times before disabling detection for this session.',
+          err,
+        );
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          failPermanently();
+        }
+      });
   }
 
   async function fetchModelWithProgress(signal: AbortSignal): Promise<Uint8Array> {
@@ -357,65 +524,44 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   }
 
   async function loadAndStart(): Promise<DetectorState> {
-    if (typeof WebAssembly === 'undefined') {
-      warnOnce(() => (warnedUnavailable = true), warnedUnavailable, 'WebAssembly is not supported here.');
+    if (!environmentSupportsWorkerPipeline()) {
+      warnOnce(
+        () => (warnedUnavailable = true),
+        warnedUnavailable,
+        'this browser lacks Worker/createImageBitmap/WebAssembly support needed for on-device detection.',
+      );
       setState({ status: 'unavailable' });
       return currentState;
     }
 
     stopRequested = false;
     loadAbort = new AbortController();
-    installTelemetryBlock();
     setState({ status: 'loading' });
 
     try {
-      const [mediapipe, modelBytes] = await Promise.all([
-        import('@mediapipe/tasks-vision'),
-        fetchModelWithProgress(loadAbort.signal),
-      ]);
+      const modelBytes = await fetchModelWithProgress(loadAbort.signal);
 
       if (stopRequested) {
         setState({ status: 'disabled' });
         return currentState;
       }
 
-      const fileset = await mediapipe.FilesetResolver.forVisionTasks(WASM_BASE_PATH);
+      if (!worker) {
+        worker = createWorker();
+        if (!worker) {
+          warnOnce(() => (warnedUnavailable = true), warnedUnavailable, 'failed to start the detection worker.');
+          setState({ status: 'unavailable' });
+          return currentState;
+        }
+      }
+
+      await initWorker(worker, modelBytes);
 
       if (stopRequested) {
         setState({ status: 'disabled' });
         return currentState;
       }
 
-      const shared = {
-        runningMode: 'VIDEO' as const,
-        scoreThreshold: DEFAULT_SCORE_THRESHOLD,
-        maxResults,
-        categoryAllowlist: ALLOWED_LABELS,
-      };
-
-      let detector: MpObjectDetector;
-      try {
-        detector = await mediapipe.ObjectDetector.createFromOptions(fileset, {
-          ...shared,
-          baseOptions: { modelAssetBuffer: modelBytes, delegate: 'GPU' },
-        });
-      } catch (gpuErr) {
-        // GPU delegate support varies a lot across real phones; a hard
-        // failure here must not kill the feature.
-        console.warn('[ObjectDetector] GPU delegate unavailable, falling back to CPU.', gpuErr);
-        detector = await mediapipe.ObjectDetector.createFromOptions(fileset, {
-          ...shared,
-          baseOptions: { modelAssetBuffer: modelBytes, delegate: 'CPU' },
-        });
-      }
-
-      if (stopRequested) {
-        detector.close();
-        setState({ status: 'disabled' });
-        return currentState;
-      }
-
-      mpDetector = detector;
       consecutiveErrors = 0;
       slowStreak = 0;
       intervalMs = baseIntervalMs;
@@ -434,6 +580,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         'failed to initialise the on-device object detector; continuing without it.',
         err,
       );
+      terminateWorker();
       setState({ status: 'unavailable' });
       return currentState;
     } finally {
@@ -458,8 +605,8 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       if (startPromise) {
         return startPromise;
       }
-      if (currentState.status === 'disabled' && mpDetector) {
-        // Model already loaded — instant resume, no re-fetch.
+      if (currentState.status === 'disabled' && worker) {
+        // Model already loaded in the worker — instant resume, no re-fetch.
         stopRequested = false;
         consecutiveErrors = 0;
         slowStreak = 0;
@@ -471,7 +618,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       }
       // idle, unavailable (deliberate retry — e.g. the network came back;
       // warnedUnavailable already guards against repeat warnings), or
-      // disabled-without-a-loaded-model: all fall through to a full load.
+      // disabled-without-a-loaded-worker: all fall through to a full load.
       const promise = loadAndStart().finally(() => {
         startPromise = null;
       });
@@ -500,12 +647,12 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       stopRequested = true;
       loadAbort?.abort();
       stopInference();
-      try {
-        mpDetector?.close();
-      } catch {
-        // Best-effort; we're dropping the reference regardless.
+      pendingInit?.reject(new Error('disposed'));
+      pendingInit = null;
+      if (worker) {
+        disposeWorker(worker);
+        worker = null;
       }
-      mpDetector = null;
       output.length = 0;
       setState({ status: 'idle' });
     },

@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "npm run vision-assets && vite",
-    "build": "npm run vision-assets && tsc --noEmit && vite build",
+    "dev": "npm run vision-assets && npm run vision-worker && vite",
+    "build": "npm run vision-assets && npm run vision-worker && tsc --noEmit && vite build",
     "vision-assets": "node scripts/fetch-vision-assets.mjs",
+    "vision-worker": "node scripts/build-vision-worker.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "generate-icons": "node scripts/generate-icons.mjs"
@@ -16,6 +17,7 @@
     "pixi.js": "^8.6.6"
   },
   "devDependencies": {
+    "esbuild": "^0.25.0",
     "typescript": "~5.7.2",
     "vite": "^6.0.7",
     "vite-plugin-pwa": "^0.21.1"
