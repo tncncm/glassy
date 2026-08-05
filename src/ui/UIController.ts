@@ -93,6 +93,9 @@ const TEMPLATE = `
         <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
         <button type="button" class="btn btn--icon home__mute" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
       </div>
+      <p class="install-hint" data-install-hint hidden>
+        For true full screen on iPhone: tap <strong>Share</strong>, then <strong>Add to Home Screen</strong>, and open Glassy from there.
+      </p>
     </div>
   </div>
 
@@ -191,6 +194,7 @@ class GlassyUIController implements UIController {
   private readonly gameOverBestEl: HTMLElement;
   private readonly newBestBadge: HTMLElement;
   private readonly debugEl: HTMLElement;
+  private readonly installHintEl: HTMLElement;
 
   private readonly permissionPreRequestEl: HTMLElement;
   private readonly permissionFailureEl: HTMLElement;
@@ -238,6 +242,8 @@ class GlassyUIController implements UIController {
     this.failureBodyEl = requireElement(this.root, '[data-role="failure-body"]');
     this.continueButtonEl = requireElement(this.root, '[data-action="continue"]');
     this.retryButtonEl = requireElement(this.root, '[data-action="retry"]');
+
+    this.installHintEl = requireElement(this.root, '[data-install-hint]');
 
     this.muteButtons = Array.from(
       this.root.querySelectorAll<HTMLButtonElement>('[data-mute-button]'),
@@ -340,6 +346,11 @@ class GlassyUIController implements UIController {
     }
     this.debugEl.removeAttribute('hidden');
     this.debugEl.textContent = text;
+  }
+
+  setInstallHintVisible(visible: boolean): void {
+    if (visible) this.installHintEl.removeAttribute('hidden');
+    else this.installHintEl.setAttribute('hidden', '');
   }
 
   // -------------------------------------------------------------------- //

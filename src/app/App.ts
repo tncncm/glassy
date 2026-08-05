@@ -115,6 +115,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
         // shows the explainer; from the explainer it actually asks.
         audio.play('click');
         unlockAudio();
+        // Must ride this gesture — a fullscreen request outside one is refused.
+        requestFullscreenIfSupported();
         if (state === 'home') {
           ui.setCameraFailure(null);
           go('requestingCamera', { requestCamera: false });
@@ -139,6 +141,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
       },
       onQuitToHome(): void {
         audio.play('click');
+        // Don't strand the user in a chromeless window on the home screen.
+        exitFullscreenIfActive();
         go('home');
       },
       onToggleMute(): void {
@@ -360,6 +364,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.setMuted(audio.isMuted());
     ui.setBest(preferences.getBestScore());
     ui.setScore(0);
+    // Only nag where it's the only option and isn't already done.
+    ui.setInstallHintVisible(isIPhoneSafari() && !isStandalone());
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be
@@ -413,6 +419,51 @@ function isDebugEnabled(): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+/** True when launched from the home screen as an installed PWA. */
+function isStandalone(): boolean {
+  const iosStandalone = (navigator as Navigator & { standalone?: boolean }).standalone === true;
+  return iosStandalone || window.matchMedia('(display-mode: standalone)').matches;
+}
+
+/** iPhone/iPod Safari — the one platform with no Fullscreen API at all. */
+function isIPhoneSafari(): boolean {
+  return /iPhone|iPod/.test(navigator.userAgent);
+}
+
+/**
+ * Go full screen if the platform allows it. MUST be called from a user gesture.
+ *
+ * iPhone Safari implements none of this — `requestFullscreen` is simply absent
+ * (iPad has had it since iPadOS 13). There is no workaround: on iPhone the only
+ * real full screen is installing the PWA to the home screen, which is why the
+ * home screen carries that hint instead. Every failure here is swallowed.
+ */
+function requestFullscreenIfSupported(): void {
+  try {
+    const el = document.documentElement as HTMLElement & {
+      webkitRequestFullscreen?: () => Promise<void> | void;
+    };
+    if (document.fullscreenElement) return;
+    if (typeof el.requestFullscreen === 'function') {
+      void el.requestFullscreen({ navigationUI: 'hide' }).catch(() => {});
+    } else if (typeof el.webkitRequestFullscreen === 'function') {
+      void el.webkitRequestFullscreen();
+    }
+  } catch {
+    /* not supported — the app is perfectly playable windowed */
+  }
+}
+
+function exitFullscreenIfActive(): void {
+  try {
+    if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      void document.exitFullscreen().catch(() => {});
+    }
+  } catch {
+    /* nothing to exit */
   }
 }
 

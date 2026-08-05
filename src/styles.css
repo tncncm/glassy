@@ -296,6 +296,24 @@ body {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
 }
 
+/* iOS-only "Add to Home Screen" hint — iPhone Safari has no Fullscreen API. */
+.install-hint {
+  margin-top: 2px;
+  font-size: clamp(11px, 2.1vh, 12.5px);
+  line-height: 1.4;
+  color: var(--glassy-ink-dim);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.install-hint[hidden] {
+  display: none;
+}
+
+.install-hint strong {
+  color: var(--glassy-ink);
+  font-weight: 600;
+}
+
 .stat {
   display: flex;
   flex-direction: column;
@@ -559,10 +577,19 @@ body {
 /* Screen: playing (HUD)                                               */
 /* ------------------------------------------------------------------ */
 
-.screen[data-screen='playing'] {
+/**
+ * The playing screen is a full-viewport overlay sitting ABOVE the Pixi canvas,
+ * so it must stay transparent to pointers even while active — otherwise it
+ * swallows every tap and drag and the game receives no input at all. Only the
+ * HUD buttons opt back in, via `.hud__controls .btn { pointer-events: auto }`.
+ * This overrides `.screen--active`; do not remove it.
+ */
+.screen[data-screen='playing'],
+.screen[data-screen='playing'].screen--active {
   touch-action: none;
   -webkit-user-select: none;
   user-select: none;
+  pointer-events: none;
 }
 
 .hud {

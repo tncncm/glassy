@@ -236,4 +236,10 @@ export interface UIController {
   setCameraFailure(failure: CameraFailure | null): void;
   /** Dev-only FPS readout; ignored when the debug flag is off. */
   setDebugText(text: string): void;
+  /**
+   * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
+   * the Fullscreen API does not exist and installing the PWA is the only way
+   * to actually get a full screen.
+   */
+  setInstallHintVisible(visible: boolean): void;
 }
