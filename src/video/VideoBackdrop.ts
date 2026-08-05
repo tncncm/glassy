@@ -21,6 +21,13 @@
 export const DEMO_VIDEO_SRC = '/demo/dashcam.mp4';
 
 /**
+ * Ceiling on waiting for the clip's first frame. A missing or stalled file
+ * must not leave the player staring at a black screen — past this we give up
+ * and let the caller fall back to the animated gradient.
+ */
+const LOAD_TIMEOUT_MS = 8000;
+
+/**
  * Dev-only `?video=` override. Callers MUST wrap the call in
  * `if (import.meta.env.DEV)` so the branch is statically eliminated —
  * testing this at runtime instead would ship the dev path in the bundle.
@@ -48,16 +55,47 @@ export async function attachVideoBackdrop(
     // The fallback gradient canvas sits above the video and would hide it.
     fallbackCanvas.hidden = true;
     video.srcObject = null;
-    video.src = src;
     video.loop = true;
     video.muted = true;
     video.playsInline = true;
-    await new Promise<void>((resolve, reject) => {
-      video.onloadeddata = () => resolve();
-      video.onerror = () => reject(new Error(`could not load ${src}`));
+    video.src = src;
+
+    /*
+     * play() MUST be called here, synchronously after setting src, and NOT
+     * after awaiting `loadeddata`.
+     *
+     * iOS Safari only honours play() while the page still has user
+     * activation, and activation does not survive an await. Waiting for the
+     * video to load first — the obvious ordering — gets the promise rejected
+     * with NotAllowedError on a real iPhone while working fine on desktop.
+     * Calling it now is legal even though no data has arrived yet: WebKit
+     * queues the request and starts as soon as it can.
+     */
+    const playing = video.play();
+
+    // Then wait for actual data, with a ceiling so a stalled or missing file
+    // can't hang the game on a black screen.
+    await Promise.race([
+      new Promise<void>((resolve, reject) => {
+        if (video.readyState >= 2) {
+          resolve();
+          return;
+        }
+        video.onloadeddata = () => resolve();
+        video.onerror = () => reject(new Error(`could not load ${src}`));
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`timed out loading ${src}`)), LOAD_TIMEOUT_MS),
+      ),
+    ]);
+
+    // A rejected play() is not fatal on its own — the element may still be
+    // primed and start on the next tick — but a video with no data is.
+    await playing.catch((err: unknown) => {
+      console.warn('[glassy] video play() rejected; continuing', err);
     });
-    await video.play();
-    return true;
+
+    return video.readyState >= 2;
   } catch (err) {
     console.error('[glassy] video backdrop failed', err);
     return false;
