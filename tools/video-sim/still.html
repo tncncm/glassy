@@ -1,0 +1,39 @@
+<!doctype html><html><body style="background:#111;color:#eee;font:12px monospace">
+<pre id="out">…</pre>
+<script type="module">
+/** Compares int8 vs float32 on the same stills, to tell a broken pipeline
+ *  from a genuinely hard scene. */
+import { FilesetResolver, ObjectDetector } from '@mediapipe/tasks-vision';
+
+window.__run = async (paths, models) => {
+  const fs = await FilesetResolver.forVisionTasks('/vision/wasm');
+  const results = {};
+  for (const model of models) {
+    let det;
+    try {
+      det = await ObjectDetector.createFromOptions(fs, {
+        baseOptions: { modelAssetPath: model, delegate: 'GPU' },
+        runningMode: 'IMAGE',
+        scoreThreshold: 0.05,
+        maxResults: 25,
+      });
+    } catch (e) {
+      results[model] = { error: String(e.message ?? e) };
+      continue;
+    }
+    results[model] = {};
+    for (const p of paths) {
+      const img = new Image();
+      img.src = p;
+      await img.decode();
+      const r = det.detect(img);
+      results[model][p.split('/').pop()] = (r.detections ?? [])
+        .map((d) => ({ n: d.categories[0]?.categoryName, s: +d.categories[0]?.score.toFixed(3) }))
+        .slice(0, 10);
+    }
+    det.close();
+  }
+  document.getElementById('out').textContent = JSON.stringify(results, null, 1);
+  return results;
+};
+</script></body></html>

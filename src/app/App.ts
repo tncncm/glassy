@@ -66,6 +66,9 @@ const ROTATE_PROMPT_MAX_SHORT_EDGE = 820;
  */
 const HORIZON_PUSH_INTERVAL_MS = 200;
 
+/** See the comment in `syncSceneAnalysis`. */
+const HORIZON_HINT_ENABLED = true;
+
 export interface App {
   start(): Promise<void>;
   destroy(): void;
@@ -254,7 +257,22 @@ export async function createApp(root: HTMLElement): Promise<App> {
    * we have no gameplay reason to read.
    */
   function syncSceneAnalysis(): void {
-    const shouldRun = state === 'playing' && camera.state.status === 'live';
+    // Measured against real Italian motorway footage (tools/video-sim), the
+    // estimator locks onto the crash barrier's top rail rather than the
+    // skyline — and that is what we want: the barrier IS the running surface
+    // the player is trying to line up with.
+    //
+    // It first shipped wandering over 0.50..0.88 of frame height (it hopped
+    // between the barrier's three parallel rails), which would have slid the
+    // ground by a third of the screen mid-run. After cluster-locking and
+    // stickiness in SceneAnalyser: range 0.52..0.75, std dev 0.067, and a
+    // 5-6x smoother frame-to-frame step. What remains is genuine perspective
+    // drift of the rail itself, which SHOULD be tracked.
+    //
+    // The game still treats this as a hint only: a manual drag overrides it
+    // for 4s and low confidence is ignored.
+    const shouldRun =
+      HORIZON_HINT_ENABLED && state === 'playing' && camera.state.status === 'live';
     if (shouldRun) {
       scene.start();
       if (horizonTimer === null) {

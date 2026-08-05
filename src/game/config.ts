@@ -33,9 +33,17 @@ export const GROUND_LERP_RATE = 12;
 
 /* --- Horizon hint bias (camera-estimated horizon nudging the ground target) */
 
-/** Below this confidence the horizon estimate is ignored outright — a noisy
- * single-frame estimate must never be allowed to tug the ground line. */
-export const HORIZON_HINT_MIN_CONFIDENCE = 0.35;
+/**
+ * Below this confidence the horizon estimate is ignored outright — a noisy
+ * single-frame estimate must never be allowed to tug the ground line.
+ *
+ * Measured, not guessed: on real motorway footage (tools/video-sim) a solid
+ * lock on the crash barrier reports ~0.32 mean confidence, because cluster
+ * averaging deliberately flattens the peak it scores against. This sat at
+ * 0.35 and silently rejected almost every good estimate. Fog and pure noise
+ * still report null outright, so they never reach this check.
+ */
+export const HORIZON_HINT_MIN_CONFIDENCE = 0.22;
 /** Seconds after any manual ground-line drag (pointer or keyboard) during
  * which the horizon hint is ignored entirely. The player's own placement of
  * the platform always wins over a passive camera guess. */

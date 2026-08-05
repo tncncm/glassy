@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Glassy — video simulation harness</title>
+    <style>
+      body { margin: 0; background: #05060a; color: #f4f6fb; font: 13px -apple-system, sans-serif; }
+      #wrap { position: relative; display: inline-block; }
+      video { display: block; max-width: 100vw; }
+      canvas { position: absolute; inset: 0; pointer-events: none; }
+      #hud { padding: 8px 12px; font-variant-numeric: tabular-nums; white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <video id="v" muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="hud">idle</div>
+
+    <script type="module">
+      /**
+       * Dev-only diagnostic. Runs the REAL SceneAnalyser and ObjectDetector
+       * against a recorded video instead of a live camera, so we can judge
+       * on real driving footage whether either is worth keeping.
+       *
+       * The video never leaves this machine: it is read from the local dev
+       * server and analysed in-page, exactly as a camera frame would be.
+       */
+      import { createSceneAnalyser } from '/src/vision/SceneAnalyser.ts';
+      import { createObjectDetector } from '/src/vision/ObjectDetector.ts';
+
+      const video = document.getElementById('v');
+      const overlay = document.getElementById('overlay');
+      const hud = document.getElementById('hud');
+      const ctx = overlay.getContext('2d');
+
+      /** Everything observed, drained by the Node runner at the end. */
+      const log = { horizon: [], detections: [], detectorStates: [], errors: [] };
+      window.__simLog = log;
+      window.__simDone = false;
+
+      const COLORS = { vehicle: '#ff5d5d', person: '#ff5dfa', sign: '#5be8ff' };
+      let latest = [];
+
+      function draw() {
+        overlay.width = video.clientWidth;
+        overlay.height = video.clientHeight;
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        // Horizon estimate.
+        const h = analyser.horizon;
+        if (h.y !== null) {
+          ctx.strokeStyle = `rgba(125,255,150,${0.25 + 0.75 * h.confidence})`;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(0, h.y * overlay.height);
+          ctx.lineTo(overlay.width, h.y * overlay.height);
+          ctx.stroke();
+          ctx.fillStyle = 'rgba(125,255,150,0.95)';
+          ctx.font = '12px monospace';
+          ctx.fillText(`horizon ${h.y.toFixed(2)} conf ${h.confidence.toFixed(2)}`, 6, h.y * overlay.height - 5);
+        }
+
+        // Detections.
+        for (const d of latest) {
+          const x = (d.x - d.width / 2) * overlay.width;
+          const y = (d.y - d.height / 2) * overlay.height;
+          const w = d.width * overlay.width;
+          const hh = d.height * overlay.height;
+          ctx.strokeStyle = COLORS[d.kind] ?? '#fff';
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x, y, w, hh);
+          ctx.fillStyle = COLORS[d.kind] ?? '#fff';
+          ctx.font = 'bold 12px monospace';
+          ctx.fillText(`${d.kind} ${d.score.toFixed(2)}`, x + 3, y - 4);
+        }
+
+        hud.textContent =
+          `t=${video.currentTime.toFixed(1)}s / ${(video.duration || 0).toFixed(1)}s   ` +
+          `horizon=${h.y === null ? 'null' : h.y.toFixed(3)} conf=${h.confidence.toFixed(2)}   ` +
+          `detections=${latest.length}   detector=${detector.state.status}`;
+
+        if (!window.__simDone) requestAnimationFrame(draw);
+      }
+
+      const analyser = createSceneAnalyser({ video, sampleHz: 6 });
+      const detector = createObjectDetector({
+        video,
+        sampleHz: 4,
+        onStateChange: (s) => log.detectorStates.push({ t: video.currentTime, ...s }),
+        onDetections: (dets) => {
+          // The array is reused — copy what we keep.
+          latest = dets.map((d) => ({ ...d }));
+          for (const d of latest) log.detections.push({ t: +video.currentTime.toFixed(2), ...d });
+        },
+      });
+
+      window.addEventListener('error', (e) => log.errors.push(String(e.message)));
+
+      window.__simStart = async (src, playbackRate) => {
+        video.src = src;
+        await new Promise((res, rej) => {
+          video.onloadeddata = res;
+          video.onerror = () => rej(new Error('video failed to load'));
+        });
+        video.playbackRate = playbackRate ?? 1;
+        log.meta = {
+          width: video.videoWidth,
+          height: video.videoHeight,
+          duration: video.duration,
+        };
+
+        analyser.start();
+        await detector.start();
+
+        // Sample the horizon on our own clock so the log has an even series.
+        const horizonTimer = setInterval(() => {
+          const h = analyser.horizon;
+          log.horizon.push({ t: +video.currentTime.toFixed(2), y: h.y, confidence: h.confidence });
+        }, 200);
+
+        video.onended = () => {
+          clearInterval(horizonTimer);
+          analyser.stop();
+          detector.stop();
+          window.__simDone = true;
+        };
+
+        await video.play();
+        draw();
+        return log.meta;
+      };
+    </script>
+  </body>
+</html>

@@ -12,7 +12,7 @@
  *     `captureStream`/`MediaRecorder`, and never reads pixel data itself
  *   - the ONLY network calls this module ever makes are the one-time,
  *     same-origin fetches of the wasm runtime (`/vision/wasm/*`) and the
- *     detector model (`/vision/efficientdet_lite0_int8.tflite`) — both
+ *     detector model (`/vision/efficientdet_lite0_float16.tflite`) — both
  *     self-hosted, never a CDN, never Google, and both happen once at
  *     `start()`, never again during inference
  *   - what survives past a single inference tick is a handful of numbers
@@ -53,11 +53,16 @@ import type {
 
 /** Self-hosted only — see scripts/fetch-vision-assets.mjs. Never a CDN. */
 const WASM_BASE_PATH = '/vision/wasm';
-const MODEL_PATH = '/vision/efficientdet_lite0_int8.tflite';
+const MODEL_PATH = '/vision/efficientdet_lite0_float16.tflite';
 
 /** Default inferences per second. Low on purpose — a neural net on a phone. */
 const DEFAULT_SAMPLE_HZ = 3;
-const DEFAULT_SCORE_THRESHOLD = 0.4;
+/**
+ * Measured against real Italian motorway footage: a clearly-visible truck
+ * scores 0.42-0.58, distant cars 0.25-0.33. 0.4 missed almost everything;
+ * 0.3 catches the obvious stuff without letting noise through.
+ */
+const DEFAULT_SCORE_THRESHOLD = 0.3;
 const DEFAULT_MAX_RESULTS = 8;
 
 /**
@@ -76,7 +81,6 @@ const LABEL_TO_KIND: Readonly<Record<string, DetectedKind>> = {
   'traffic light': 'sign',
   'stop sign': 'sign',
   'parking meter': 'sign',
-  bench: 'sign',
   'fire hydrant': 'sign',
 };
 const ALLOWED_LABELS = Object.keys(LABEL_TO_KIND);

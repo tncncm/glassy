@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8" /><title>raw detector probe</title></head>
+  <body style="background:#111;color:#eee;font:13px monospace">
+    <video id="v" muted playsinline style="max-width:900px"></video>
+    <pre id="out"></pre>
+    <script type="module">
+      /**
+       * Diagnostic: runs MediaPipe with NO allowlist and a near-zero score
+       * threshold, to separate "our filtering is wrong" from "the model
+       * genuinely sees nothing in this footage".
+       */
+      import { FilesetResolver, ObjectDetector } from '@mediapipe/tasks-vision';
+
+      const video = document.getElementById('v');
+      const out = document.getElementById('out');
+      const raw = [];
+      window.__raw = raw;
+      window.__done = false;
+
+      window.__run = async (src) => {
+        const fileset = await FilesetResolver.forVisionTasks('/vision/wasm');
+        const detector = await ObjectDetector.createFromOptions(fileset, {
+          baseOptions: {
+            modelAssetPath: '/vision/efficientdet_lite0_int8.tflite',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          scoreThreshold: 0.05,   // deliberately permissive
+          maxResults: 20,
+          // no categoryAllowlist on purpose
+        });
+
+        video.src = src;
+        await new Promise((r) => { video.onloadeddata = r; });
+        await video.play();
+
+        let ts = 0;
+        const tick = () => {
+          if (video.ended) { window.__done = true; return; }
+          const now = Math.max(++ts, Math.round(performance.now()));
+          ts = now;
+          try {
+            const res = detector.detectForVideo(video, now);
+            for (const d of res.detections ?? []) {
+              const c = d.categories?.[0];
+              if (!c) continue;
+              raw.push({ t: +video.currentTime.toFixed(2), name: c.categoryName, score: +c.score.toFixed(3) });
+            }
+            out.textContent =
+              `t=${video.currentTime.toFixed(1)}  this frame: ` +
+              (res.detections ?? []).map((d) => `${d.categories[0]?.categoryName}:${d.categories[0]?.score.toFixed(2)}`).join(' ') +
+              `\ntotal so far: ${raw.length}`;
+          } catch (e) {
+            out.textContent = 'ERROR ' + e.message;
+          }
+          setTimeout(tick, 200);
+        };
+        tick();
+      };
+    </script>
+  </body>
+</html>

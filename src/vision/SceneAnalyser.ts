@@ -35,7 +35,7 @@ import type {
  * exists to avoid.
  */
 const SAMPLE_WIDTH = 48;
-const SAMPLE_HEIGHT = 27;
+const SAMPLE_HEIGHT = 39;
 
 /** Ignore the top/bottom of the frame — usually the car's window frame or
  * the dashboard, never the horizon. */
@@ -45,10 +45,41 @@ const EDGE_MARGIN_FRACTION = 0.1;
 const DEFAULT_SAMPLE_HZ = 6;
 
 /**
- * Peak-to-mean row-gradient ratio (0..1, see `sample()`) below which we
- * don't trust the winning row at all and report it as "no estimate".
+ * Rows on each side to average into a row's "cluster" score (see `sample()`).
+ * A multi-rail crash barrier is several close, parallel edges plus its own
+ * shadow line; this turns them into one wide bump instead of N competing
+ * narrow peaks, so the winning position doesn't hop rail-to-rail frame to
+ * frame. Kept small and cheap — this is a plain neighbourhood mean, not a
+ * separable/prefix-sum blur, because the band is only ~30 rows.
  */
-const CONFIDENCE_THRESHOLD = 0.2;
+const CLUSTER_RADIUS = 2;
+
+/**
+ * Rows on each side used for the final sub-row weighted centroid (see
+ * `sample()`). Lets the reported y settle at the weighted middle of a
+ * structure instead of snapping to whichever single row is nominally
+ * strongest this tick.
+ */
+const CENTROID_RADIUS = 3;
+
+/**
+ * Once locked (smoothedY !== null), a row's cluster score is multiplied by
+ * 1 / (1 + (distance / this) ** 2) before competing for "best row", where
+ * distance is 0..1 of frame height from the current smoothed estimate. At
+ * distance = this radius the weight has already halved; a competing
+ * structure has to be substantially stronger than the locked one to win
+ * before it even reaches the temporal jump-confirmation gate below. This is
+ * the main fix for the crash-barrier case: three rails plus a shadow line
+ * sit within a few percent of frame height of each other, so once we're on
+ * one of them the others should almost never look more attractive.
+ */
+const LOCK_STICKINESS_RADIUS = 0.05;
+
+/**
+ * Peak-to-mean cluster-score ratio (0..1, see `sample()`) below which we
+ * don't trust the picked row at all and report it as "no estimate".
+ */
+const CONFIDENCE_THRESHOLD = 0.15;
 
 /** Exponential-smoothing factor applied to small, in-band moves. */
 const SMOOTH_ALPHA = 0.25;
@@ -80,12 +111,17 @@ const JUMP_SETTLE_DISTANCE = 0.01;
 
 /**
  * Consecutive low-confidence/rejected samples after which we give up on the
- * smoothed estimate entirely and go back to reporting `y: null`. About 2s at
- * the default 6Hz — long enough to ride out a shaky bump, short enough that
- * a genuinely horizon-less scene (parking garage, tunnel) stops biasing the
- * ground line forever.
+ * smoothed estimate entirely and go back to reporting `y: null`. About 1.3s
+ * at the default 6Hz — long enough to ride out a shaky bump, short enough
+ * that a genuinely horizon-less scene (parking garage, tunnel) stops biasing
+ * the ground line forever. Shorter than it might look: with the lock-radius
+ * proximity weighting above, a real, fast repositioning of the tracked
+ * structure (the car bouncing, a dip in the road) shows up as exactly this
+ * — a run of rejects while the true edge sits outside the lock radius — so
+ * this also doubles as "how long we tolerate being spatially stale" before
+ * releasing the lock and re-searching the whole frame.
  */
-const REJECT_STREAK_TO_NULL = 12;
+const REJECT_STREAK_TO_NULL = 8;
 
 /** Keeps peak/mean ratio finite when both are ~0 (flat, edge-less frame). */
 const EPSILON = 1e-3;
@@ -114,7 +150,8 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
   // stop() (and permanently, if the canvas ever turns out to be tainted).
   let ctx: Context2D | null = null;
   let lumaBuffer: Float32Array | null = null; // SAMPLE_WIDTH * SAMPLE_HEIGHT
-  let rowScores: Float32Array | null = null; // SAMPLE_HEIGHT
+  let rowScores: Float32Array | null = null; // SAMPLE_HEIGHT, raw per-row gradient
+  let clusterScores: Float32Array | null = null; // SAMPLE_HEIGHT, neighbourhood-smoothed
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let disabledBySecurityError = false;
@@ -130,7 +167,7 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
   let confirmedTargetY: number | null = null;
 
   function trySetupBuffers(): boolean {
-    if (ctx && lumaBuffer && rowScores) return true;
+    if (ctx && lumaBuffer && rowScores && clusterScores) return true;
     try {
       let context: Context2D | null = null;
       if (typeof OffscreenCanvas !== 'undefined') {
@@ -146,11 +183,13 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
       ctx = context;
       lumaBuffer = new Float32Array(SAMPLE_WIDTH * SAMPLE_HEIGHT);
       rowScores = new Float32Array(SAMPLE_HEIGHT);
+      clusterScores = new Float32Array(SAMPLE_HEIGHT);
       return true;
     } catch {
       ctx = null;
       lumaBuffer = null;
       rowScores = null;
+      clusterScores = null;
       return false;
     }
   }
@@ -158,6 +197,7 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
   function dropBuffers(): void {
     ctx = null;
     lumaBuffer = null;
+    clusterScores = null;
     rowScores = null;
   }
 
@@ -240,7 +280,7 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
     if (document.hidden) return;
     if (video.readyState < 2) return;
     if (video.videoWidth === 0 || video.videoHeight === 0) return;
-    if (!trySetupBuffers() || !ctx || !lumaBuffer || !rowScores) return;
+    if (!trySetupBuffers() || !ctx || !lumaBuffer || !rowScores || !clusterScores) return;
 
     try {
       ctx.drawImage(video, 0, 0, SAMPLE_WIDTH, SAMPLE_HEIGHT);
@@ -264,11 +304,10 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
       const bandEnd = Math.min(SAMPLE_HEIGHT - 1, SAMPLE_HEIGHT - marginRows);
 
       const scores = rowScores;
-      let bestRow = -1;
-      let bestScore = -Infinity;
-      let scoreSum = 0;
-      let scoreCount = 0;
+      const clusters = clusterScores;
 
+      // Pass 1: raw per-row gradient score, same definition as before —
+      // mean absolute luma difference against the row above.
       for (let y = bandStart; y < bandEnd; y++) {
         const rowOffset = y * SAMPLE_WIDTH;
         const prevOffset = (y - 1) * SAMPLE_WIDTH;
@@ -278,35 +317,96 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
           const prev = luma[prevOffset + x] ?? 0;
           sum += Math.abs(cur - prev);
         }
-        const score = sum / SAMPLE_WIDTH;
-        scores[y] = score;
-        scoreSum += score;
-        scoreCount++;
-        if (score > bestScore) {
-          bestScore = score;
-          bestRow = y;
+        scores[y] = sum / SAMPLE_WIDTH;
+      }
+
+      // Pass 2: neighbourhood-smoothed "cluster" score. A multi-rail crash
+      // barrier is several close parallel edges plus its own shadow line;
+      // averaging over CLUSTER_RADIUS turns that into one wide bump instead
+      // of several narrow ones fighting for the single-row maximum, so the
+      // winning position stops hopping rail-to-rail frame to frame. This is
+      // a plain neighbourhood mean (not a running/prefix-sum blur) — the
+      // band is only ~30 rows, so the extra passes stay cheap.
+      let clusterSum = 0;
+      let clusterCount = 0;
+      let globalBestRow = -1;
+      let globalBestCluster = -Infinity;
+      for (let y = bandStart; y < bandEnd; y++) {
+        const lo = Math.max(bandStart, y - CLUSTER_RADIUS);
+        const hi = Math.min(bandEnd - 1, y + CLUSTER_RADIUS);
+        let sum = 0;
+        let count = 0;
+        for (let k = lo; k <= hi; k++) {
+          sum += scores[k] ?? 0;
+          count++;
+        }
+        const c = count > 0 ? sum / count : 0;
+        clusters[y] = c;
+        clusterSum += c;
+        clusterCount++;
+        if (c > globalBestCluster) {
+          globalBestCluster = c;
+          globalBestRow = y;
         }
       }
 
-      if (bestRow < 0 || scoreCount === 0) {
+      if (globalBestRow < 0 || clusterCount === 0) {
         applyRejectedSample();
         return;
       }
 
-      const meanScore = scoreSum / scoreCount;
-      // Confidence is two factors multiplied together:
+      const clusterMean = clusterSum / clusterCount;
+
+      // Pass 3: pick the row to report. Cold (no lock yet), take the
+      // strongest cluster in the frame, same as the old single-row logic.
+      // Locked, heavily favour rows near the current smoothed estimate: a
+      // competing structure (fence, treeline, a different rail) has to be
+      // substantially stronger to win here, and even then still has to
+      // clear the temporal jump-confirmation gate in applyAcceptedSample
+      // before the lock actually moves. Distance-weighting like this is
+      // what stops the estimate drifting across a barrier's full height —
+      // without it, three rails a few rows apart swap which one "wins" run
+      // to run purely on lighting noise, dragging the reported y with them.
+      let pickedRow = globalBestRow;
+      let pickedCluster = globalBestCluster;
+      if (smoothedY !== null) {
+        let bestEffective = -Infinity;
+        let bestEffectiveRow = -1;
+        let bestEffectiveCluster = 0;
+        for (let y = bandStart; y < bandEnd; y++) {
+          const rowY = y / (SAMPLE_HEIGHT - 1);
+          const distance = Math.abs(rowY - smoothedY);
+          const weight = 1 / (1 + (distance / LOCK_STICKINESS_RADIUS) ** 2);
+          const c = clusters[y] ?? 0;
+          const effective = c * weight;
+          if (effective > bestEffective) {
+            bestEffective = effective;
+            bestEffectiveRow = y;
+            bestEffectiveCluster = c;
+          }
+        }
+        if (bestEffectiveRow >= 0) {
+          pickedRow = bestEffectiveRow;
+          pickedCluster = bestEffectiveCluster;
+        }
+      }
+
+      // Confidence reflects trust in the row we actually picked (which may
+      // be a sticky, not-quite-strongest-this-tick pick), not the frame's
+      // global maximum — see the two-factor shape/strength reasoning below,
+      // unchanged from before, just applied to cluster scores now.
       //  - shape: normalised peak-to-mean ratio, bounded to [0, 1). A lone
-      //    strong row against a flat background trends to 1; a uniformly
-      //    "busy" frame (noise) — where every row is about as gradient-y as
-      //    every other — trends to 0 regardless of how strong the gradients
-      //    are in absolute terms.
-      //  - strength: the winning row's absolute gradient against a fixed
-      //    scale, bounded to [0, 1). Without this a foggy, nearly-flat scene
-      //    can still produce a "peaky-looking" row purely because its
+      //    strong structure against a flat background trends to 1; a
+      //    uniformly "busy" frame (noise) — where every row is about as
+      //    gradient-y as every other — trends to 0 regardless of how strong
+      //    the gradients are in absolute terms.
+      //  - strength: the picked row's absolute cluster gradient against a
+      //    fixed scale, bounded to [0, 1). Without this a foggy, nearly-flat
+      //    scene can still produce a "peaky-looking" row purely because its
       //    background noise happens to be even flatter, despite the edge
       //    itself being too faint to be worth trusting.
-      const shape = (bestScore - meanScore) / (bestScore + meanScore + EPSILON);
-      const strength = Math.min(1, bestScore / STRONG_EDGE_MAGNITUDE);
+      const shape = (pickedCluster - clusterMean) / (pickedCluster + clusterMean + EPSILON);
+      const strength = Math.min(1, pickedCluster / STRONG_EDGE_MAGNITUDE);
       const confidence = Math.min(1, Math.max(0, shape * strength));
 
       if (confidence < CONFIDENCE_THRESHOLD) {
@@ -314,7 +414,23 @@ export function createSceneAnalyser(options: SceneAnalyserOptions): SceneAnalyse
         return;
       }
 
-      const candidateY = bestRow / (SAMPLE_HEIGHT - 1);
+      // Sub-row weighted centroid around the picked row, using the raw
+      // (unsmoothed) per-row scores so the estimate settles at a structure's
+      // weighted middle instead of snapping to whichever exact row is
+      // nominally strongest this tick — the other half of the fix for
+      // hopping between adjacent rails.
+      let centroidNum = 0;
+      let centroidDen = 0;
+      const cLo = Math.max(bandStart, pickedRow - CENTROID_RADIUS);
+      const cHi = Math.min(bandEnd - 1, pickedRow + CENTROID_RADIUS);
+      for (let y = cLo; y <= cHi; y++) {
+        const w = Math.max(0, (scores[y] ?? 0) - clusterMean);
+        centroidNum += y * w;
+        centroidDen += w;
+      }
+      const centroidRow = centroidDen > EPSILON ? centroidNum / centroidDen : pickedRow;
+
+      const candidateY = centroidRow / (SAMPLE_HEIGHT - 1);
       applyAcceptedSample(candidateY, confidence);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'SecurityError') {
