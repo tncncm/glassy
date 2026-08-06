@@ -459,21 +459,21 @@ export async function createApp(root: HTMLElement): Promise<App> {
       case 'playing':
         if (previous === 'paused' || previous === 'rotate') {
           game.resume();
-          void camera.resume();
+          resumeBackdrop();
         } else if (previous === 'gameOver') {
           // beginRun() already called game.start() for the fresh run, but the
           // camera was suspended by go('gameOver') below and is not resumed
           // by any other path — without this, restarting from the Game Over
           // screen leaves the live feed frozen on its last frame (or the
           // fallback animation stopped) for the entire new run.
-          void camera.resume();
+          resumeBackdrop();
         }
         ui.show('playing');
         break;
 
       case 'paused':
         game.pause();
-        camera.suspend();
+        suspendBackdrop();
         ui.show('paused');
         break;
 
@@ -483,7 +483,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
         break;
 
       case 'gameOver':
-        camera.suspend();
+        suspendBackdrop();
         ui.show('gameOver');
         break;
     }
@@ -532,7 +532,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     if (destroyed) return;
     if (document.hidden) {
       audio.suspend();
-      camera.suspend();
+      suspendBackdrop();
       // Auto-pause a live run rather than letting the player die offscreen.
       if (state === 'playing') go('paused');
       return;
@@ -562,6 +562,33 @@ export async function createApp(root: HTMLElement): Promise<App> {
         motionTimer = window.setInterval(pushMotion, MOTION_PUSH_INTERVAL_MS);
       }
     });
+  }
+
+  /**
+   * Suspend/resume the BACKDROP, whatever it currently is.
+   *
+   * CameraController owns the <video> element when a camera is live, but a
+   * demo/dev clip is attached to that same element outside its knowledge. So
+   * `camera.suspend()` would pause the clip (it pauses the element) while
+   * `camera.resume()` would not restart it — it only re-acquires a camera
+   * track. That asymmetry is exactly why "Play again" left the demo frozen.
+   */
+  function suspendBackdrop(): void {
+    if (usingDevVideo) {
+      video.pause();
+      return;
+    }
+    camera.suspend();
+  }
+
+  function resumeBackdrop(): void {
+    if (usingDevVideo) {
+      void video.play().catch(() => {
+        // Autoplay can be refused after a long pause; the next gesture retries.
+      });
+      return;
+    }
+    void camera.resume();
   }
 
   function pushMotion(): void {

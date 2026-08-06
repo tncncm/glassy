@@ -42,13 +42,37 @@
 
 import { createDetectionTracker, type DetectionTracker } from './DetectionTracker.ts';
 import { createRoofFinder, type RoofFinder } from './RoofFinder.ts';
+import { createSceneAnalyser } from './SceneAnalyser.ts';
+import { createCarriagewayFilter, type CarriagewayFilter, type CarriagewayRejectReason } from './CarriagewayFilter.ts';
 import type {
   ObjectDetector,
   ObjectDetectorOptions,
   DetectorState,
   DetectedKind,
   Detection,
+  SceneAnalyser,
+  TrackedObject,
 } from '../types.ts';
+
+/**
+ * `ObjectDetectorOptions` (types.ts, frozen — see CLAUDE.md) has no slot for
+ * a carriageway-filter debug hook; adding one there would widen a contract
+ * every other layer depends on for a diagnostic only tools/video-sim needs.
+ * Instead: an optional extra property, read here via a local, non-exported
+ * type that widens the caller's options object structurally. A plain JS
+ * caller (tools/video-sim/index.html, not type-checked) can pass it freely;
+ * App.ts, built against the real `ObjectDetectorOptions`, simply never has
+ * it and this is always a no-op for production. Never fires anything a real
+ * caller depends on — purely additive, purely diagnostic.
+ */
+interface ObjectDetectorDebugOptions {
+  onCarriagewayDebug?: (
+    kept: readonly TrackedObject[],
+    rejected: readonly TrackedObject[],
+    rejectedReasons: readonly CarriagewayRejectReason[],
+    horizonY: number | null,
+  ) => void;
+}
 
 // Type-only — erased entirely at compile time. Does NOT pull the worker or
 // MediaPipe into this file or the main bundle.
@@ -179,6 +203,19 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
 
   const tracker: DetectionTracker = createDetectionTracker();
   const roofFinder: RoofFinder = createRoofFinder();
+  /**
+   * ObjectDetector owns its own SceneAnalyser instance rather than taking
+   * the horizon as an option — `ObjectDetectorOptions` is frozen (see
+   * CLAUDE.md) and today's only consumer of the horizon is the game, wired
+   * up independently in App.ts. This pays for a second tiny (48x39, see
+   * SceneAnalyser's own PRIVACY comment) canvas read at the same ~6Hz the
+   * game's own analyser already runs at — negligible next to RoofFinder's
+   * 320x180 sample, and it keeps the vision layer's carriageway filtering
+   * self-contained instead of threading a cross-layer dependency through
+   * App.ts for one number.
+   */
+  const laneAnalyser: SceneAnalyser = createSceneAnalyser({ video });
+  const carriagewayFilter: CarriagewayFilter = createCarriagewayFilter();
   let lastTrackUpdateMs = 0;
 
   let currentState: DetectorState = { status: 'idle' };
@@ -319,7 +356,8 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
    * Both arrays are reused; consumers read them synchronously.
    */
   function emitTracked(): void {
-    if (!options.onTrackedObjects) return;
+    const debugOptions = options as ObjectDetectorOptions & ObjectDetectorDebugOptions;
+    if (!options.onTrackedObjects && !debugOptions.onCarriagewayDebug) return;
     const now = performance.now();
     const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
     lastTrackUpdateMs = now;
@@ -328,7 +366,16 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     // in place, before handing objects out. Falls back to the box's own
     // top edge and sides (already written by the tracker) on any failure.
     roofFinder.refine(video, trackedObjects, dt);
-    options.onTrackedObjects(trackedObjects);
+    // Keep only vehicles plausibly travelling with us on our own
+    // carriageway (see CarriagewayFilter.ts for the full reasoning).
+    // person/sign objects pass through untouched. Falls back to the
+    // unfiltered list on any internal failure — a cluttered world beats an
+    // empty one.
+    const horizonY = laneAnalyser.horizon.y;
+    const kept = carriagewayFilter.filter(trackedObjects, horizonY, dt);
+
+    debugOptions.onCarriagewayDebug?.(kept, carriagewayFilter.rejected, carriagewayFilter.rejectedReasons, horizonY);
+    options.onTrackedObjects?.(kept);
   }
 
   function handleDetectResult(data: Extract<WorkerToMainMessage, { type: 'result' }>): void {
@@ -595,6 +642,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       intervalMs = intervalForMode();
       lastTimestamp = -1;
       setState({ status: 'ready' });
+      laneAnalyser.start();
       scheduleNext();
       return currentState;
     } catch (err) {
@@ -642,6 +690,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         intervalMs = intervalForMode();
         lastTimestamp = -1;
         setState({ status: 'ready' });
+        laneAnalyser.start();
         scheduleNext();
         return Promise.resolve(currentState);
       }
@@ -662,6 +711,8 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       stopRequested = true;
       loadAbort?.abort();
       stopInference();
+      laneAnalyser.stop();
+      carriagewayFilter.reset();
       if (currentState.status === 'loading') {
         // loadAndStart()'s in-flight promise will observe stopRequested and
         // land on 'disabled' itself once it unwinds.
@@ -684,6 +735,8 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       }
       output.length = 0;
       roofFinder.stop();
+      laneAnalyser.stop();
+      carriagewayFilter.reset();
       setState({ status: 'idle' });
     },
   };

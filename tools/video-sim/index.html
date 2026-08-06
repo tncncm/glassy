@@ -29,6 +29,7 @@
        */
       import { createSceneAnalyser } from '/src/vision/SceneAnalyser.ts';
       import { createObjectDetector } from '/src/vision/ObjectDetector.ts';
+      import { corridorHalfWidthAt } from '/src/vision/CarriagewayFilter.ts';
 
       const video = document.getElementById('v');
       const overlay = document.getElementById('overlay');
@@ -36,13 +37,29 @@
       const ctx = overlay.getContext('2d');
 
       /** Everything observed, drained by the Node runner at the end. */
-      const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [] };
+      const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [], carriageway: [] };
       let tracked = [];
       window.__simLog = log;
       window.__simDone = false;
 
       const COLORS = { vehicle: '#ff5d5d', person: '#ff5dfa', sign: '#5be8ff' };
       let latest = [];
+
+      // Carriageway filter diagnostics — the KEPT list is what `tracked`
+      // already is (ObjectDetector filters before calling onTrackedObjects);
+      // these two are what got dropped, and why, and the exact horizon row
+      // the filter used, so the corridor drawn below matches production
+      // logic exactly rather than approximating it from the harness's own
+      // separate SceneAnalyser instance.
+      let rejected = [];
+      let rejectedReasons = [];
+      let carriagewayHorizonY = null;
+      const REASON_COLORS = {
+        corridor: '#ff9d3d',
+        size: '#c86bff',
+        'near-horizon': '#ff4d4d',
+        motion: '#ffe234',
+      };
 
       function draw() {
         overlay.width = video.clientWidth;
@@ -63,7 +80,59 @@
           ctx.fillText(`horizon ${h.y.toFixed(2)} conf ${h.confidence.toFixed(2)}`, 6, h.y * overlay.height - 5);
         }
 
+        // The perspective corridor CarriagewayFilter actually filtered
+        // against this tick, drawn as the trapezoid it is: narrow at the
+        // horizon, wide at the bottom of frame. Uses the EXACT horizon value
+        // the filter used (from ObjectDetector's own internal analyser via
+        // onCarriagewayDebug), not the harness's separate one, so this is
+        // never an approximation of what ran.
+        if (carriagewayHorizonY !== null) {
+          const hy = carriagewayHorizonY;
+          const steps = 24;
+          ctx.strokeStyle = 'rgba(80,180,255,0.55)';
+          ctx.fillStyle = 'rgba(80,180,255,0.06)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          for (let i = 0; i <= steps; i++) {
+            const y = hy + (1 - hy) * (i / steps);
+            const hw = corridorHalfWidthAt(y, hy);
+            const x = (0.5 - hw) * overlay.width;
+            if (i === 0) ctx.moveTo(x, y * overlay.height); else ctx.lineTo(x, y * overlay.height);
+          }
+          for (let i = steps; i >= 0; i--) {
+            const y = hy + (1 - hy) * (i / steps);
+            const hw = corridorHalfWidthAt(y, hy);
+            const x = (0.5 + hw) * overlay.width;
+            ctx.lineTo(x, y * overlay.height);
+          }
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+        }
+
+        // Rejected objects — dropped by CarriagewayFilter this tick. Thick
+        // red-family dashed box, coloured by WHY, with the reason labelled
+        // so a frame grab tells you not just "gone" but "gone, and here's
+        // the signal that did it".
+        for (let i = 0; i < rejected.length; i++) {
+          const o = rejected[i];
+          const reason = rejectedReasons[i] ?? '?';
+          const x = (o.x - o.width / 2) * overlay.width;
+          const y = (o.y - o.height / 2) * overlay.height;
+          const w = o.width * overlay.width;
+          const hh = o.height * overlay.height;
+          ctx.strokeStyle = REASON_COLORS[reason] ?? '#ff2d2d';
+          ctx.lineWidth = 2.5;
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(x, y, w, hh);
+          ctx.setLineDash([]);
+          ctx.fillStyle = REASON_COLORS[reason] ?? '#ff2d2d';
+          ctx.font = 'bold 12px monospace';
+          ctx.fillText(`✕ ${reason}`, x + 3, y - 4);
+        }
+
         // Tracked objects — the thing platforms are actually built from.
+        // Everything drawn here already SURVIVED the carriageway filter.
         for (const o of tracked) {
           const x = (o.x - o.width / 2) * overlay.width;
           const y = (o.y - o.height / 2) * overlay.height;
@@ -114,7 +183,8 @@
         hud.textContent =
           `t=${video.currentTime.toFixed(1)}s / ${(video.duration || 0).toFixed(1)}s   ` +
           `horizon=${h.y === null ? 'null' : h.y.toFixed(3)} conf=${h.confidence.toFixed(2)}   ` +
-          `detections=${latest.length}   detector=${detector.state.status}`;
+          `detections=${latest.length}   detector=${detector.state.status}   ` +
+          `carriageway: kept=${tracked.length} rejected=${rejected.length}`;
 
         if (!window.__simDone) requestAnimationFrame(draw);
       }
@@ -135,6 +205,28 @@
               h: +o.height.toFixed(3), stable: o.stable,
               surfaceY: +o.surfaceY.toFixed(3), surfaceLeft: +o.surfaceLeft.toFixed(3),
               surfaceRight: +o.surfaceRight.toFixed(3) });
+          }
+        },
+        // Diagnostic-only hook ObjectDetector reads via a local structural
+        // type, not part of the frozen ObjectDetectorOptions contract (see
+        // ObjectDetector.ts) — exists purely so this harness can see what
+        // the carriageway filter dropped and why.
+        onCarriagewayDebug: (kept, rej, reasons, horizonY) => {
+          rejected = rej.map((o) => ({ ...o }));
+          rejectedReasons = reasons.slice();
+          carriagewayHorizonY = horizonY;
+          for (let i = 0; i < rejected.length; i++) {
+            log.carriageway.push({ t: +video.currentTime.toFixed(2), id: rejected[i].id,
+              kind: rejected[i].kind, x: +rejected[i].x.toFixed(3), y: +rejected[i].y.toFixed(3),
+              w: +rejected[i].width.toFixed(3), h: +rejected[i].height.toFixed(3),
+              stable: rejected[i].stable, reason: rejectedReasons[i], horizonY,
+              kept: false });
+          }
+          for (const o of kept) {
+            if (o.kind !== 'vehicle') continue;
+            log.carriageway.push({ t: +video.currentTime.toFixed(2), id: o.id, kind: o.kind,
+              x: +o.x.toFixed(3), y: +o.y.toFixed(3), w: +o.width.toFixed(3), h: +o.height.toFixed(3),
+              stable: o.stable, reason: null, horizonY, kept: true });
           }
         },
         onDetections: (dets) => {

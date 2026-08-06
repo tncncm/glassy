@@ -167,5 +167,31 @@ if (durations.length) {
   console.log(`  durata traccia stabile: max ${durations[0].toFixed(1)}s  mediana ${durations[Math.floor(durations.length/2)].toFixed(1)}s`);
   console.log(`  tracce >2s            : ${durations.filter((d) => d > 2).length}`);
 }
+// Carriageway filter report
+const cw = log.carriageway ?? [];
+const cwVehicleSamples = cw.length;
+const cwKept = cw.filter((c) => c.kept).length;
+const cwRejected = cw.filter((c) => !c.kept).length;
+const cwById = new Map();
+for (const c of cw) {
+  const e = cwById.get(c.id) ?? { everKept: false, everRejected: false, reasons: new Set() };
+  if (c.kept) e.everKept = true; else { e.everRejected = true; e.reasons.add(c.reason); }
+  cwById.set(c.id, e);
+}
+const reasonCounts = {};
+for (const c of cw) if (!c.kept) reasonCounts[c.reason] = (reasonCounts[c.reason] ?? 0) + 1;
+console.log('\n══════════ CARRIAGEWAY FILTER ══════════');
+console.log(`  vehicle samples      : ${cwVehicleSamples}  (kept ${cwKept}, rejected ${cwRejected}${cwVehicleSamples ? ', ' + ((100*cwRejected/cwVehicleSamples).toFixed(1)) + '% rejected' : ''})`);
+if (Object.keys(reasonCounts).length) {
+  console.log('  rejected by reason   :');
+  for (const [reason, n] of Object.entries(reasonCounts).sort((a,b)=>b[1]-a[1])) {
+    console.log(`    ${reason.padEnd(14)} ${n}`);
+  }
+}
+const cwTracksKeptOnly = [...cwById.values()].filter((e) => e.everKept && !e.everRejected).length;
+const cwTracksRejectedOnly = [...cwById.values()].filter((e) => e.everRejected && !e.everKept).length;
+const cwTracksBoth = [...cwById.values()].filter((e) => e.everKept && e.everRejected).length;
+console.log(`  distinct vehicle tracks: ${cwById.size}  (kept-only ${cwTracksKeptOnly}, rejected-only ${cwTracksRejectedOnly}, flipped ${cwTracksBoth})`);
+
 console.log(`\nAnnotated frames: ${outDir}/frame-*.png`);
 console.log(`Raw log:          ${outDir}/log.json`);
