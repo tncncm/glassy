@@ -8,14 +8,12 @@
 
 import type {
   CameraFailure,
-  GameMode,
   DetectorState,
   DetectorStatus,
   GameOverResult,
   ScreenName,
   UIController,
   UIIntents,
-  VisionMode,
 } from '../types.ts';
 
 const SCREEN_NAMES: readonly ScreenName[] = [
@@ -66,144 +64,14 @@ const MUTE_LABEL_OFF = 'Unmute sound';
 const MUTE_ICON_ON = '\u{1F50A}'; // speaker
 const MUTE_ICON_OFF = '\u{1F507}'; // muted speaker
 
-const VISION_TITLE = 'Spot real things out the window';
-const VISION_DESC = 'On-device AI: one-time ~9 MB download, more battery.';
+// Detection now does real work: with it off, the road has no real platforms
+// at all and the game falls back to synthetic ones, so the copy leads with
+// what turning it on actually buys the player, not just the cost.
+const VISION_TITLE = 'Turn traffic into platforms';
+const VISION_DESC = 'Spots real vehicles to land on. ~9 MB one-time download, more battery.';
 const VISION_ARIA_LABEL =
-  'Spot real things out the window. Uses on-device AI: one-time about 9 megabyte download, more battery. Off by default.';
+  'Turn traffic into platforms. On-device AI spots real vehicles out the windscreen so you can land on them. Without it, only synthetic platforms appear. Uses a one-time about 9 megabyte download and more battery. Off by default.';
 const VISION_ICON = '\u{1F50D}'; // magnifying glass
-
-interface VisionModeOption {
-  mode: VisionMode;
-  label: string;
-  desc: string;
-}
-
-// Copy is deliberately concrete about the physical action ("phone pointed")
-// and the consequence (what the camera sees / what the game does with it) —
-// the two modes must be legible without trying both.
-const VISION_MODE_OPTIONS: readonly VisionModeOption[] = [
-  {
-    mode: 'window',
-    label: 'Side window',
-    desc: 'Phone pointed out the side. Scenery rushes past.',
-  },
-  {
-    mode: 'windscreen',
-    label: 'Windscreen',
-    desc: 'Phone pointed forward. Jump onto the vehicle ahead.',
-  },
-];
-
-interface GameModeOption {
-  mode: GameMode;
-  label: string;
-  desc: string;
-}
-
-// Two genuinely different games. The copy has to make the goal legible, not
-// just name the mode — nobody should have to play both to find out.
-const GAME_MODE_OPTIONS: readonly GameModeOption[] = [
-  {
-    mode: 'runner',
-    label: 'Runner',
-    desc: 'Endless run. Jump and dash past obstacles.',
-  },
-  {
-    mode: 'crossing',
-    label: 'Crossing',
-    desc: 'Hop across real traffic, left to right. Needs windscreen.',
-  },
-];
-
-/** Narrows a raw dataset string to GameMode, or null if it isn't one. */
-function parseGameMode(value: string | undefined): GameMode | null {
-  return value === 'runner' || value === 'crossing' ? value : null;
-}
-
-function gameModeOptionHtml(option: GameModeOption): string {
-  const checked = option.mode === 'runner';
-  return `
-    <button
-      type="button"
-      class="vision-mode__option"
-      data-action="select-game-mode"
-      data-game-mode-button
-      data-mode="${option.mode}"
-      role="radio"
-      aria-checked="${checked ? 'true' : 'false'}"
-      tabindex="${checked ? '0' : '-1'}"
-      aria-label="${option.label}. ${option.desc}"
-    >
-      <span class="vision-mode__dot" aria-hidden="true"></span>
-      <span class="vision-mode__text">
-        <span class="vision-mode__label">${option.label}</span>
-        <span class="vision-mode__desc">${option.desc}</span>
-      </span>
-    </button>`;
-}
-
-function gameModeGroupHtml(compact: boolean): string {
-  const options = GAME_MODE_OPTIONS.map((opt) => gameModeOptionHtml(opt)).join('');
-  return `
-    <div
-      class="vision-mode${compact ? ' vision-mode--compact' : ''}"
-      data-role="game-mode-group"
-      role="radiogroup"
-      aria-label="Game"
-    >${options}
-    </div>`;
-}
-
-/** Narrows a raw dataset string to VisionMode, or null if it isn't one. */
-function parseVisionMode(value: string | undefined): VisionMode | null {
-  return value === 'window' || value === 'windscreen' ? value : null;
-}
-
-/**
- * One radio option. `aria-label` always carries the full "label. consequence"
- * sentence, independent of whether the description is visually shown — CSS
- * (the paused screen's compact layout, and the short-height media query on
- * the home screen) is free to hide `.vision-mode__desc` to save vertical
- * space without ever taking the consequence away from screen reader users.
- */
-function visionModeOptionHtml(option: VisionModeOption): string {
-  const checked = option.mode === 'window';
-  return `
-    <button
-      type="button"
-      class="vision-mode__option"
-      data-action="select-vision-mode"
-      data-vision-mode-button
-      data-mode="${option.mode}"
-      role="radio"
-      aria-checked="${checked ? 'true' : 'false'}"
-      tabindex="${checked ? '0' : '-1'}"
-      aria-label="${option.label}. ${option.desc}"
-    >
-      <span class="vision-mode__dot" aria-hidden="true"></span>
-      <span class="vision-mode__text">
-        <span class="vision-mode__label">${option.label}</span>
-        <span class="vision-mode__desc">${option.desc}</span>
-      </span>
-    </button>`;
-}
-
-/**
- * A full radiogroup, rendered once per screen that hosts it (home + paused)
- * so both can toggle by class with no per-transition DOM churn, same as every
- * other screen element.
- */
-function visionModeGroupHtml(compact: boolean): string {
-  const options = VISION_MODE_OPTIONS.map((opt) => visionModeOptionHtml(opt)).join('');
-  return `
-    <div
-      class="vision-mode${compact ? ' vision-mode--compact' : ''}"
-      data-role="vision-mode-group"
-      role="radiogroup"
-      aria-label="Camera framing"
-    >${options}
-    </div>`;
-}
 
 /**
  * Whether the opt-in toggle should render as ON. `idle` (never asked to
@@ -233,7 +101,7 @@ const TEMPLATE = `
   <div class="screen" data-screen="home">
     <div class="panel home__panel">
       <h1 class="home__title">Glassy</h1>
-      <p class="home__pitch">A tiny endless runner that plays over your car window.</p>
+      <p class="home__pitch">Hold your phone up to the windscreen and hop your character across real traffic, left block to right block. Don't fall.</p>
       <div class="stat home__best">
         <span class="stat__label">Best</span>
         <span class="stat__value" data-role="home-best">0</span>
@@ -242,7 +110,7 @@ const TEMPLATE = `
         <span class="safety-line__icon" aria-hidden="true">⚠️</span>
         <span>Passenger use only. Do not use while driving.</span>
       </div>
-      <p class="privacy-line">Your camera is the backdrop — shown live on your screen, never recorded. Glassy looks at the picture only on your phone, to find the horizon and, if you turn it on below, to spot real things like cars and signs. Nothing is ever uploaded or sent anywhere — no frame and no detection is ever stored. The detection model downloads once to your phone and runs there; there's no server.</p>
+      <p class="privacy-line">Your camera shows the road live on your screen — it's never recorded. Glassy looks at the picture only on your phone, to find the horizon and, if you turn it on below, to spot real vehicles to jump on. Nothing is ever uploaded or sent anywhere — no frame and no detection is ever stored. The detection model downloads once to your phone and runs there; there's no server.</p>
       <div class="vision" data-role="vision">
         <button
           type="button"
@@ -264,8 +132,6 @@ const TEMPLATE = `
         <div class="vision__progress" data-role="vision-progress" hidden aria-hidden="true">
           <div class="vision__progress-fill" data-role="vision-progress-fill"></div>
         </div>
-        ${gameModeGroupHtml(false)}
-        ${visionModeGroupHtml(false)}
       </div>
       <div class="home__actions">
         <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
@@ -281,8 +147,8 @@ const TEMPLATE = `
     <div class="panel permission__panel">
       <div class="permission__state" data-state="pre-request">
         <div class="permission__icon" aria-hidden="true">\u{1F4F7}</div>
-        <h2 class="permission__title">Camera as a backdrop</h2>
-        <p class="permission__body">Glassy uses your rear camera as a live backdrop behind the game. It looks at the picture only on your phone — to find the horizon and, if you turned on real-world detection, to spot things like cars and signs. Nothing is ever recorded, saved or sent anywhere: no frame and no detection ever leaves your phone, and there's no server for it to reach.</p>
+        <h2 class="permission__title">Camera as your windscreen view</h2>
+        <p class="permission__body">Glassy uses your rear camera as a live view behind the game, as if you were looking through the windscreen. It looks at the picture only on your phone — to find the horizon and, if you turned on real-vehicle detection, to spot traffic to jump on. Nothing is ever recorded, saved or sent anywhere: no frame and no detection ever leaves your phone, and there's no server for it to reach.</p>
         <div class="btn-row">
           <button type="button" class="btn btn--primary" data-action="continue">Continue</button>
         </div>
@@ -343,8 +209,6 @@ const TEMPLATE = `
         <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
         <button type="button" class="btn btn--icon" data-action="toggle-vision" data-vision-button aria-pressed="false" aria-label="${VISION_ARIA_LABEL}">${VISION_ICON}</button>
       </div>
-      ${gameModeGroupHtml(true)}
-      ${visionModeGroupHtml(true)}
     </div>
   </div>
 
@@ -400,9 +264,6 @@ class GlassyUIController implements UIController {
   private readonly visionStatusTextEl: HTMLElement;
   private readonly visionProgressEl: HTMLElement;
   private readonly visionProgressFillEl: HTMLElement;
-  private readonly visionModeButtons: HTMLButtonElement[];
-  private readonly gameModeButtons: HTMLButtonElement[];
-  private readonly visionModeGroups: HTMLElement[];
 
   private currentScreen: ScreenName = 'loading';
   private lastScore = -1;
@@ -411,8 +272,6 @@ class GlassyUIController implements UIController {
   private hasCameraFailure = false;
   private lastDetectorStatus: DetectorStatus | null = null;
   private lastDetectorProgress: number | null = null;
-  private lastVisionMode: VisionMode | null = null;
-  private lastGameMode: GameMode | null = null;
 
   constructor(root: HTMLElement, intents: UIIntents) {
     this.root = root;
@@ -458,15 +317,6 @@ class GlassyUIController implements UIController {
     this.visionStatusTextEl = requireElement(this.root, '[data-role="vision-status-text"]');
     this.visionProgressEl = requireElement(this.root, '[data-role="vision-progress"]');
     this.visionProgressFillEl = requireElement(this.root, '[data-role="vision-progress-fill"]');
-    this.gameModeButtons = Array.from(
-      this.root.querySelectorAll<HTMLButtonElement>('[data-game-mode-button]'),
-    );
-    this.visionModeButtons = Array.from(
-      this.root.querySelectorAll<HTMLButtonElement>('[data-vision-mode-button]'),
-    );
-    this.visionModeGroups = Array.from(
-      this.root.querySelectorAll<HTMLElement>('[data-role="vision-mode-group"]'),
-    );
 
     this.focusTargets = {
       loading: null,
@@ -487,12 +337,10 @@ class GlassyUIController implements UIController {
     };
 
     this.root.addEventListener('click', this.handleClick);
-    this.root.addEventListener('keydown', this.handleKeydown);
 
     this.applyScreen(this.currentScreen);
     this.setMuted(false);
     this.setDetectorState({ status: 'idle' });
-    this.setVisionMode('window');
     this.setupViewportGuard();
   }
 
@@ -572,13 +420,6 @@ class GlassyUIController implements UIController {
     for (const btn of this.visionButtons) {
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
     }
-    // The framing choice only matters once detection is actually on — read it
-    // as inactive/secondary rather than hiding it (the user may want to
-    // preset it before opting in) or disabling it (which would need its own
-    // explanation for why a control it can plainly reach doesn't respond).
-    for (const group of this.visionModeGroups) {
-      group.classList.toggle('vision-mode--inactive', !on);
-    }
 
     switch (state.status) {
       case 'loading': {
@@ -618,26 +459,6 @@ class GlassyUIController implements UIController {
         break;
       default:
         break;
-    }
-  }
-
-  setGameMode(mode: GameMode): void {
-    if (mode === this.lastGameMode) return;
-    this.lastGameMode = mode;
-    for (const btn of this.gameModeButtons) {
-      const checked = parseGameMode(btn.dataset['mode']) === mode;
-      btn.setAttribute('aria-checked', checked ? 'true' : 'false');
-      btn.tabIndex = checked ? 0 : -1;
-    }
-  }
-
-  setVisionMode(mode: VisionMode): void {
-    if (mode === this.lastVisionMode) return;
-    this.lastVisionMode = mode;
-    for (const btn of this.visionModeButtons) {
-      const checked = parseVisionMode(btn.dataset['mode']) === mode;
-      btn.setAttribute('aria-checked', checked ? 'true' : 'false');
-      btn.tabIndex = checked ? 0 : -1;
     }
   }
 
@@ -719,16 +540,6 @@ class GlassyUIController implements UIController {
       case 'toggle-vision':
         this.intents.onToggleVision();
         break;
-      case 'select-game-mode': {
-        const mode = parseGameMode(actionEl.dataset['mode']);
-        if (mode) this.intents.onSelectGameMode(mode);
-        break;
-      }
-      case 'select-vision-mode': {
-        const mode = parseVisionMode(actionEl.dataset['mode']);
-        if (mode) this.intents.onSelectVisionMode(mode);
-        break;
-      }
       case 'play-without-camera-pre':
       case 'play-without-camera-fail':
         this.intents.onPlayWithoutCamera();
@@ -741,38 +552,6 @@ class GlassyUIController implements UIController {
         break;
       default:
         break;
-    }
-  };
-
-  /**
-   * Roving-tabindex arrow-key navigation for the vision-mode radiogroups.
-   * Individual radios are already reachable and activatable via Tab +
-   * Enter/Space (native `<button>` behaviour); this adds the conventional
-   * left/right (and up/down) radio-group navigation on top.
-   */
-  private readonly handleKeydown = (event: KeyboardEvent): void => {
-    if (
-      event.key !== 'ArrowLeft' &&
-      event.key !== 'ArrowRight' &&
-      event.key !== 'ArrowUp' &&
-      event.key !== 'ArrowDown'
-    ) {
-      return;
-    }
-    const target = event.target;
-    if (!(target instanceof HTMLElement) || target.getAttribute('role') !== 'radio') return;
-    const group = target.closest<HTMLElement>('[role="radiogroup"]');
-    if (!group || !this.root.contains(group)) return;
-    const options = Array.from(group.querySelectorAll<HTMLButtonElement>('[role="radio"]'));
-    const index = options.indexOf(target as HTMLButtonElement);
-    if (index === -1) return;
-    event.preventDefault();
-    const delta = event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 1;
-    const next = options[(index + delta + options.length) % options.length];
-    const mode = parseVisionMode(next?.dataset['mode']);
-    if (next && mode) {
-      next.focus();
-      this.intents.onSelectVisionMode(mode);
     }
   };
 

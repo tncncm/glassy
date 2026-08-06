@@ -1,18 +1,18 @@
 /**
- * Platform — a single pooled "windscreen" platform: a real tracked vehicle
- * turned into solid ground the player can land on. Mirrors Obstacle's
- * lifecycle discipline (the Graphics content is only ever mutated via
- * `.clear()` + redraw on the SAME pre-built instance, never `new Graphics()`)
- * with one difference: unlike an Obstacle's fixed size, a platform's box
- * genuinely changes shape every frame as it glides toward the latest tracked
- * box (see PlatformSystem), so `redraw()` runs whenever the box has moved
- * enough to matter — still just mutating the existing Graphics, never
- * constructing a new one, so this stays allocation-free per frame.
+ * Platform — a single pooled landing surface: either a real tracked vehicle,
+ * a synthetic "ghost" fallback, or one of the two fixed start/goal anchor
+ * blocks (see CrossingSystem, the only owner of this entity). The Graphics
+ * content is only ever mutated via `.clear()` + redraw on the SAME
+ * pre-built instance, never `new Graphics()`; unlike a fixed-size sprite, a
+ * platform's box genuinely changes shape every frame as it glides toward its
+ * latest target box, so `redraw()` runs whenever the box has moved enough to
+ * matter — still just mutating the existing Graphics, never constructing a
+ * new one, so this stays allocation-free per frame.
  *
  * Positions/sizes are tracked as 0..1 FRAME FRACTIONS (matching
  * TrackedObject's own units) and converted to canvas px fresh every call to
- * `updateVisual` — see PlatformSystem's doc for why that's what makes a live
- * resize "just work" with no special-case handling.
+ * `updateVisual` — that's what makes a live resize "just work" with no
+ * special-case handling.
  */
 
 import { Graphics } from 'pixi.js';
@@ -149,12 +149,10 @@ export class Platform {
   /**
    * Per-frame update: glide current→target and current alpha→fadeAlpha at
    * `followT` (a single expDecay(dt) factor shared across every platform,
-   * computed once by PlatformSystem.update), recompute px extents against
-   * the live canvas size, clamp the top so it can never sink below the real
-   * ground line (`maxTopY`), and redraw only if the box changed enough to
-   * matter.
+   * computed once by the owning system), recompute px extents against the
+   * live canvas size, and redraw only if the box changed enough to matter.
    */
-  updateVisual(followT: number, canvasWidth: number, canvasHeight: number, maxTopY: number, fadeAlpha: number): void {
+  updateVisual(followT: number, canvasWidth: number, canvasHeight: number, fadeAlpha: number): void {
     this.currentCenterXFraction = lerp(this.currentCenterXFraction, this.targetCenterXFraction, followT);
     this.currentCenterYFraction = lerp(this.currentCenterYFraction, this.targetCenterYFraction, followT);
     this.currentWidthFraction = lerp(this.currentWidthFraction, this.targetWidthFraction, followT);
@@ -164,8 +162,7 @@ export class Platform {
     const widthPx = this.currentWidthFraction * canvasWidth;
     const heightPx = this.currentHeightFraction * canvasHeight;
     const centerXPx = this.currentCenterXFraction * canvasWidth;
-    const rawTopPx = this.currentCenterYFraction * canvasHeight - heightPx / 2;
-    const topPx = Math.min(rawTopPx, maxTopY);
+    const topPx = this.currentCenterYFraction * canvasHeight - heightPx / 2;
 
     this.leftPx = centerXPx - widthPx / 2;
     this.rightPx = centerXPx + widthPx / 2;

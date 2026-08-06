@@ -455,6 +455,73 @@ body {
   flex: none;
 }
 
+/* Short landscape phones (iPhone SE class, ~375-390px tall): even with a
+   single game and no mode selectors, the mandatory copy (title, safety line,
+   privacy line, opt-in cost, Play) is too much text to fit un-scrolled at
+   this height. Trim what's genuinely optional (pitch, install hint) and
+   tighten spacing so as little scrolling as possible is needed to reach
+   Play — the panel's own overflow-y: auto remains the safety net under this. */
+@media (max-height: 430px) {
+  .home__panel {
+    gap: 4px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .home__title {
+    font-size: 22px;
+  }
+
+  .home__pitch {
+    display: none;
+  }
+
+  .home__best {
+    display: none;
+  }
+
+  .safety-line {
+    padding: 6px 12px;
+  }
+
+  .privacy-line {
+    font-size: 10px;
+    line-height: 1.25;
+  }
+
+  .install-hint {
+    display: none;
+  }
+
+  .vision {
+    gap: 2px;
+  }
+
+  .vision__toggle {
+    min-height: 44px;
+    padding: 5px 10px;
+  }
+
+  .vision__title {
+    font-size: 11.5px;
+  }
+
+  .vision__desc {
+    font-size: 10px;
+  }
+
+  .vision__status {
+    margin: 0 10px;
+    font-size: 9.5px;
+    line-height: 1.2;
+  }
+
+  .vision__progress {
+    margin: 2px 10px 0;
+    height: 3px;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Object-detection opt-in toggle (home + mirrored icon on paused)     */
 /* ------------------------------------------------------------------ */
@@ -595,209 +662,6 @@ body {
 }
 
 /* ------------------------------------------------------------------ */
-/* Camera-framing mode selector (home, full; paused, compact)          */
-/* ------------------------------------------------------------------ */
-
-.vision-mode {
-  width: 100%;
-  display: flex;
-  gap: 8px;
-  margin-top: 2px;
-  transition: opacity var(--glassy-transition-fast);
-}
-
-/* Detection is off: the choice still matters for next time the user opts in,
-   so it stays visible and interactive — just visually secondary, and never
-   styled in a way that could read as "detection is currently on". */
-.vision-mode--inactive {
-  opacity: 0.5;
-}
-
-.vision-mode__option {
-  appearance: none;
-  flex: 1;
-  min-width: 0;
-  min-height: 44px;
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: var(--glassy-radius-md);
-  border: 1px solid var(--glassy-surface-border);
-  background: var(--glassy-surface-strong);
-  color: var(--glassy-ink);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    border-color var(--glassy-transition-fast),
-    background-color var(--glassy-transition-fast);
-}
-
-.vision-mode__option:active {
-  transform: scale(0.99);
-}
-
-.vision-mode__option:focus-visible {
-  outline: 2px solid var(--glassy-accent);
-  outline-offset: 2px;
-}
-
-.vision-mode__option[aria-checked='true'] {
-  border-color: rgba(125, 211, 252, 0.75);
-  background: rgba(125, 211, 252, 0.16);
-}
-
-.vision-mode__dot {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  margin-top: 1px;
-  border-radius: 50%;
-  border: 2px solid var(--glassy-surface-border);
-  position: relative;
-}
-
-.vision-mode__option[aria-checked='true'] .vision-mode__dot {
-  border-color: var(--glassy-accent);
-}
-
-.vision-mode__option[aria-checked='true'] .vision-mode__dot::after {
-  content: '';
-  position: absolute;
-  inset: 3px;
-  border-radius: 50%;
-  background: var(--glassy-accent);
-}
-
-.vision-mode__text {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-.vision-mode__label {
-  font-size: clamp(11.5px, 2.1vh, 13px);
-  font-weight: 700;
-  line-height: 1.25;
-}
-
-.vision-mode__option[aria-checked='true'] .vision-mode__label {
-  color: var(--glassy-accent);
-}
-
-.vision-mode__desc {
-  font-size: clamp(9.5px, 1.8vh, 11px);
-  color: var(--glassy-ink-dim);
-  line-height: 1.3;
-}
-
-/* Compact variant (paused screen): label only, description visually hidden —
-   the full consequence still reaches assistive tech via aria-label, which is
-   always present regardless of what CSS shows. */
-.vision-mode--compact {
-  gap: 8px;
-}
-
-.vision-mode--compact .vision-mode__option {
-  justify-content: center;
-  align-items: center;
-  padding: 8px 8px;
-}
-
-.vision-mode--compact .vision-mode__label {
-  font-size: clamp(11px, 2.1vh, 12.5px);
-}
-
-.vision-mode--compact .vision-mode__desc {
-  display: none;
-}
-
-/* Short landscape phones (iPhone SE class, ~375px tall): the home panel
-   carries a lot of mandatory copy (safety line, privacy line, opt-in cost).
-   Compact it so Play stays reachable with as little scrolling as possible —
-   the panel's own overflow-y: auto remains the safety net underneath this. */
-@media (max-height: 420px) {
-  .home__panel {
-    gap: 3px;
-    padding-top: 6px;
-    padding-bottom: 6px;
-  }
-
-  .home__pitch {
-    display: none;
-  }
-
-  .safety-line {
-    padding: 6px 12px;
-  }
-
-  .privacy-line {
-    font-size: 10.5px;
-    line-height: 1.3;
-  }
-
-  .vision__toggle {
-    min-height: 44px;
-    padding: 6px 10px;
-  }
-
-  .vision__title {
-    font-size: 11.5px;
-  }
-
-  .vision__desc {
-    font-size: 10px;
-  }
-
-  .vision {
-    gap: 2px;
-  }
-
-  .vision__status {
-    margin: 0 10px;
-    font-size: 9.5px;
-    line-height: 1.2;
-  }
-
-  .vision__progress {
-    margin: 2px 10px 0;
-    height: 3px;
-  }
-
-  /* No vertical room left for a two-line description under each option —
-     drop to a label-only row, same shape as the paused screen's compact
-     variant. The consequence is not lost: `aria-label` on the button always
-     carries the full sentence, for every screen reader user regardless of
-     what's visually shown. */
-  .vision-mode {
-    margin-top: 1px;
-    gap: 6px;
-  }
-
-  .vision-mode__option {
-    min-height: 44px;
-    padding: 5px 8px;
-    gap: 6px;
-    justify-content: center;
-    align-items: center;
-  }
-
-  .vision-mode__dot {
-    width: 13px;
-    height: 13px;
-  }
-
-  .vision-mode__label {
-    font-size: 11px;
-  }
-
-  .vision-mode__desc {
-    display: none;
-  }
-}
-
-/* ------------------------------------------------------------------ */
 /* Screen: permission                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -845,6 +709,30 @@ body {
   align-items: center;
   gap: clamp(8px, 1.8vh, 14px);
   width: 100%;
+}
+
+/* Short landscape phones: the permission explainer is long (it has to cover
+   both the horizon read and the opt-in detection read); tighten it so the
+   primary button stays close to the fold. */
+@media (max-height: 430px) {
+  .permission__panel {
+    gap: 6px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .permission__icon {
+    font-size: 20px;
+  }
+
+  .permission__body {
+    font-size: 11.5px;
+    line-height: 1.3;
+  }
+
+  .permission__state {
+    gap: 6px;
+  }
 }
 
 /* ------------------------------------------------------------------ */

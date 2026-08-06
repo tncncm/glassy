@@ -30,13 +30,10 @@ import {
   type GameOverResult,
   type Preferences,
   type SoundName,
-  type Detection,
   type DetectorState,
   type ObjectDetector,
   type SceneAnalyser,
   type TrackedObject,
-  type GameMode,
-  type VisionMode,
   type UIController,
   type UIIntents,
 } from '../types.ts';
@@ -128,14 +125,8 @@ export async function createApp(root: HTMLElement): Promise<App> {
    */
   const detector: ObjectDetector = createObjectDetector({
     video,
-    mode: preferences.getVisionMode(),
     onStateChange(next: DetectorState): void {
       ui.setDetectorState(next);
-    },
-    onDetections(detections: readonly Detection[]): void {
-      // The array is reused by the detector — hand it straight on, and the
-      // game reads it synchronously. Neither side retains it.
-      game.onSceneDetections(detections);
     },
     onTrackedObjects(objects: readonly TrackedObject[]): void {
       // Windscreen mode: these become platforms. Reused array on both sides.
@@ -223,12 +214,6 @@ export async function createApp(root: HTMLElement): Promise<App> {
         audio.play('click');
         unlockAudio();
         requestFullscreenIfSupported();
-        // The demo clip is forward-facing dashcam footage, so force windscreen
-        // framing — running it in side-window mode would demo the wrong thing.
-        preferences.setVisionMode('windscreen');
-        ui.setVisionMode('windscreen');
-        detector.setMode('windscreen');
-        game.setVisionMode('windscreen');
         void (async () => {
           // Never re-attempt getUserMedia here: the point of the demo is to
           // work without a camera at all.
@@ -248,28 +233,6 @@ export async function createApp(root: HTMLElement): Promise<App> {
         unlockAudio();
         ui.setCameraFailure(null);
         void requestCameraThenPlay();
-      },
-      onSelectGameMode(mode: GameMode): void {
-        audio.play('click');
-        preferences.setGameMode(mode);
-        ui.setGameMode(mode);
-        game.setGameMode(mode);
-        // Crossing only makes sense pointed forward — the level IS what the
-        // camera sees. Switch framing with it rather than letting someone pick
-        // a combination that can't work.
-        if (mode === 'crossing' && preferences.getVisionMode() !== 'windscreen') {
-          preferences.setVisionMode('windscreen');
-          ui.setVisionMode('windscreen');
-          detector.setMode('windscreen');
-          game.setVisionMode('windscreen');
-        }
-      },
-      onSelectVisionMode(mode: VisionMode): void {
-        audio.play('click');
-        preferences.setVisionMode(mode);
-        ui.setVisionMode(mode);
-        detector.setMode(mode);
-        game.setVisionMode(mode);
       },
       onToggleVision(): void {
         audio.play('click');
@@ -584,12 +547,6 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.setInstallHintVisible(isIPhoneSafari() && !isStandalone());
     // Reflect the stored opt-in without starting a download on load.
     ui.setDetectorState({ status: preferences.getVisionEnabled() ? 'idle' : 'disabled' });
-    const savedMode = preferences.getVisionMode();
-    ui.setVisionMode(savedMode);
-    game.setVisionMode(savedMode);
-    const savedGameMode = preferences.getGameMode();
-    ui.setGameMode(savedGameMode);
-    game.setGameMode(savedGameMode);
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be

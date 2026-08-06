@@ -49,12 +49,6 @@ export interface Preferences {
    */
   getVisionEnabled(): boolean;
   setVisionEnabled(enabled: boolean): void;
-  /** Which way the phone is pointed. Defaults to 'window'. */
-  getVisionMode(): VisionMode;
-  setVisionMode(mode: VisionMode): void;
-  /** Which game is being played. Defaults to 'runner'. */
-  getGameMode(): GameMode;
-  setGameMode(mode: GameMode): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -204,26 +198,6 @@ export interface Detection {
 }
 
 /**
- * Where the phone is pointed. This is not cosmetic — it changes what the
- * camera sees, how well detection works, and what the game does with it.
- */
-export type VisionMode =
-  /**
-   * Rear camera out a SIDE window. Scenery rips past, objects are cropped,
-   * motion-blurred and side-on. Detection is sparse and unreliable here
-   * (measured: ~8 hits in 42s of motorway footage), so detections only
-   * flavour what spawns.
-   */
-  | 'window'
-  /**
-   * Rear camera out the WINDSCREEN. The vehicle ahead holds still in frame,
-   * roughly centred and at a sane scale — much closer to what the model was
-   * trained on. Detections are stable enough to become real, trackable
-   * platforms the player can land on.
-   */
-  | 'windscreen';
-
-/**
  * A detection followed across frames. The detector runs at a few Hz with a
  * jittery box; a platform built straight from raw detections would flicker and
  * jump. The tracker associates each detection with the object it belongs to,
@@ -248,19 +222,6 @@ export interface TrackedObject {
    */
   stable: boolean;
 }
-
-/**
- * Two genuinely different games sharing one engine.
- *
- * 'runner' is the validated endless runner: the world scrolls, the player runs
- * at a fixed x, detections only flavour what spawns.
- *
- * 'crossing' needs windscreen framing. The camera IS the level: the player
- * starts on a fixed block at the left edge and must reach a fixed block at the
- * right, hopping across real vehicles. Nothing scrolls; falling off the bottom
- * ends the attempt.
- */
-export type GameMode = 'runner' | 'crossing';
 
 export type DetectorStatus =
   /** Never asked to load. */
@@ -289,15 +250,12 @@ export interface ObjectDetectorOptions {
    * Fires per accepted detection, at most a few times a second. The array is
    * REUSED between calls — read it synchronously, never retain it.
    */
-  onDetections?: (detections: readonly Detection[]) => void;
   /**
    * Tracked, smoothed objects — the same detections associated across frames.
    * Use this, not `onDetections`, for anything the player can stand on. The
    * array is REUSED between calls: read it synchronously, never retain it.
    */
   onTrackedObjects?: (objects: readonly TrackedObject[]) => void;
-  /** Fewer, steadier frames suit 'window'; 'windscreen' wants a faster rate. */
-  mode?: VisionMode;
 }
 
 export interface ObjectDetector {
@@ -311,8 +269,6 @@ export interface ObjectDetector {
   stop(): void;
   /** Stop and release the model entirely. */
   dispose(): void;
-  /** Switch what the camera is pointed at. Safe to call while running. */
-  setMode(mode: VisionMode): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -392,11 +348,10 @@ export interface Game {
   /** Viewport changed. */
   resize(width: number, height: number): void;
   /**
-   * Suggest where the running surface should sit, as a 0..1 fraction of screen
-   * height, from the camera's estimated horizon. This is a HINT, not a command:
-   * a recent player drag always wins, and the game is free to ignore a
-   * low-confidence estimate. `null` means "no usable estimate" — revert to
-   * whatever the player last chose.
+   * The camera's estimated horizon, as a 0..1 fraction of screen height, or
+   * `null` when there is no usable estimate. The crossing game uses it to sit
+   * the fixed start/goal blocks at road level, so the level adapts to however
+   * the phone is actually being held instead of assuming a fixed height.
    */
   setHorizonHint(y: number | null, confidence: number): void;
   /**
@@ -406,20 +361,12 @@ export interface Game {
    * array is reused by the caller: read it synchronously, never retain it.
    * Never required for the game to function.
    */
-  onSceneDetections(detections: readonly Detection[]): void;
   /**
    * Windscreen mode: real objects ahead, tracked across frames. The game turns
    * `stable` ones into platforms the player can land on, positioned to follow
    * the real vehicle on screen. Reused array — read synchronously.
    */
   onTrackedObjects(objects: readonly TrackedObject[]): void;
-  /** Changes how detections are used. See VisionMode. */
-  setVisionMode(mode: VisionMode): void;
-  /**
-   * Switch between the endless runner and the crossing game. 'crossing' only
-   * makes sense with windscreen framing; the caller enforces that pairing.
-   */
-  setGameMode(mode: GameMode): void;
   /** Tear down Pixi and remove all listeners. */
   destroy(): void;
 }
@@ -467,10 +414,6 @@ export interface UIIntents {
   onPlayDemoVideo(): void;
   /** The user flipped the on-device object-detection opt-in. */
   onToggleVision(): void;
-  /** The user switched between side-window and windscreen framing. */
-  onSelectVisionMode(mode: VisionMode): void;
-  /** The user chose the runner or the crossing game. */
-  onSelectGameMode(mode: GameMode): void;
 }
 
 export interface UIController {
@@ -493,10 +436,6 @@ export interface UIController {
    * download//status line while `loading` or after failure.
    */
   setDetectorState(state: DetectorState): void;
-  /** Reflect the current framing choice in the mode selector. */
-  setVisionMode(mode: VisionMode): void;
-  /** Reflect the current game choice in the selector. */
-  setGameMode(mode: GameMode): void;
   /**
    * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
    * the Fullscreen API does not exist and installing the PWA is the only way

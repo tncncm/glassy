@@ -14,6 +14,16 @@ import {
   COLLISION_PARTICLE_COUNT,
   COLLISION_SPEED_MAX,
   COLLISION_SPEED_MIN,
+  CROSSING_IMPACT_PARTICLE_COLOR,
+  CROSSING_IMPACT_PARTICLE_COUNT,
+  CROSSING_IMPACT_PARTICLE_LIFETIME_SECONDS,
+  CROSSING_IMPACT_PARTICLE_SPEED_MAX,
+  CROSSING_IMPACT_PARTICLE_SPEED_MIN,
+  CROSSING_IMPACT_PARTICLE_VERTICAL_SQUASH,
+  CROSSING_SPARKLE_LIFETIME_SECONDS,
+  CROSSING_SPARKLE_PARTICLE_COUNT,
+  CROSSING_SPARKLE_SPEED_MAX,
+  CROSSING_SPARKLE_SPEED_MIN,
   DUST_COLOR,
   DUST_LIFETIME_SECONDS,
   DUST_PARTICLE_COUNT,
@@ -23,16 +33,6 @@ import {
   PARTICLE_GRAVITY,
   PARTICLE_POOL_SIZE,
   PARTICLE_RADIUS,
-  PICKUP_PARTICLE_COUNT,
-  PICKUP_PARTICLE_LIFETIME_SECONDS,
-  PICKUP_PARTICLE_SPEED_MAX,
-  PICKUP_PARTICLE_SPEED_MIN,
-  SLAM_PARTICLE_COLOR,
-  SLAM_PARTICLE_COUNT,
-  SLAM_PARTICLE_LIFETIME_SECONDS,
-  SLAM_PARTICLE_SPEED_MAX,
-  SLAM_PARTICLE_SPEED_MIN,
-  SLAM_PARTICLE_VERTICAL_SQUASH,
 } from '../config.ts';
 import { randomRange } from '../util/math.ts';
 
@@ -117,37 +117,37 @@ export class ParticleSystem {
     }
   }
 
-  /** Flattened, evenly-spaced ring at (x, y) — the slam landing shockwave.
-   * Unlike `spawnBurst`'s random full-circle scatter, an even angular spread
-   * reads as a coherent shockwave rather than debris, and the vertical
-   * component is squashed so it hugs the ground line instead of ballooning
-   * upward. */
+  /** Flattened, evenly-spaced ring at (x, y) — the goal-arrival impact
+   * shockwave. Unlike `spawnBurst`'s random full-circle scatter, an even
+   * angular spread reads as a coherent shockwave rather than debris, and the
+   * vertical component is squashed so it hugs the platform instead of
+   * ballooning upward. */
   spawnRing(x: number, y: number): void {
-    for (let i = 0; i < SLAM_PARTICLE_COUNT; i++) {
+    for (let i = 0; i < CROSSING_IMPACT_PARTICLE_COUNT; i++) {
       const slot = this.acquire();
       if (!slot) return;
-      const angle = (i / SLAM_PARTICLE_COUNT) * Math.PI * 2;
-      const speed = randomRange(SLAM_PARTICLE_SPEED_MIN, SLAM_PARTICLE_SPEED_MAX);
+      const angle = (i / CROSSING_IMPACT_PARTICLE_COUNT) * Math.PI * 2;
+      const speed = randomRange(CROSSING_IMPACT_PARTICLE_SPEED_MIN, CROSSING_IMPACT_PARTICLE_SPEED_MAX);
       const vx = Math.cos(angle) * speed;
-      const vy = Math.sin(angle) * speed * SLAM_PARTICLE_VERTICAL_SQUASH;
-      this.activate(slot, x, y, vx, vy, SLAM_PARTICLE_LIFETIME_SECONDS, SLAM_PARTICLE_COLOR);
+      const vy = Math.sin(angle) * speed * CROSSING_IMPACT_PARTICLE_VERTICAL_SQUASH;
+      this.activate(slot, x, y, vx, vy, CROSSING_IMPACT_PARTICLE_LIFETIME_SECONDS, CROSSING_IMPACT_PARTICLE_COLOR);
     }
   }
 
   /** Small upward-biased sparkle at (x, y) in a caller-supplied `color` —
-   * used for pickup collection (collectible/power-up). Kept as a separate
-   * method rather than overloading spawnDust/spawnBurst because those two
-   * bake in their own fixed palettes (DUST_COLOR, COLLISION_COLOR_A/B);
-   * this one needs a different color per pickup kind. */
+   * used for the perfect-landing and goal-arrival reward beats. Kept as a
+   * separate method rather than overloading spawnDust/spawnBurst because
+   * those two bake in their own fixed palettes (DUST_COLOR,
+   * COLLISION_COLOR_A/B); this one needs a different color per event. */
   spawnSparkle(x: number, y: number, color: number): void {
-    for (let i = 0; i < PICKUP_PARTICLE_COUNT; i++) {
+    for (let i = 0; i < CROSSING_SPARKLE_PARTICLE_COUNT; i++) {
       const slot = this.acquire();
       if (!slot) return;
       const angle = randomRange(0, Math.PI * 2);
-      const speed = randomRange(PICKUP_PARTICLE_SPEED_MIN, PICKUP_PARTICLE_SPEED_MAX);
+      const speed = randomRange(CROSSING_SPARKLE_SPEED_MIN, CROSSING_SPARKLE_SPEED_MAX);
       const vx = Math.cos(angle) * speed;
-      const vy = Math.sin(angle) * speed - PICKUP_PARTICLE_SPEED_MIN;
-      this.activate(slot, x, y, vx, vy, PICKUP_PARTICLE_LIFETIME_SECONDS, color);
+      const vy = Math.sin(angle) * speed - CROSSING_SPARKLE_SPEED_MIN;
+      this.activate(slot, x, y, vx, vy, CROSSING_SPARKLE_LIFETIME_SECONDS, color);
     }
   }
 

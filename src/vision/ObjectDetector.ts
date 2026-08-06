@@ -45,7 +45,6 @@ import type {
   ObjectDetector,
   ObjectDetectorOptions,
   DetectorState,
-  VisionMode,
   DetectedKind,
   Detection,
 } from '../types.ts';
@@ -80,8 +79,6 @@ const MODEL_PATH = '/vision/efficientdet_lite0_float16.tflite';
  */
 const WORKER_PATH = '/vision/detector-worker.js';
 
-/** Default inferences per second. Low on purpose — a neural net on a phone. */
-const DEFAULT_SAMPLE_HZ = 3;
 /**
  * Measured against real Italian motorway footage: a clearly-visible truck
  * scores 0.42-0.58, distant cars 0.25-0.33. 0.4 missed almost everything;
@@ -167,17 +164,15 @@ function environmentSupportsWorkerPipeline(): boolean {
 
 export function createObjectDetector(options: ObjectDetectorOptions): ObjectDetector {
   const { video } = options;
-  const sampleHz = options.sampleHz ?? DEFAULT_SAMPLE_HZ;
   /**
-   * Windscreen framing holds objects still in frame, so it both benefits from
-   * and can afford a faster rate: inference is on the CPU delegate in a worker
-   * and costs the main thread nothing measurable.
+   * There is one framing now — through the windscreen — where objects hold
+   * still in frame. That both benefits from and can afford a faster rate:
+   * inference runs on the CPU delegate in a worker and costs the main thread
+   * nothing measurable.
    */
   const WINDSCREEN_SAMPLE_HZ = 6;
-  let mode: VisionMode = options.mode ?? 'window';
-  const baseIntervalMs = 1000 / Math.max(1, sampleHz);
   function intervalForMode(): number {
-    return mode === 'windscreen' ? 1000 / WINDSCREEN_SAMPLE_HZ : baseIntervalMs;
+    return 1000 / WINDSCREEN_SAMPLE_HZ;
   }
   let intervalMs = intervalForMode();
 
@@ -295,7 +290,6 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   function publishDetections(detections: readonly RawDetection[], bitmapWidth: number, bitmapHeight: number): void {
     output.length = 0;
     if (bitmapWidth === 0 || bitmapHeight === 0) {
-      options.onDetections?.(output);
       return;
     }
 
@@ -316,7 +310,6 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     }
 
     emitTracked();
-    options.onDetections?.(output);
   }
 
   /**
@@ -626,15 +619,6 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       return currentState;
     },
 
-    setMode(next: VisionMode): void {
-      if (next === mode) return;
-      mode = next;
-      // Tracks describe a different scene now — carrying them over would let
-      // a side-window vehicle become a windscreen platform.
-      tracker.reset();
-      lastTrackUpdateMs = 0;
-      intervalMs = intervalForMode();
-    },
 
     start(): Promise<DetectorState> {
       if (currentState.status === 'ready') {
