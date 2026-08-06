@@ -406,18 +406,28 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       for (let i = 0; i < candidates.length; i++) {
         const platform = candidates[i]!;
         if (player.x < platform.left - assistHorizontalPx || player.x > platform.right + assistHorizontalPx) continue;
-        if (prevFootY > platform.top + assistVerticalPx) continue;
-        if (selectedPlatform === null || platform.top < crossingSurfaceReferenceY) {
+        // Interpolate the ACTUAL surface height at the player's x (clamped
+        // onto the platform's own span) rather than a flat top — see
+        // Platform.surfaceYAt's doc. This is what lets the player land on a
+        // bonnet and walk up onto a roof instead of everything reading as an
+        // invisible flat slab.
+        const surfaceAtX = platform.surfaceYAt(clamp(player.x, platform.left, platform.right));
+        if (prevFootY > surfaceAtX + assistVerticalPx) continue;
+        if (selectedPlatform === null || surfaceAtX < crossingSurfaceReferenceY) {
           selectedPlatform = platform;
-          crossingSurfaceReferenceY = platform.top;
+          crossingSurfaceReferenceY = surfaceAtX;
         }
       }
     }
     if (selectedPlatform !== null) {
       // Ride every frame it stays selected, not just on identity change —
-      // this is what makes standing on a gliding real/ghost platform track
-      // its motion smoothly instead of only snapping in on first contact.
-      crossingSurfaceReferenceY = selectedPlatform.top;
+      // and RE-SAMPLED at the player's CURRENT x, not just re-read — so
+      // standing on a gliding real/ghost platform tracks its motion smoothly
+      // AND walking across a sloped surface follows the incline, both from
+      // the same per-frame re-sample. The profile itself can only move a
+      // `followT`-sized step per frame toward its latest tracked shape (see
+      // Platform.updateVisual's doc), so this can never read as a shove.
+      crossingSurfaceReferenceY = selectedPlatform.surfaceYAt(clamp(player.x, selectedPlatform.left, selectedPlatform.right));
     }
     if (selectedPlatform !== currentCrossingPlatform) {
       // Deliberately does NOT rebase onto anything when the NEW surface is
@@ -659,7 +669,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
           player.setWalkVelocity(direction * CROSSING_WALK_SPEED);
         }
       },
-      onCrossingAimChange(dirX: number, dirY: number, power: number): void {
+      onCrossingAimChange(dirX: number, dirY: number, power: number, overCancelZone: boolean): void {
         if (status !== 'running') return;
         const maxSpeed = crossingMaxJumpSpeed(canvasWidth);
         const velocity = computeCrossingJumpVelocity(dirX, dirY, power, maxSpeed);
@@ -674,6 +684,10 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
           player.groundContactY - dirY * power * CROSSING_AIM_MAX_DRAG_PX,
           power <= cancelPower,
         );
+        // Second cancel affordance — the screen-edge banner. `overCancelZone`
+        // is InputSystem's own check against the real pointer position; this
+        // just forwards it to drive the highlight.
+        crossing.showCancelZone(canvasWidth, overCancelZone);
       },
       onCrossingJumpRelease(dirX: number, dirY: number, power: number): void {
         crossing.hideTrajectoryPreview();

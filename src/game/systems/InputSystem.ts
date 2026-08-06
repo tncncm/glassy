@@ -26,8 +26,21 @@
  *     "I changed my mind" escape hatch a fixed one-way commitment wouldn't
  *     allow, so second-guessing an aim never fires an accidental
  *     near-zero-power jump.
+ *   - SECOND cancel affordance: while aiming, if the pointer is within
+ *     CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX of the canvas's literal top edge —
+ *     a screen-FIXED band, unlike the press-anchored ring above — releasing
+ *     there cancels instead of jumping (`onCrossingAimCancel`, not
+ *     `onCrossingJumpRelease`). Unlike the ring, this only ever fires on
+ *     RELEASE, not on move: entering the band just live-updates the
+ *     `overCancelZone` flag passed to `onCrossingAimChange` so the caller can
+ *     draw it "armed", the "drag an icon onto Remove" pattern. It lives at
+ *     the top edge specifically because an aim drag is anchored to the
+ *     PLAYER's own on-screen position (well below the literal top of a
+ *     landscape frame) and capped at CROSSING_AIM_MAX_DRAG_PX, so reaching
+ *     this band is not a realistic accident even for a steep upward aim.
  *   - `pointerup` while committed to aiming fires `onCrossingJumpRelease`
- *     with the last aim vector/power; released before ever committing (a
+ *     with the last aim vector/power (or `onCrossingAimCancel` if released
+ *     inside the cancel zone above); released before ever committing (a
  *     plain tap, or a hold-then-release with no drag) just stops walking.
  *
  * This was picked over (a) a fixed on-screen d-pad — extra chrome, and the
@@ -52,7 +65,13 @@
  * destroy().
  */
 
-import { CROSSING_AIM_CANCEL_RADIUS_PX, CROSSING_AIM_DEADZONE_PX, CROSSING_AIM_MAX_DRAG_PX, CROSSING_KEYBOARD_CHARGE_SECONDS } from '../config.ts';
+import {
+  CROSSING_AIM_CANCEL_RADIUS_PX,
+  CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX,
+  CROSSING_AIM_DEADZONE_PX,
+  CROSSING_AIM_MAX_DRAG_PX,
+  CROSSING_KEYBOARD_CHARGE_SECONDS,
+} from '../config.ts';
 import { clamp } from '../util/math.ts';
 
 export interface InputCallbacks {
@@ -61,9 +80,12 @@ export interface InputCallbacks {
   onCrossingWalk(direction: -1 | 0 | 1): void;
   /** Fires on every update to an in-progress aim (drag vector in
    * screen-space px, `power` 0..1 saturating at CROSSING_AIM_MAX_DRAG_PX or
-   * CROSSING_KEYBOARD_CHARGE_SECONDS) so the caller can keep a trajectory
-   * preview in sync. */
-  onCrossingAimChange(dirX: number, dirY: number, power: number): void;
+   * CROSSING_KEYBOARD_CHARGE_SECONDS). `overCancelZone` is true while a
+   * pointer aim is currently positioned over the screen-edge cancel banner
+   * (see the class doc) — always false for a keyboard-charged aim, which has
+   * no pointer position. The caller uses both to keep the trajectory preview
+   * and both cancel affordances in sync. */
+  onCrossingAimChange(dirX: number, dirY: number, power: number, overCancelZone: boolean): void;
   /** The aim gesture committed and released; fire the jump with this final
    * vector/power. */
   onCrossingJumpRelease(dirX: number, dirY: number, power: number): void;
@@ -150,7 +172,9 @@ export class InputSystem {
     const elapsedSeconds = (performance.now() - this.keyboardChargeStart) / 1000;
     const power = clamp(elapsedSeconds / CROSSING_KEYBOARD_CHARGE_SECONDS, 0, 1);
     const { dirX, dirY } = this.currentKeyboardAimDirection();
-    this.callbacks.onCrossingAimChange(dirX, dirY, power);
+    // No pointer position exists for a keyboard-charged aim, so the
+    // screen-edge cancel zone (a pointer-only affordance) never applies.
+    this.callbacks.onCrossingAimChange(dirX, dirY, power, false);
   }
 
   private onPointerDown(event: PointerEvent): void {
@@ -201,7 +225,7 @@ export class InputSystem {
     }
 
     const power = clamp(distance, 0, CROSSING_AIM_MAX_DRAG_PX) / CROSSING_AIM_MAX_DRAG_PX;
-    this.callbacks.onCrossingAimChange(dx, dy, power);
+    this.callbacks.onCrossingAimChange(dx, dy, power, this.isOverCancelZone(event.clientY));
   }
 
   private onPointerUp(event: PointerEvent): void {
@@ -209,8 +233,15 @@ export class InputSystem {
     event.preventDefault();
     const dx = event.clientX - this.startX;
     const dy = event.clientY - this.startY;
+    const releasedInCancelZone = this.aiming && this.isOverCancelZone(event.clientY);
     this.releasePrimary(event.pointerId);
-    if (this.aiming) {
+    if (releasedInCancelZone) {
+      // Second cancel affordance — see the class doc. Walking is already
+      // stopped (it was zeroed the instant the gesture committed to aiming),
+      // so there's nothing else to reconcile here beyond ending the aim.
+      this.aiming = false;
+      this.callbacks.onCrossingAimCancel();
+    } else if (this.aiming) {
       this.aiming = false;
       const power = clamp(Math.hypot(dx, dy), 0, CROSSING_AIM_MAX_DRAG_PX) / CROSSING_AIM_MAX_DRAG_PX;
       this.callbacks.onCrossingJumpRelease(dx, dy, power);
@@ -246,6 +277,15 @@ export class InputSystem {
   private halfDirectionFor(clientX: number): -1 | 1 {
     const rect = this.canvas.getBoundingClientRect();
     return clientX - rect.left < rect.width / 2 ? -1 : 1;
+  }
+
+  /** Whether a client-space y falls within the screen-edge cancel zone —
+   * canvas-relative, so it stays correct regardless of where the canvas sits
+   * in the viewport. Shared by the live "armed" readout (onPointerMove) and
+   * the actual cancel decision (onPointerUp) so they can never disagree. */
+  private isOverCancelZone(clientY: number): boolean {
+    const rect = this.canvas.getBoundingClientRect();
+    return clientY - rect.top <= CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX;
   }
 
   private onKeyDown(event: KeyboardEvent): void {

@@ -41,7 +41,7 @@
  */
 
 import { createDetectionTracker, type DetectionTracker } from './DetectionTracker.ts';
-import { createRoofFinder, type RoofFinder } from './RoofFinder.ts';
+import { createSurfaceProfileFinder, type SurfaceProfileFinder } from './SurfaceProfileFinder.ts';
 import { createSceneAnalyser } from './SceneAnalyser.ts';
 import { createCarriagewayFilter, type CarriagewayFilter, type CarriagewayRejectReason } from './CarriagewayFilter.ts';
 import type {
@@ -202,17 +202,17 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   let intervalMs = intervalForMode();
 
   const tracker: DetectionTracker = createDetectionTracker();
-  const roofFinder: RoofFinder = createRoofFinder();
+  const surfaceFinder: SurfaceProfileFinder = createSurfaceProfileFinder();
   /**
    * ObjectDetector owns its own SceneAnalyser instance rather than taking
    * the horizon as an option — `ObjectDetectorOptions` is frozen (see
    * CLAUDE.md) and today's only consumer of the horizon is the game, wired
    * up independently in App.ts. This pays for a second tiny (48x39, see
    * SceneAnalyser's own PRIVACY comment) canvas read at the same ~6Hz the
-   * game's own analyser already runs at — negligible next to RoofFinder's
-   * 320x180 sample, and it keeps the vision layer's carriageway filtering
-   * self-contained instead of threading a cross-layer dependency through
-   * App.ts for one number.
+   * game's own analyser already runs at — negligible next to
+   * SurfaceProfileFinder's 320x180 sample, and it keeps the vision layer's
+   * carriageway filtering self-contained instead of threading a cross-layer
+   * dependency through App.ts for one number.
    */
   const laneAnalyser: SceneAnalyser = createSceneAnalyser({ video });
   const carriagewayFilter: CarriagewayFilter = createCarriagewayFilter();
@@ -362,10 +362,11 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
     lastTrackUpdateMs = now;
     const trackedObjects = tracker.update(output, dt);
-    // Refine the loose detection box down to the actual roof line/width
-    // in place, before handing objects out. Falls back to the box's own
-    // top edge and sides (already written by the tracker) on any failure.
-    roofFinder.refine(video, trackedObjects, dt);
+    // Refine the loose detection box down to the actual vehicle silhouette
+    // (flat row + per-column profile) in place, before handing objects out.
+    // Falls back to the box's own top edge and sides (already written by
+    // the tracker) on any failure.
+    surfaceFinder.refine(video, trackedObjects, dt);
     // Keep only vehicles plausibly travelling with us on our own
     // carriageway (see CarriagewayFilter.ts for the full reasoning).
     // person/sign objects pass through untouched. Falls back to the
@@ -734,7 +735,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         worker = null;
       }
       output.length = 0;
-      roofFinder.stop();
+      surfaceFinder.stop();
       laneAnalyser.stop();
       carriagewayFilter.reset();
       setState({ status: 'idle' });

@@ -15,7 +15,7 @@
  * twitchy. A platform that lags 100ms is fine; one that jitters is unusable.
  */
 
-import type { DetectedKind, Detection, TrackedObject } from '../types.ts';
+import { SURFACE_PROFILE_SAMPLES, type DetectedKind, type Detection, type TrackedObject } from '../types.ts';
 
 /** Boxes overlapping less than this are never considered the same object. */
 const MIN_IOU_TO_MATCH = 0.2;
@@ -89,6 +89,9 @@ export function createDetectionTracker(): DetectionTracker {
   const output: TrackedObject[] = Array.from({ length: MAX_TRACKS }, () => ({
     id: 0, kind: 'vehicle', x: 0, y: 0, width: 0, height: 0, score: 0,
     surfaceY: 0, surfaceLeft: 0, surfaceRight: 0,
+    // Allocated ONCE here, per pooled slot, and mutated in place forever
+    // after — never reallocated per tick. See the fallback fill below.
+    surfaceProfile: new Float32Array(SURFACE_PROFILE_SAMPLES),
     age: 0, stable: false,
   }));
   const live: TrackedObject[] = [];
@@ -185,13 +188,19 @@ export function createDetectionTracker(): DetectionTracker {
       slot.height = t.height;
       slot.score = t.score;
       // Fallback landing surface: the box's own top edge and sides. Callers
-      // (see ObjectDetector.ts) may refine this via RoofFinder before the
-      // object is handed out; if refinement doesn't run or doesn't trust
-      // its answer this tick, this is what ships — always populated, never
-      // left at a stale or zero value.
+      // (see ObjectDetector.ts) may refine this via SurfaceProfileFinder
+      // before the object is handed out; if refinement doesn't run or
+      // doesn't trust its answer this tick, this is what ships — always
+      // populated, never left at a stale or zero value.
       slot.surfaceY = t.y - t.height / 2;
       slot.surfaceLeft = t.x - t.width / 2;
       slot.surfaceRight = t.x + t.width / 2;
+      // Same fallback, generalised to the profile: flat at the box's own
+      // top edge until/unless SurfaceProfileFinder recovers real per-column
+      // shape. Filling every entry (not leaving stale values from a
+      // previous object that held this pooled slot) is what lets consumers
+      // index it unconditionally.
+      for (let p = 0; p < SURFACE_PROFILE_SAMPLES; p++) slot.surfaceProfile[p] = slot.surfaceY;
       slot.age = t.ageSeconds;
       slot.stable = t.confirmations >= CONFIRMATIONS_TO_STABILISE;
       live.push(slot);

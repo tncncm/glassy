@@ -75,7 +75,7 @@ const { chromium } = await import(
 const browser = await chromium.launch();
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 720 } })).newPage();
 page.on('pageerror', (e) => console.error('  page error:', e.message));
-page.on('console', (m) => { if (m.type() === 'error') console.error('  console:', m.text().slice(0, 200)); });
+page.on('console', (m) => { if (m.type() === 'error' || m.text().startsWith('[PROFDBG')) console.error('  console:', m.text().slice(0, 300)); });
 
 await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}`, { waitUntil: 'load' });
 
@@ -192,6 +192,63 @@ const cwTracksKeptOnly = [...cwById.values()].filter((e) => e.everKept && !e.eve
 const cwTracksRejectedOnly = [...cwById.values()].filter((e) => e.everRejected && !e.everKept).length;
 const cwTracksBoth = [...cwById.values()].filter((e) => e.everKept && e.everRejected).length;
 console.log(`  distinct vehicle tracks: ${cwById.size}  (kept-only ${cwTracksKeptOnly}, rejected-only ${cwTracksRejectedOnly}, flipped ${cwTracksBoth})`);
+
+// Surface profile report: how much shape is actually being found (spread
+// between the highest and lowest column per sample, i.e. does the polyline
+// show a bonnet-to-roof step or sit dead flat), how often individual columns
+// fall back to the flat surfaceY, and how steady the shape is tick to tick.
+const vehicleTracked = tracked.filter((t) => t.kind === 'vehicle' && Array.isArray(t.profile));
+const FLAT_EPS = 0.0015; // fraction-of-frame-height tolerance for "this column is just surfaceY"
+let flatColumns = 0;
+let totalColumns = 0;
+const spreads = [];
+for (const t of vehicleTracked) {
+  const p = t.profile;
+  let lo = Infinity, hi = -Infinity, flatHere = 0;
+  for (const v of p) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+    if (Math.abs(v - t.surfaceY) < FLAT_EPS) flatHere++;
+  }
+  flatColumns += flatHere;
+  totalColumns += p.length;
+  spreads.push(hi - lo);
+}
+spreads.sort((a, b) => a - b);
+const spreadAt = (q) => (spreads.length ? spreads[Math.min(spreads.length - 1, Math.floor(q * spreads.length))] : NaN);
+
+// Temporal stability per column per track id — the same "median frame-to-
+// frame jump" measure used for the horizon above, generalised across all 24
+// columns of every stable track.
+const byTrackId = new Map();
+for (const t of vehicleTracked) {
+  if (!t.stable) continue;
+  const list = byTrackId.get(t.id) ?? [];
+  list.push(t);
+  byTrackId.set(t.id, list);
+}
+const colSteps = [];
+for (const list of byTrackId.values()) {
+  list.sort((a, b) => a.t - b.t);
+  for (let i = 1; i < list.length; i++) {
+    const prev = list[i - 1].profile, cur = list[i].profile;
+    if (!prev || !cur || prev.length !== cur.length) continue;
+    for (let c = 0; c < cur.length; c++) colSteps.push(Math.abs(cur[c] - prev[c]));
+  }
+}
+colSteps.sort((a, b) => a - b);
+const colMedStep = colSteps.length ? colSteps[Math.floor(colSteps.length / 2)] : NaN;
+const colP90Step = colSteps.length ? colSteps[Math.floor(colSteps.length * 0.9)] : NaN;
+
+console.log('\n══════════ SURFACE PROFILE ══════════');
+console.log(`  vehicle samples w/ profile : ${vehicleTracked.length}`);
+console.log(`  column fallback-to-flat    : ${totalColumns ? ((100 * flatColumns) / totalColumns).toFixed(1) : 'n/a'}% of columns (within ${FLAT_EPS} of surfaceY)`);
+if (spreads.length) {
+  console.log(`  shape spread (hi-lo, frac of frame height): p50 ${spreadAt(0.5).toFixed(4)}  p90 ${spreadAt(0.9).toFixed(4)}  max ${spreads[spreads.length - 1].toFixed(4)}`);
+}
+if (colSteps.length) {
+  console.log(`  per-column frame-to-frame jump (stable tracks): median ${colMedStep.toFixed(4)}  p90 ${colP90Step.toFixed(4)}  ${colMedStep > 0.02 ? '← jittery' : '← steady'}`);
+}
 
 console.log(`\nAnnotated frames: ${outDir}/frame-*.png`);
 console.log(`Raw log:          ${outDir}/log.json`);

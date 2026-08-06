@@ -305,12 +305,25 @@ export class Player {
       const wasAirborne = !this.grounded;
       if (wasAirborne) {
         this.landingImpactSpeed = Math.abs(this.velocityY);
+        // Land cleanly, no residual slide — keeps "which surface is the
+        // player standing on" unambiguous for the frame right after
+        // landing. Deliberately scoped to the LANDING EDGE only (once, the
+        // frame `grounded` flips true), not every subsequent grounded
+        // frame: this branch re-runs on essentially every grounded frame
+        // (gravity nudges `airborneHeight` slightly negative each tick,
+        // which this same block re-clamps to 0 — see the file doc), so an
+        // unconditional reset here silently zeroed a held walk's velocityX
+        // one frame after `setWalkVelocity` set it, since nothing re-polls
+        // walk input every frame the way `updateCrossingAim` does for a
+        // charging jump. That made sustained walking (a held key, or a
+        // touch held still after the initial press) advance by a single
+        // frame's distance and then stop dead — the walking-follows-the-
+        // incline requirement above is unusable without this fix, since it
+        // depends on x actually changing over multiple frames.
+        this.velocityX = 0;
       }
       this.airborneHeight = 0;
       this.velocityY = 0;
-      // Land cleanly, no residual slide — keeps "which surface is the
-      // player standing on" unambiguous for the frame right after landing.
-      this.velocityX = 0;
       this.grounded = true;
       this.coyoteTimer = CROSSING_COYOTE_TIME_SECONDS;
       if (wasAirborne) {

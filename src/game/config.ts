@@ -370,14 +370,20 @@ export const CROSSING_WALK_SPEED = 210;
 /**
  * How many deliberate hops a single crossing SHOULD take at full power, in a
  * straight line, with no walking between jumps — the number the whole jump
- * envelope below is derived from. 5-8 is the range that keeps a crossing
- * feeling like a sequence of real decisions without turning into a slog;
- * 6 sits in the middle of that band. Mixed-power jumps and walking between
- * hops (the actual way most crossings get played) push the real hop count
- * higher than this, which is exactly the point — this is a LOWER bound on
- * how many commits a crossing demands, not a par time.
+ * envelope below is derived from. Shipped at 6 first; measured against the
+ * HARD-difficulty span (~0.76 of screen width) that gave a max single-jump
+ * reach of only ~0.127 of screen width, which played as "too short" (felt
+ * clipped/underpowered, not like a deliberate commit). Lowered to 4 — max
+ * reach ~0.19 of screen width, so a dead-straight full-power run still takes
+ * 4 real jumps to clear the HARD span, with mixed-power jumps and walking
+ * between hops (the actual way most crossings get played) pushing the real
+ * hop count higher still. This is a LOWER bound on how many commits a
+ * crossing demands, not a par time — retune HERE, not by scaling
+ * CROSSING_MAX_JUMP_HORIZONTAL_FRACTION directly, so the ghost spacing and
+ * per-leg timer budget (both derived FROM this constant) stay consistent
+ * with the jump-power cap instead of drifting out of sync with it.
  */
-export const CROSSING_TARGET_HOPS_PER_CROSSING = 6;
+export const CROSSING_TARGET_HOPS_PER_CROSSING = 4;
 
 /** The horizontal distance (in canvas-width fractions) a full-power jump
  * actually has to cover: the gap between the two anchor blocks' facing
@@ -452,6 +458,37 @@ export const CROSSING_AIM_CANCEL_RING_THICKNESS = 2;
  * dragging off-canvas doesn't over-charge the jump. */
 export const CROSSING_AIM_MAX_DRAG_PX = 160;
 
+/**
+ * SECOND, unmissable cancel affordance — see InputSystem's class doc for the
+ * full gesture. The existing cancel RING above arms on MOVE (drag back near
+ * the press point) and un-commits back to walking mid-gesture; users kept
+ * reporting cancel as "missing" even after the ring shipped, so this adds a
+ * completely different kind of target: a labelled banner FIXED at the
+ * screen's top edge, shown only while aiming, that cancels the jump if the
+ * pointer is RELEASED inside it — the same "drag an icon onto Remove"
+ * pattern most touch users already know.
+ *
+ * Top edge specifically because an ordinary aim drag is anchored to the
+ * PLAYER's own on-screen position (which sits around the road line —
+ * CROSSING_BLOCK_CENTER_Y_FRACTION, well below the very top of a landscape
+ * frame — not the empty sky above it) and capped at CROSSING_AIM_MAX_DRAG_PX
+ * of travel, so reaching this band is not a realistic accident even for a
+ * steep upward aim; it takes a deliberate drag toward open space nothing
+ * else uses.
+ */
+export const CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX = 72;
+export const CROSSING_AIM_CANCEL_ZONE_COLOR = 0x11151c;
+export const CROSSING_AIM_CANCEL_ZONE_ALPHA = 0.5;
+/** Highlight shown once the pointer is actually over the zone — releasing
+ * right now would cancel. Same red family as the ring's own armed state. */
+export const CROSSING_AIM_CANCEL_ZONE_ARMED_COLOR = 0xff4a4a;
+export const CROSSING_AIM_CANCEL_ZONE_ARMED_ALPHA = 0.82;
+export const CROSSING_AIM_CANCEL_ZONE_LABEL_TEXT = 'DRAG HERE TO CANCEL';
+export const CROSSING_AIM_CANCEL_ZONE_ARMED_LABEL_TEXT = 'RELEASE TO CANCEL';
+export const CROSSING_AIM_CANCEL_ZONE_LABEL_SIZE = 13;
+export const CROSSING_AIM_CANCEL_ZONE_LABEL_COLOR = 0xffffff;
+export const CROSSING_AIM_CANCEL_ZONE_LABEL_OUTLINE_COLOR = 0x0c3542;
+
 /* --- Aim gesture (keyboard) ------------------------------------------ */
 
 /** Seconds of holding Space to reach full power. */
@@ -519,10 +556,11 @@ export const CROSSING_GHOST_GAP_SAFETY_FACTOR_HARD = 0.85;
  * loosest, easiest safety factor above, which demands the most
  * intermediate platforms to tile a leg span):
  * `ceil(CROSSING_TARGET_HOPS_PER_CROSSING / CROSSING_GHOST_GAP_SAFETY_FACTOR_EASY) - 1`
- * = `ceil(6 / 0.6) - 1` = 9. Kept at 10 for a point of slack — this must
- * never be the binding constraint on how many ghosts a chain spawns (see
- * `maybeSpawnGhostChain`'s clamp), or the guarantee "the crossing is always
- * possible on an empty road" would silently break.
+ * = `ceil(4 / 0.6) - 1` = 6 (was 9 back when CROSSING_TARGET_HOPS_PER_CROSSING
+ * was 6). Kept at 10, now even more slack than the worst case needs — this
+ * must never be the binding constraint on how many ghosts a chain spawns
+ * (see `maybeSpawnGhostChain`'s clamp), or the guarantee "the crossing is
+ * always possible on an empty road" would silently break.
  */
 export const CROSSING_GHOST_POOL_SIZE = 10;
 export const CROSSING_GHOST_WIDTH_FRACTION = 0.1;

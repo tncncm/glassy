@@ -38,6 +38,16 @@ import {
   CROSSING_AIM_CANCEL_RING_ALPHA,
   CROSSING_AIM_CANCEL_RING_COLOR,
   CROSSING_AIM_CANCEL_RING_THICKNESS,
+  CROSSING_AIM_CANCEL_ZONE_ALPHA,
+  CROSSING_AIM_CANCEL_ZONE_ARMED_ALPHA,
+  CROSSING_AIM_CANCEL_ZONE_ARMED_COLOR,
+  CROSSING_AIM_CANCEL_ZONE_ARMED_LABEL_TEXT,
+  CROSSING_AIM_CANCEL_ZONE_COLOR,
+  CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX,
+  CROSSING_AIM_CANCEL_ZONE_LABEL_COLOR,
+  CROSSING_AIM_CANCEL_ZONE_LABEL_OUTLINE_COLOR,
+  CROSSING_AIM_CANCEL_ZONE_LABEL_SIZE,
+  CROSSING_AIM_CANCEL_ZONE_LABEL_TEXT,
   CROSSING_BLOCK_CENTER_Y_FRACTION,
   CROSSING_BLOCK_CENTER_Y_MAX_FRACTION,
   CROSSING_BLOCK_CENTER_Y_MIN_FRACTION,
@@ -190,6 +200,16 @@ export class CrossingSystem {
   private readonly cancelRing: Graphics;
   private cancelRingDrawn = false;
 
+  // --- Second cancel affordance: a labelled banner fixed at the screen's
+  // top edge, shown only while aiming — see CROSSING_AIM_CANCEL_ZONE_* in
+  // config.ts for why this lives at a screen-fixed edge rather than
+  // world-anchored like the ring above. HUD-layer (never shaken/hitstopped),
+  // drawn once in flat white and recolored via `.tint` between its idle and
+  // armed states, same trick buildCrossingFlag() already uses. ---
+  private readonly cancelZoneBg = new Graphics();
+  private readonly cancelZoneLabel: Text;
+  private cancelZoneLastWidth = -1;
+
   // --- Anchor-block pennant glyphs — see CROSSING_FLAG_* in config.ts.
   // Shape-coded (not just color-coded) start/goal markers, floating above
   // each block; repositioned every frame, recolored (tint) only on retint. ---
@@ -286,6 +306,26 @@ export class CrossingSystem {
     this.pausedLabel.y = CROSSING_TIMER_PAUSED_LABEL_Y_PX;
     this.pausedLabel.visible = false;
     hudContainer.addChild(this.pausedLabel);
+
+    // Cancel zone banner — drawn once in flat white (`.tint` recolors it
+    // idle/armed, see showCancelZone()); geometry is a plain full-width rect
+    // rebuilt only when canvasWidth actually changes, same pattern the timer
+    // bar above already uses.
+    this.cancelZoneBg.visible = false;
+    hudContainer.addChild(this.cancelZoneBg);
+    this.cancelZoneLabel = new Text({
+      text: CROSSING_AIM_CANCEL_ZONE_LABEL_TEXT,
+      style: {
+        fontSize: CROSSING_AIM_CANCEL_ZONE_LABEL_SIZE,
+        fill: CROSSING_AIM_CANCEL_ZONE_LABEL_COLOR,
+        fontFamily: 'sans-serif',
+        fontWeight: 'bold',
+        stroke: { color: CROSSING_AIM_CANCEL_ZONE_LABEL_OUTLINE_COLOR, width: 2 },
+      },
+    });
+    this.cancelZoneLabel.anchor.set(0.5, 0.5);
+    this.cancelZoneLabel.visible = false;
+    hudContainer.addChild(this.cancelZoneLabel);
   }
 
   /** Every landing candidate — both anchor blocks plus every active real and
@@ -419,14 +459,18 @@ export class CrossingSystem {
       const roofWidth = Math.max(track.surfaceRight - track.surfaceLeft, track.width * 0.2);
       const roofCenterX = (track.surfaceLeft + track.surfaceRight) / 2;
 
+      // The actual top silhouette — bonnet, windscreen, roof — not just a
+      // flat top edge; see Platform's file doc and types.ts's
+      // TrackedObject.surfaceProfile. Platform copies this synchronously and
+      // never retains it, matching the reused-array contract.
       const existing = this.findRealByTrackId(track.id);
       if (existing) {
-        existing.retarget(roofCenterX, roofCenterY, roofWidth, roofHeight);
+        existing.retarget(roofCenterX, roofCenterY, roofWidth, roofHeight, track.surfaceProfile);
         continue;
       }
       const fresh = this.realPool.pop();
       if (!fresh) continue; // pool exhausted — extra tracks simply wait for a slot
-      fresh.activate(track.id, roofCenterX, roofCenterY, roofWidth, roofHeight);
+      fresh.activate(track.id, roofCenterX, roofCenterY, roofWidth, roofHeight, track.surfaceProfile);
       // Real platforms keep Platform's DEFAULT palette (cyan) — no
       // setPalette call — so they read as "the same kind of thing" as
       // whatever else is cyan-coded (the trajectory preview's landing zone).
@@ -546,19 +590,22 @@ export class CrossingSystem {
       let y = originY - yUp;
 
       // Stop the preview the instant the ballistic arc would cross a
-      // landing candidate's top edge within its horizontal span — dots must
-      // show WHERE the jump actually lands, not the free-flight parabola
-      // continuing on through a platform that would already have caught it.
-      // Linearly interpolate between this sample and the previous one for a
-      // landing marker that reads as "here", not "somewhere in this step".
+      // landing candidate's ACTUAL surface height AT THIS X (the profile,
+      // not a flat top — see Platform.surfaceYAt's doc) within its
+      // horizontal span — dots must show WHERE the jump actually lands, not
+      // the free-flight parabola continuing on through a platform that would
+      // already have caught it. Linearly interpolate between this sample and
+      // the previous one for a landing marker that reads as "here", not
+      // "somewhere in this step".
       for (let p = 0; p < this.candidates.length; p++) {
         const platform = this.candidates[p]!;
         if (x < platform.left || x > platform.right) continue;
-        if (prevY <= platform.top && y >= platform.top) {
-          const frac = y > prevY ? (platform.top - prevY) / (y - prevY) : 1;
+        const surfaceAtX = platform.surfaceYAt(x);
+        if (prevY <= surfaceAtX && y >= surfaceAtX) {
+          const frac = y > prevY ? (surfaceAtX - prevY) / (y - prevY) : 1;
           const landingT = prevT + (t - prevT) * frac;
           x = originX + vx * landingT;
-          y = platform.top;
+          y = surfaceAtX;
           stopped = true;
           break;
         }
@@ -579,6 +626,8 @@ export class CrossingSystem {
   hideTrajectoryPreview(): void {
     for (let i = 0; i < this.previewDots.length; i++) this.previewDots[i]!.visible = false;
     this.cancelRing.visible = false;
+    this.cancelZoneBg.visible = false;
+    this.cancelZoneLabel.visible = false;
   }
 
   /**
@@ -605,6 +654,37 @@ export class CrossingSystem {
     // Solid when releasing would cancel; ghosted while it is merely available.
     this.cancelRing.alpha = armed ? 1 : CROSSING_AIM_CANCEL_RING_ALPHA;
     this.cancelRing.scale.set(armed ? 1.12 : 1);
+  }
+
+  /**
+   * The SECOND cancel affordance — see CROSSING_AIM_CANCEL_ZONE_* in
+   * config.ts and InputSystem's class doc for the full gesture this backs. A
+   * labelled banner spanning the top edge of the canvas, shown only while
+   * aiming; `armed` is InputSystem's own top-edge-proximity check against
+   * the REAL pointer position (not anything derived here), so the highlight
+   * is exact, not a re-derivation. Geometry (a plain full-width rect) is
+   * rebuilt only when canvasWidth actually changes — same "redraw on
+   * dimension change, restyle via `.tint`/`.alpha` every frame" pattern the
+   * timer bar above already uses.
+   */
+  showCancelZone(canvasWidth: number, armed: boolean): void {
+    if (Math.abs(canvasWidth - this.cancelZoneLastWidth) > 0.5) {
+      this.cancelZoneLastWidth = canvasWidth;
+      this.cancelZoneBg.clear().rect(0, 0, canvasWidth, CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX).fill({ color: 0xffffff });
+      this.cancelZoneLabel.x = canvasWidth / 2;
+      // Bottom-anchored within the band, not vertically centered — the
+      // timer bar + the "WAITING FOR A LANDING SPOT" paused label both live
+      // in the first ~32px from the top (see their own Y constants), and
+      // aiming while the timer is paused is a completely ordinary thing to
+      // do, so both CAN be on screen at once. Sitting low in the band keeps
+      // this legible instead of overlapping them.
+      this.cancelZoneLabel.y = CROSSING_AIM_CANCEL_ZONE_HEIGHT_PX - 18;
+    }
+    this.cancelZoneBg.visible = true;
+    this.cancelZoneLabel.visible = true;
+    this.cancelZoneBg.tint = armed ? CROSSING_AIM_CANCEL_ZONE_ARMED_COLOR : CROSSING_AIM_CANCEL_ZONE_COLOR;
+    this.cancelZoneBg.alpha = armed ? CROSSING_AIM_CANCEL_ZONE_ARMED_ALPHA : CROSSING_AIM_CANCEL_ZONE_ALPHA;
+    this.cancelZoneLabel.text = armed ? CROSSING_AIM_CANCEL_ZONE_ARMED_LABEL_TEXT : CROSSING_AIM_CANCEL_ZONE_LABEL_TEXT;
   }
 
   /**

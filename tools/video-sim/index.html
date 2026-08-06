@@ -144,19 +144,50 @@
           ctx.strokeRect(x, y, w, hh);
           ctx.setLineDash([]);
 
-          // The REFINED roof line (RoofFinder), drawn distinctly from the
-          // raw box top: bright yellow, only across surfaceLeft..surfaceRight
-          // rather than the box's full width, so a landing surface that is
-          // narrower than the box is visibly narrower on screen too.
+          // The REFINED flat surface (SurfaceProfileFinder's single-row
+          // result), drawn distinctly from the raw box top: dim yellow,
+          // only across surfaceLeft..surfaceRight rather than the box's
+          // full width, so a landing surface that is narrower than the box
+          // is visibly narrower on screen too. Kept for comparison against
+          // the polyline below — this is the flat slab the profile replaces.
           const sx = o.surfaceLeft * overlay.width;
           const sw = (o.surfaceRight - o.surfaceLeft) * overlay.width;
           const sy = o.surfaceY * overlay.height;
-          ctx.strokeStyle = o.stable ? '#ffe234' : 'rgba(255,226,52,0.5)';
-          ctx.lineWidth = o.stable ? 3 : 1.5;
+          ctx.strokeStyle = o.stable ? 'rgba(255,226,52,0.55)' : 'rgba(255,226,52,0.3)';
+          ctx.lineWidth = o.stable ? 1.5 : 1;
+          ctx.setLineDash([3, 3]);
           ctx.beginPath();
           ctx.moveTo(sx, sy);
           ctx.lineTo(sx + sw, sy);
           ctx.stroke();
+          ctx.setLineDash([]);
+
+          // The actual traced silhouette — surfaceProfile drawn as a
+          // polyline across the same surfaceLeft..surfaceRight span. THIS
+          // is what should trace the bonnet/windscreen/roof shape instead
+          // of sitting flat like the dashed line above.
+          if (o.surfaceProfile && o.surfaceProfile.length > 1) {
+            const n = o.surfaceProfile.length;
+            ctx.strokeStyle = o.stable ? '#ff8a3d' : 'rgba(255,138,61,0.5)';
+            ctx.lineWidth = o.stable ? 2.5 : 1.5;
+            ctx.beginPath();
+            for (let p = 0; p < n; p++) {
+              const px = sx + (sw * p) / (n - 1);
+              const py = o.surfaceProfile[p] * overlay.height;
+              if (p === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+            }
+            ctx.stroke();
+            // Small dots at each sample so individual columns are visible
+            // at full zoom, not just the smoothed line through them.
+            if (o.stable) {
+              ctx.fillStyle = '#ff8a3d';
+              for (let p = 0; p < n; p++) {
+                const px = sx + (sw * p) / (n - 1);
+                const py = o.surfaceProfile[p] * overlay.height;
+                ctx.fillRect(px - 1, py - 1, 2, 2);
+              }
+            }
+          }
 
           if (o.stable) {
             ctx.fillStyle = '#39ff88';
@@ -198,13 +229,19 @@
         sampleHz: 4,
         onStateChange: (s) => log.detectorStates.push({ t: video.currentTime, ...s }),
         onTrackedObjects: (objs) => {
-          tracked = objs.map((o) => ({ ...o }));
+          // `{ ...o }` only shallow-copies own properties — a Float32Array
+          // field would still be the SAME pooled array the caller keeps
+          // mutating next tick. Draw happens later (next rAF), so without an
+          // explicit copy the polyline would race the pool and occasionally
+          // paint a half-updated frame's data. Copy it out explicitly.
+          tracked = objs.map((o) => ({ ...o, surfaceProfile: Float32Array.from(o.surfaceProfile) }));
           for (const o of tracked) {
             log.tracked.push({ t: +video.currentTime.toFixed(2), id: o.id, kind: o.kind,
               x: +o.x.toFixed(3), y: +o.y.toFixed(3), w: +o.width.toFixed(3),
               h: +o.height.toFixed(3), stable: o.stable,
               surfaceY: +o.surfaceY.toFixed(3), surfaceLeft: +o.surfaceLeft.toFixed(3),
-              surfaceRight: +o.surfaceRight.toFixed(3) });
+              surfaceRight: +o.surfaceRight.toFixed(3),
+              profile: Array.from(o.surfaceProfile).map((v) => +v.toFixed(4)) });
           }
         },
         // Diagnostic-only hook ObjectDetector reads via a local structural

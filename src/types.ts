@@ -210,6 +210,12 @@ export interface Detection {
  * jump. The tracker associates each detection with the object it belongs to,
  * smooths it, and keeps it alive briefly through missed frames.
  */
+/**
+ * How many columns the top-surface profile is sampled at, left to right.
+ * Fixed so the arrays can be pooled and never reallocated.
+ */
+export const SURFACE_PROFILE_SAMPLES = 24;
+
 export interface TrackedObject {
   /** Stable for the life of this object. Never reused. */
   id: number;
@@ -235,6 +241,21 @@ export interface TrackedObject {
   surfaceY: number;
   surfaceLeft: number;
   surfaceRight: number;
+  /**
+   * The vehicle's actual TOP PROFILE — bonnet, windscreen, roof — sampled at
+   * `SURFACE_PROFILE_SAMPLES` evenly spaced columns between `surfaceLeft` and
+   * `surfaceRight`. Each entry is a 0..1 fraction of frame height.
+   *
+   * A single `surfaceY` makes every vehicle a flat slab, which is why they
+   * read as rectangles rather than cars. This follows the silhouette, so a
+   * player can stand on the bonnet and walk up onto the roof.
+   *
+   * ALWAYS populated: filled with `surfaceY` when no better profile could be
+   * recovered, so consumers can index it unconditionally. The array is REUSED
+   * between ticks along with the object — read it synchronously, never retain
+   * it. Off-road-vehicle detections (person/sign) get a flat profile.
+   */
+  surfaceProfile: Float32Array;
   /** Seconds since it was first seen. */
   age: number;
   /**
