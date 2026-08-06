@@ -49,6 +49,13 @@ export interface Preferences {
    */
   getVisionEnabled(): boolean;
   setVisionEnabled(enabled: boolean): void;
+  /**
+   * Drifting dots that match the vehicle's motion, to reduce motion sickness.
+   * Defaults to TRUE: this is a comfort feature, and someone who needs it is
+   * unlikely to go hunting through settings before they feel unwell.
+   */
+  getMotionCues(): boolean;
+  setMotionCues(enabled: boolean): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -213,6 +220,21 @@ export interface TrackedObject {
   width: number;
   height: number;
   score: number;
+  /**
+   * The REFINED landing surface, all 0..1 fractions of the frame.
+   *
+   * The detector's bounding box is loose: it wraps the whole vehicle, mirrors
+   * and a little background, and its top edge wobbles. Landing on that reads
+   * as landing on an invisible rectangle floating near a car. These three
+   * describe the actual roof line found inside the box by a cheap edge scan,
+   * so the player lands ON the car.
+   *
+   * Falls back to the box's own top edge and sides when no refinement was
+   * possible, so consumers can always use these unconditionally.
+   */
+  surfaceY: number;
+  surfaceLeft: number;
+  surfaceRight: number;
   /** Seconds since it was first seen. */
   age: number;
   /**
@@ -269,6 +291,56 @@ export interface ObjectDetector {
   stop(): void;
   /** Stop and release the model entirely. */
   dispose(): void;
+}
+
+/* ------------------------------------------------------------------ */
+/* Device motion — src/motion/MotionSensor.ts                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The phone's own movement, which in a car is constant and unavoidable.
+ *
+ * Two uses, both important:
+ *  - STABILISATION. Nobody can hold a phone still while someone else drives.
+ *    That shake moves the whole camera frame, so every tracked box moves with
+ *    it, so every platform jitters. Rotation rate lets us subtract the part of
+ *    the motion that was the hand, not the world.
+ *  - COMFORT. Staring at a screen inside a moving vehicle causes motion
+ *    sickness. Drifting dots that match the vehicle's real motion — the idea
+ *    behind iOS's Vehicle Motion Cues — measurably help.
+ *
+ * PRIVACY: motion is read live and never stored or transmitted, exactly like
+ * camera frames.
+ */
+export interface MotionState {
+  /** True once permission is granted and events are arriving. */
+  available: boolean;
+  /** Rotation rate in deg/s. Phone shake shows up here. */
+  rotationAlpha: number;
+  rotationBeta: number;
+  rotationGamma: number;
+  /** Linear acceleration excluding gravity, m/s². Vehicle motion shows here. */
+  accelerationX: number;
+  accelerationY: number;
+  accelerationZ: number;
+}
+
+export interface MotionSensorOptions {
+  /** Low-pass smoothing rate (1/s). Raw sensor data is far too noisy to use. */
+  smoothingRate?: number;
+}
+
+export interface MotionSensor {
+  /**
+   * iOS requires DeviceMotionEvent.requestPermission() from a user gesture.
+   * Resolves false when unavailable or refused — never throws, and the game
+   * must work fine without it.
+   */
+  request(): Promise<boolean>;
+  start(): void;
+  stop(): void;
+  /** Cheap field read, safe every frame. Stable object, never allocates. */
+  readonly state: MotionState;
 }
 
 /* ------------------------------------------------------------------ */
@@ -355,6 +427,14 @@ export interface Game {
    */
   setHorizonHint(y: number | null, confidence: number): void;
   /**
+   * Latest device motion. Used to damp hand-shake out of platform positions
+   * and to drive the motion-comfort cues. Safe to call every frame; must not
+   * allocate. The game works normally when motion is unavailable.
+   */
+  setMotion(state: MotionState): void;
+  /** Whether to draw the motion-sickness comfort cues. */
+  setMotionCuesEnabled(enabled: boolean): void;
+  /**
    * Something real was spotted out the window. The game MAY turn this into a
    * themed spawn — a hazard, a collectible, a power-up — but it is free to
    * ignore it, and MUST keep every spawn inside the solvability envelope. The
@@ -414,6 +494,8 @@ export interface UIIntents {
   onPlayDemoVideo(): void;
   /** The user flipped the on-device object-detection opt-in. */
   onToggleVision(): void;
+  /** The user flipped the motion-comfort cues. */
+  onToggleMotionCues(): void;
 }
 
 export interface UIController {
@@ -436,6 +518,8 @@ export interface UIController {
    * download//status line while `loading` or after failure.
    */
   setDetectorState(state: DetectorState): void;
+  /** Reflect the motion-cues setting. */
+  setMotionCues(enabled: boolean): void;
   /**
    * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
    * the Fullscreen API does not exist and installing the PWA is the only way

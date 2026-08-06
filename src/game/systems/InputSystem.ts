@@ -20,7 +20,8 @@
  *     screen this way"). Drag distance maps to power, 0..1, saturating at
  *     CROSSING_AIM_MAX_DRAG_PX. `onCrossingAimChange` fires on every move so
  *     the caller can redraw the trajectory preview live.
- *   - If the pointer then drags back to WITHIN the deadzone of the press
+ *   - If the pointer then drags back to within CROSSING_AIM_CANCEL_RADIUS_PX
+ *     of the press
  *     point before release, the gesture UN-COMMITS back to walking — an
  *     "I changed my mind" escape hatch a fixed one-way commitment wouldn't
  *     allow, so second-guessing an aim never fires an accidental
@@ -51,7 +52,7 @@
  * destroy().
  */
 
-import { CROSSING_AIM_DEADZONE_PX, CROSSING_AIM_MAX_DRAG_PX, CROSSING_KEYBOARD_CHARGE_SECONDS } from '../config.ts';
+import { CROSSING_AIM_CANCEL_RADIUS_PX, CROSSING_AIM_DEADZONE_PX, CROSSING_AIM_MAX_DRAG_PX, CROSSING_KEYBOARD_CHARGE_SECONDS } from '../config.ts';
 import { clamp } from '../util/math.ts';
 
 export interface InputCallbacks {
@@ -186,7 +187,7 @@ export class InputSystem {
         this.walkDirection = 0;
         this.callbacks.onCrossingWalk(0);
       }
-    } else if (distance <= CROSSING_AIM_DEADZONE_PX) {
+    } else if (distance <= CROSSING_AIM_CANCEL_RADIUS_PX) {
       // Un-commit: the pointer dragged back near the press point before
       // release — resume walking instead of leaving a near-zero-power aim
       // as the only option (see class doc).

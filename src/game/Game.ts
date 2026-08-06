@@ -18,8 +18,10 @@
  */
 
 import { Application, Container, Text } from 'pixi.js';
-import type { CreateGame, Game, GameOptions, GameOverResult, GameStatus, TrackedObject } from '../types.ts';
+import type { CreateGame, Game, GameOptions, GameOverResult, GameStatus, MotionState, TrackedObject } from '../types.ts';
 import {
+  CROSSING_AIM_CANCEL_RADIUS_PX,
+  CROSSING_AIM_MAX_DRAG_PX,
   COLLISION_SHAKE_TRAUMA,
   CROSSING_DIFFICULTY_RAMP_CROSSINGS,
   CROSSING_EDGE_MARGIN_PX,
@@ -28,6 +30,7 @@ import {
   CROSSING_GOAL_SHAKE_TRAUMA,
   CROSSING_GOAL_SPARKLE_COLOR,
   CROSSING_HITSTOP_SECONDS,
+  CROSSING_HOP_REACTION_SECONDS,
   CROSSING_LANDING_ASSIST_HORIZONTAL_PX_EASY,
   CROSSING_LANDING_ASSIST_HORIZONTAL_PX_HARD,
   CROSSING_LANDING_ASSIST_VERTICAL_PX_EASY,
@@ -35,21 +38,28 @@ import {
   CROSSING_LANDING_SHAKE_TRAUMA_MAX,
   CROSSING_LANDING_SHAKE_TRAUMA_PER_PXPS,
   CROSSING_MIN_JUMP_VERTICAL_FRACTION,
-  CROSSING_NO_GHOST_CROSSING_BONUS,
   CROSSING_PERFECT_LANDING_BONUS,
   CROSSING_PERFECT_LANDING_COMBO_MAX_MULTIPLIER,
   CROSSING_PERFECT_LANDING_COMBO_STEP,
   CROSSING_PERFECT_LANDING_SHAKE_TRAUMA,
   CROSSING_PERFECT_LANDING_SPARKLE_COLOR,
-  CROSSING_PERFECT_LANDING_WIDTH_FRACTION,
+  CROSSING_PERFECT_LANDING_WIDTH_FRACTION_EASY,
+  CROSSING_PERFECT_LANDING_WIDTH_FRACTION_HARD,
   CROSSING_PREVIEW_DURATION_MARGIN,
   CROSSING_SCORE_BONUS_PER_CROSSING,
   CROSSING_SCORE_PER_PIXEL_PROGRESS,
   CROSSING_SCORE_PER_SECOND,
+  CROSSING_TARGET_HOPS_PER_CROSSING,
+  CROSSING_TIMER_FLOOR_GENEROSITY,
+  CROSSING_TIMER_SHRINK_PER_CROSSING_SECONDS,
+  CROSSING_TIMER_START_GENEROSITY,
   CROSSING_WALK_SPEED,
   DEBUG_TEXT_COLOR,
   DEBUG_TEXT_SIZE,
   DEBUG_TEXT_UPDATE_INTERVAL_SECONDS,
+  GYRO_STABILIZATION_GAIN_PX_PER_DEG,
+  GYRO_STABILIZATION_LEAK_RATE,
+  GYRO_STABILIZATION_MAX_OFFSET_PX,
   PLAYER_HEIGHT,
   SHAKE_DECAY_RATE,
   SHAKE_MAGNITUDE_PX,
@@ -59,9 +69,30 @@ import type { Platform } from './entities/Platform.ts';
 import { GameLoop } from './GameLoop.ts';
 import { CrossingSystem } from './systems/CrossingSystem.ts';
 import { InputSystem } from './systems/InputSystem.ts';
+import { MotionCueSystem } from './systems/MotionCueSystem.ts';
 import { ParticleSystem } from './systems/ParticleSystem.ts';
 import { clamp, lerp } from './util/math.ts';
-import { crossingFullPowerFlightTimeSeconds, crossingMaxJumpSpeed } from './util/solvability.ts';
+import { crossingFullPowerFlightTimeSeconds, crossingMaxHorizontalReach, crossingMaxJumpSpeed } from './util/solvability.ts';
+
+/**
+ * Per-leg countdown budget (seconds), escalating with crossings completed —
+ * derived from the same hop-count/flight-time kinematics util/solvability.ts
+ * already provides (CROSSING_TARGET_HOPS_PER_CROSSING full-power hops, each
+ * budgeted its own flight time plus a reaction-time margin), not a guessed
+ * seconds value. See CROSSING_TIMER_* in config.ts for the generosity/floor
+ * multipliers. THE CLOCK ITSELF only ever ticks down while
+ * `isProgressReachable()` is true (see that function) — this is just the
+ * BUDGET each leg starts with, escalating leg over leg exactly like every
+ * other difficulty dial in this file.
+ */
+function crossingLegTimeSeconds(canvasWidth: number, crossingsCompleted: number): number {
+  const perHopSeconds = crossingFullPowerFlightTimeSeconds(canvasWidth) + CROSSING_HOP_REACTION_SECONDS;
+  const baseBudget = CROSSING_TARGET_HOPS_PER_CROSSING * perHopSeconds;
+  const firstLegBudget = baseBudget * CROSSING_TIMER_START_GENEROSITY;
+  const floorBudget = baseBudget * CROSSING_TIMER_FLOOR_GENEROSITY;
+  const shrunkBudget = firstLegBudget - CROSSING_TIMER_SHRINK_PER_CROSSING_SECONDS * crossingsCompleted;
+  return Math.max(floorBudget, shrunkBudget);
+}
 
 /**
  * Scratch object reused by computeCrossingJumpVelocity, below — never
@@ -154,6 +185,13 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   const particles = new ParticleSystem(particleLayer);
   const crossing = new CrossingSystem(crossingLayer, hudLayer);
 
+  // Motion-comfort cues: peripheral dots, deliberately a SIBLING on top of
+  // everything else (including the HUD) — they must stay visible and never
+  // get caught in screen shake (worldContainer's transform) or hitstop, since
+  // they represent the vehicle's real motion, not the game's. See
+  // MotionCueSystem's doc and Game.setMotion/setMotionCuesEnabled below.
+  const motionCues = new MotionCueSystem(app.stage);
+
   let debugText: Text | null = null;
   if (debug === true) {
     debugText = new Text({
@@ -200,10 +238,68 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   let crossingLastPlayerX = 0;
 
   /** Consecutive PERFECT landings (see CROSSING_PERFECT_LANDING_WIDTH_
-   * FRACTION) — broken by any non-perfect landing, persists across
+   * FRACTION_EASY/HARD) — broken by any non-perfect landing, persists across
    * completed crossings within a single run. Scales the perfect-landing
    * score bonus and drives the visible combo counter in the HUD. */
   let comboCount = 0;
+
+  /** Per-leg countdown — see crossingLegTimeSeconds()'s doc and
+   * isProgressReachable() below for the fairness rule that governs when it
+   * actually ticks. */
+  let legTimeBudget = 0;
+  let legTimeRemaining = 0;
+  /** True whenever `isProgressReachable()` was false as of the last frame —
+   * read by CrossingSystem.updateHud to draw the "waiting" state. Recomputed
+   * every running frame, never guessed. */
+  let timerPaused = false;
+
+  /** Latest device motion — a STABLE, externally-owned object the caller
+   * (App, wiring MotionSensor.state) is expected to pass in every frame; see
+   * Game.setMotion's doc in types.ts. `null` until the first call, and
+   * whenever motion is genuinely unavailable this stays whatever was last
+   * received with `available: false`, which every reader below already
+   * treats as "no signal". Retaining the reference (not copying fields) is
+   * intentional and allocation-free — see setMotion() on the returned `game`
+   * object. */
+  let motionState: MotionState | null = null;
+
+  /** Gyro-stabilisation's leaky-integrator state (see GYRO_STABILIZATION_* in
+   * config.ts) — a single hand-rolled high-pass filter on rotation rate,
+   * recomputed every running frame and applied only to REAL tracked
+   * platforms via CrossingSystem.update()'s gyroOffset params. */
+  let gyroOffsetX = 0;
+  let gyroOffsetY = 0;
+
+  /**
+   * SAFETY + FAIRNESS: the per-leg clock only ever ticks while at least one
+   * landing candidate OTHER than the platform currently stood on is within
+   * this frame's full-power jump envelope — i.e. progress is genuinely
+   * possible right now. Ghost platforms guarantee something eventually
+   * enters range (see CrossingSystem.maybeSpawnGhostChain), so a paused
+   * clock resuming is always the player's own cue "you can move now",
+   * exactly matching the brief: an empty road pauses the clock rather than
+   * failing the player for it, and a busy one is never advantaged over an
+   * empty one because REAL and GHOST candidates are checked identically
+   * here — this function does not know or care which kind a candidate is.
+   * Uses the same closed-form jump-reach derivation
+   * (`crossingMaxHorizontalReach`) the ghost-chain solvability guarantee
+   * itself is built from, not a guessed distance.
+   */
+  function isProgressReachable(): boolean {
+    const originX = player.x;
+    const originY = player.groundContactY;
+    const candidates = crossing.platforms;
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i]!;
+      if (candidate === currentCrossingPlatform) continue;
+      let horizontalDistance = 0;
+      if (originX < candidate.left) horizontalDistance = candidate.left - originX;
+      else if (originX > candidate.right) horizontalDistance = originX - candidate.right;
+      const dropPx = candidate.top - originY;
+      if (horizontalDistance <= crossingMaxHorizontalReach(canvasWidth, dropPx)) return true;
+    }
+    return false;
+  }
 
   function applyLayout(width: number, height: number): void {
     canvasWidth = width;
@@ -214,6 +310,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     // stale pixel rect from before the resize/orientation-change until the
     // next running update() call ticks them forward.
     crossing.update(0, width, height, currentCrossingPlatform);
+    motionCues.resize(width, height);
     if (status !== 'running') {
       app.render();
     }
@@ -270,6 +367,23 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     }
 
     inputSystem.updateCrossingAim();
+    motionCues.update(dt, motionState);
+
+    // Gyro stabilisation: a single hand-rolled first-order high-pass
+    // (leaky-integrator) filter on rotation rate — `offset' = rate*GAIN -
+    // offset*LEAK`. Fast, sign-reversing hand tremor survives the leak and
+    // produces a real corrective nudge; a slow, sustained rotation (a
+    // genuine vehicle turn) drains out of the SAME leak roughly as fast as
+    // it accumulates, so it can only ever reach a small, hard-clamped
+    // steady-state term — never one that grows to fight real motion. See
+    // GYRO_STABILIZATION_* in config.ts for the measured bound. Always
+    // computed (decaying toward 0 when motion is unavailable), applied only
+    // to REAL tracked platforms inside crossing.update() below.
+    const rotationAlpha = motionState !== null && motionState.available ? motionState.rotationAlpha : 0;
+    const rotationBeta = motionState !== null && motionState.available ? motionState.rotationBeta : 0;
+    const gyroLeak = Math.exp(-GYRO_STABILIZATION_LEAK_RATE * dt);
+    gyroOffsetX = clamp((gyroOffsetX + rotationAlpha * GYRO_STABILIZATION_GAIN_PX_PER_DEG * dt) * gyroLeak, -GYRO_STABILIZATION_MAX_OFFSET_PX, GYRO_STABILIZATION_MAX_OFFSET_PX);
+    gyroOffsetY = clamp((gyroOffsetY + rotationBeta * GYRO_STABILIZATION_GAIN_PX_PER_DEG * dt) * gyroLeak, -GYRO_STABILIZATION_MAX_OFFSET_PX, GYRO_STABILIZATION_MAX_OFFSET_PX);
 
     // Positions (blocks/real-track glide/ghost drift/ghost-chain fallback,
     // and the live horizon-driven road height) are settled BEFORE resolution
@@ -278,7 +392,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     // last frame's resolved surface, which is exactly the "occupied as of
     // now" moment the never-vanish-underfoot freeze (and the horizon hint's
     // own "never move the blocks mid-jump" rule) need.
-    crossing.update(dt, canvasWidth, canvasHeight, currentCrossingPlatform);
+    crossing.update(dt, canvasWidth, canvasHeight, currentCrossingPlatform, gyroOffsetX, gyroOffsetY);
 
     const difficultyT = clamp(crossing.crossingsCompleted / CROSSING_DIFFICULTY_RAMP_CROSSINGS, 0, 1);
     const assistVerticalPx = lerp(CROSSING_LANDING_ASSIST_VERTICAL_PX_EASY, CROSSING_LANDING_ASSIST_VERTICAL_PX_HARD, difficultyT);
@@ -348,10 +462,16 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
 
       let isPerfect = false;
       if (selectedPlatform !== null) {
-        crossing.noteLanded(selectedPlatform);
+        // PERFECT precision escalates on the SAME difficultyT curve as the
+        // landing-assist box and the ghost gap safety factor — see
+        // CROSSING_PERFECT_LANDING_WIDTH_FRACTION_EASY/HARD's doc in
+        // config.ts. Deliberately does not care whether `selectedPlatform`
+        // is real or ghost — see the safety audit on
+        // CROSSING_PERFECT_LANDING_COMBO_MAX_MULTIPLIER in config.ts.
+        const perfectWidthFraction = lerp(CROSSING_PERFECT_LANDING_WIDTH_FRACTION_EASY, CROSSING_PERFECT_LANDING_WIDTH_FRACTION_HARD, difficultyT);
         const platformWidthPx = selectedPlatform.right - selectedPlatform.left;
         const centerX = (selectedPlatform.left + selectedPlatform.right) / 2;
-        isPerfect = Math.abs(player.x - centerX) <= platformWidthPx * CROSSING_PERFECT_LANDING_WIDTH_FRACTION;
+        isPerfect = Math.abs(player.x - centerX) <= platformWidthPx * perfectWidthFraction;
       }
 
       if (isPerfect) {
@@ -373,6 +493,19 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       handleCrossingWin();
       app.render();
       return;
+    }
+
+    // --- Timer: the clock only runs while progress is genuinely reachable
+    // (see isProgressReachable's doc above) — punishes dithering, never the
+    // road. A paused clock is a real, visible state (CrossingSystem draws it
+    // distinctly), not a silent freeze, so it never reads as a bug. ---
+    timerPaused = !isProgressReachable();
+    if (!timerPaused) {
+      legTimeRemaining = Math.max(0, legTimeRemaining - dt);
+      if (legTimeRemaining <= 0) {
+        handleCollision();
+        return;
+      }
     }
 
     // --- Lose #1: fell below the visible frame. ---
@@ -397,11 +530,6 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       player.setEdgeWarningIntensity(0);
     }
 
-    // NO COUNTDOWN, deliberately. A per-leg timer was tried and cut: it
-    // punished the player for the one thing they cannot control — how much
-    // real traffic happens to be on the road. On an empty stretch you were
-    // racing a clock with nothing to land on. Falling is the only failure.
-
     // --- Score: survival + any horizontal movement (walking OR being
     // carried both count — this is a "keep moving" incentive, not a
     // direction-specific one). ---
@@ -423,7 +551,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       worldContainer.y = 0;
     }
 
-    crossing.updateHud(canvasWidth, comboCount);
+    crossing.updateHud(dt, canvasWidth, comboCount, legTimeBudget > 0 ? legTimeRemaining / legTimeBudget : 0, timerPaused);
 
     if (debugText !== null) {
       debugAccumulator += dt;
@@ -440,20 +568,27 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     app.render();
   }
 
-  /** Reaching the goal block: score it (plus a no-ghost bonus if the whole
-   * leg was crossed on real tracks alone), celebrate with a heavier
-   * particle/sound/shake beat than an ordinary landing, swap which block is
-   * start vs. goal, re-anchor the player standing exactly on the block they
-   * just reached so the return leg begins cleanly, and roll the next leg's
-   * (harder) timer budget. Endless — never ends the run. */
+  /**
+   * Reaching the goal block: score it — identically whether the leg was
+   * crossed on real tracks, ghost platforms, or a mix; see the safety audit
+   * on CROSSING_PERFECT_LANDING_COMBO_MAX_MULTIPLIER in config.ts for why
+   * there is deliberately no bonus keyed on "avoided the ghosts" — celebrate
+   * with a heavier particle/sound/shake beat than an ordinary landing, swap
+   * which block is start vs. goal, re-anchor the player standing exactly on
+   * the block they just reached so the return leg begins cleanly, and roll
+   * the next leg's (harder, both in timer budget and in leg span) numbers.
+   * Endless — never ends the run.
+   */
   function handleCrossingWin(): void {
-    const noGhostBonus = !crossing.hasTouchedGhostThisLeg;
     crossing.completeCrossing();
+    // completeCrossing() just changed `crossings`, which also moves the
+    // spatial-difficulty leg span (see CrossingSystem.leftBlockXFraction's
+    // doc) — settle block positions against that NEW span (dt=0, no timers
+    // advance) before reading `crossing.startBlock` below, or this would
+    // read the stale pre-win position for one frame.
+    crossing.update(0, canvasWidth, canvasHeight, null);
 
     scoreAccumulator += CROSSING_SCORE_BONUS_PER_CROSSING;
-    if (noGhostBonus) {
-      scoreAccumulator += CROSSING_NO_GHOST_CROSSING_BONUS;
-    }
     particles.spawnRing(player.x, player.groundContactY);
     particles.spawnSparkle(player.x, player.groundContactY, CROSSING_GOAL_SPARKLE_COLOR);
     shakeTrauma = Math.min(1, shakeTrauma + CROSSING_GOAL_SHAKE_TRAUMA);
@@ -472,6 +607,9 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     crossingEdgeWarningTimer = 0;
     crossingLastPlayerX = newStartCenterX;
 
+    legTimeBudget = crossingLegTimeSeconds(canvasWidth, crossing.crossingsCompleted);
+    legTimeRemaining = legTimeBudget;
+    timerPaused = false;
 
     const newScoreInt = Math.floor(scoreAccumulator);
     if (newScoreInt !== scoreInt) {
@@ -501,9 +639,14 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     shakeTrauma = 0;
     hitStopTimer = 0;
     comboCount = 0;
+    gyroOffsetX = 0;
+    gyroOffsetY = 0;
+    legTimeBudget = crossingLegTimeSeconds(canvasWidth, 0);
+    legTimeRemaining = legTimeBudget;
+    timerPaused = false;
     worldContainer.x = 0;
     worldContainer.y = 0;
-    crossing.updateHud(canvasWidth, 0);
+    crossing.updateHud(0, canvasWidth, 0, 1, false);
   }
 
   const loop = new GameLoop(update);
@@ -522,6 +665,15 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         const velocity = computeCrossingJumpVelocity(dirX, dirY, power, maxSpeed);
         const previewDuration = crossingFullPowerFlightTimeSeconds(canvasWidth) * CROSSING_PREVIEW_DURATION_MARGIN;
         crossing.showTrajectoryPreview(player.x, player.groundContactY, velocity.vx, velocity.vy, canvasWidth, canvasHeight, previewDuration);
+        // Cancel ring at the press point. `power` is the drag distance
+        // normalised to the max, so the cancel radius maps to a fixed slice
+        // of it — armed when releasing now would abort rather than jump.
+        const cancelPower = CROSSING_AIM_CANCEL_RADIUS_PX / CROSSING_AIM_MAX_DRAG_PX;
+        crossing.showCancelRing(
+          player.x - dirX * power * CROSSING_AIM_MAX_DRAG_PX,
+          player.groundContactY - dirY * power * CROSSING_AIM_MAX_DRAG_PX,
+          power <= cancelPower,
+        );
       },
       onCrossingJumpRelease(dirX: number, dirY: number, power: number): void {
         crossing.hideTrajectoryPreview();
@@ -586,6 +738,25 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       // doc for the gating (confidence floor, "never move the blocks under
       // the player mid-jump") this is repurposed for.
       crossing.setHorizonHint(y, confidence);
+    },
+
+    /**
+     * Latest device motion — retains the reference (never copies fields),
+     * which is safe and allocation-free because the caller's own MotionState
+     * is a stable, reused object (see types.ts's doc on MotionSensor.state).
+     * Drives the motion-comfort cues and the gyro-stabilisation leaky
+     * integrator, both read from `motionState` inside update(). Safe to call
+     * from any status — it only ever writes a variable.
+     */
+    setMotion(state: MotionState): void {
+      motionState = state;
+    },
+
+    /** Whether to draw the motion-sickness comfort cues — see
+     * MotionCueSystem.setEnabled, which itself defaults to true, so cues are
+     * already on even if this is never called. */
+    setMotionCuesEnabled(enabled: boolean): void {
+      motionCues.setEnabled(enabled);
     },
 
     /**

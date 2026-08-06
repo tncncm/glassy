@@ -34,6 +34,10 @@ import type { Container } from 'pixi.js';
 import { Graphics, Text } from 'pixi.js';
 import type { TrackedObject } from '../../types.ts';
 import {
+  CROSSING_AIM_CANCEL_RADIUS_PX,
+  CROSSING_AIM_CANCEL_RING_ALPHA,
+  CROSSING_AIM_CANCEL_RING_COLOR,
+  CROSSING_AIM_CANCEL_RING_THICKNESS,
   CROSSING_BLOCK_CENTER_Y_FRACTION,
   CROSSING_BLOCK_CENTER_Y_MAX_FRACTION,
   CROSSING_BLOCK_CENTER_Y_MIN_FRACTION,
@@ -47,6 +51,11 @@ import {
   CROSSING_COMBO_TEXT_OUTLINE_COLOR,
   CROSSING_COMBO_TEXT_SIZE,
   CROSSING_DIFFICULTY_RAMP_CROSSINGS,
+  CROSSING_FLAG_OUTLINE_COLOR,
+  CROSSING_FLAG_HEIGHT_PX,
+  CROSSING_FLAG_POLE_HEIGHT_PX,
+  CROSSING_FLAG_POLE_WIDTH_PX,
+  CROSSING_FLAG_WIDTH_PX,
   CROSSING_GHOST_DRIFT_RANGE_PX,
   CROSSING_GHOST_DRIFT_SPEED_RADIANS_PER_SECOND,
   CROSSING_GHOST_FILL,
@@ -59,12 +68,33 @@ import {
   CROSSING_GHOST_WIDTH_FRACTION,
   CROSSING_HORIZON_BIAS_RATE,
   CROSSING_HORIZON_MIN_CONFIDENCE,
-  CROSSING_LEFT_BLOCK_CENTER_X_FRACTION,
+  CROSSING_LEFT_BLOCK_CENTER_X_FRACTION_EASY,
+  CROSSING_LEFT_BLOCK_CENTER_X_FRACTION_HARD,
   CROSSING_PREVIEW_DOT_ALPHA,
   CROSSING_PREVIEW_DOT_COLOR,
   CROSSING_PREVIEW_DOT_COUNT,
   CROSSING_PREVIEW_DOT_RADIUS,
-  CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION,
+  CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION_EASY,
+  CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION_HARD,
+  CROSSING_TIMER_BAR_BG_ALPHA,
+  CROSSING_TIMER_BAR_BG_COLOR,
+  CROSSING_TIMER_BAR_COLOR_CRITICAL,
+  CROSSING_TIMER_BAR_COLOR_PAUSED,
+  CROSSING_TIMER_BAR_COLOR_SAFE,
+  CROSSING_TIMER_BAR_COLOR_WARN,
+  CROSSING_TIMER_BAR_CRITICAL_FRACTION,
+  CROSSING_TIMER_BAR_HEIGHT_PX,
+  CROSSING_TIMER_BAR_TOP_MARGIN_PX,
+  CROSSING_TIMER_BAR_WARN_FRACTION,
+  CROSSING_TIMER_BAR_WIDTH_FRACTION,
+  CROSSING_TIMER_PAUSED_ALPHA_MAX,
+  CROSSING_TIMER_PAUSED_ALPHA_MIN,
+  CROSSING_TIMER_PAUSED_LABEL_COLOR,
+  CROSSING_TIMER_PAUSED_LABEL_OUTLINE_COLOR,
+  CROSSING_TIMER_PAUSED_LABEL_SIZE,
+  CROSSING_TIMER_PAUSED_LABEL_TEXT,
+  CROSSING_TIMER_PAUSED_LABEL_Y_PX,
+  CROSSING_TIMER_PAUSED_PULSE_RATE,
   GRAVITY,
   PLATFORM_FADE_SECONDS,
   PLATFORM_FOLLOW_LERP_RATE,
@@ -81,6 +111,26 @@ import { crossingMaxHorizontalReach } from '../util/solvability.ts';
  * fields, never searched for by id) — set purely for readability/debugging. */
 const LEFT_BLOCK_TRACK_ID = -1;
 const RIGHT_BLOCK_TRACK_ID = -2;
+
+/**
+ * Builds one anchor-block pennant glyph (pole + triangular flag), drawn in
+ * flat white so `.tint` can recolor it to whichever palette its owning block
+ * currently holds (start=green, goal=gold — see retintBlocks()) without a
+ * redraw. Local origin is the flag's ground point; callers position it at
+ * the block's current top-center every frame.
+ */
+function buildCrossingFlag(): Graphics {
+  const poleTop = -CROSSING_FLAG_POLE_HEIGHT_PX;
+  return new Graphics()
+    .rect(-CROSSING_FLAG_POLE_WIDTH_PX / 2, poleTop, CROSSING_FLAG_POLE_WIDTH_PX, CROSSING_FLAG_POLE_HEIGHT_PX)
+    .fill({ color: 0xffffff })
+    .moveTo(CROSSING_FLAG_POLE_WIDTH_PX / 2, poleTop)
+    .lineTo(CROSSING_FLAG_POLE_WIDTH_PX / 2 + CROSSING_FLAG_WIDTH_PX, poleTop + CROSSING_FLAG_HEIGHT_PX / 2)
+    .lineTo(CROSSING_FLAG_POLE_WIDTH_PX / 2, poleTop + CROSSING_FLAG_HEIGHT_PX)
+    .closePath()
+    .fill({ color: 0xffffff })
+    .stroke({ width: 1, color: CROSSING_FLAG_OUTLINE_COLOR });
+}
 
 /** One fixed ghost-pool slot's bookkeeping, built once at construction
  * (allocation at construction time is fine — only per-update allocation is
@@ -119,10 +169,13 @@ export class CrossingSystem {
    * reset to 0 in onTrackedObjects. Drives the ghost-chain fallback. */
   private timeSinceStableTrack = 0;
   private ghostChainActive = false;
-  /** True once the player has stood on any ghost platform during the
-   * CURRENT leg — cleared on completeCrossing()/reset(). Game.ts reads this
-   * (via `hasTouchedGhostThisLeg`) to award the no-ghost crossing bonus. */
-  private ghostTouchedThisLeg = false;
+
+  // SAFETY AUDIT: there used to be a `ghostTouchedThisLeg` flag here, feeding
+  // a "no-ghost crossing" bonus. It has been deleted — see
+  // CROSSING_PERFECT_LANDING_COMBO_MAX_MULTIPLIER's neighboring doc in
+  // config.ts for why. Ghost platforms are ordinary, first-class landing
+  // surfaces from a scoring point of view; nothing in this class tracks
+  // whether a leg touched one.
 
   /** Live vertical center (0..1 fraction of canvas height) every anchor
    * block and freshly-spawned ghost platform is placed at — starts at the
@@ -134,13 +187,32 @@ export class CrossingSystem {
 
   // --- Trajectory preview — pooled dots, built once. ---
   private readonly previewDots: Graphics[] = [];
+  private readonly cancelRing: Graphics;
+  private cancelRingDrawn = false;
 
-  // --- HUD: per-leg countdown bar + combo counter, pre-built once. ---
+  // --- Anchor-block pennant glyphs — see CROSSING_FLAG_* in config.ts.
+  // Shape-coded (not just color-coded) start/goal markers, floating above
+  // each block; repositioned every frame, recolored (tint) only on retint. ---
+  private readonly startFlag: Graphics;
+  private readonly goalFlag: Graphics;
+
+  // --- HUD: per-leg countdown bar + combo counter, pre-built once. The bar
+  // fill is drawn ONCE at full width and animated purely via `.scale.x` +
+  // `.tint` every frame (never re-drawn) — see updateHud()'s doc for why a
+  // continuously-changing countdown must not redraw Graphics geometry every
+  // frame. ---
   private readonly timerBarBg = new Graphics();
   private readonly timerBarFill = new Graphics();
   private readonly comboText: Text;
+  private readonly pausedLabel: Text;
   private lastHudWidth = -1;
   private lastComboDisplayed = -1;
+  private timerBarX = 0;
+  private timerBarWidth = 0;
+  /** Advances only while the timer is paused — drives the "waiting" breathing
+   * pulse (see CROSSING_TIMER_PAUSED_* in config.ts) so the pause reads as a
+   * deliberate state, never a stall. */
+  private pausedPulsePhase = 0;
 
   /**
    * `worldContainer` holds everything that should shake along with the rest
@@ -151,6 +223,10 @@ export class CrossingSystem {
    */
   constructor(worldContainer: Container, hudContainer: Container) {
     worldContainer.addChild(this.leftBlock.view, this.rightBlock.view);
+
+    this.startFlag = buildCrossingFlag();
+    this.goalFlag = buildCrossingFlag();
+    worldContainer.addChild(this.startFlag, this.goalFlag);
 
     for (let i = 0; i < CROSSING_GHOST_POOL_SIZE; i++) {
       const platform = new Platform();
@@ -177,6 +253,10 @@ export class CrossingSystem {
       this.previewDots.push(dot);
     }
 
+    this.cancelRing = new Graphics();
+    this.cancelRing.visible = false;
+    worldContainer.addChild(this.cancelRing);
+
     hudContainer.addChild(this.timerBarBg, this.timerBarFill);
     this.comboText = new Text({
       text: '',
@@ -191,6 +271,21 @@ export class CrossingSystem {
     this.comboText.anchor.set(0.5, 0);
     this.comboText.visible = false;
     hudContainer.addChild(this.comboText);
+
+    this.pausedLabel = new Text({
+      text: CROSSING_TIMER_PAUSED_LABEL_TEXT,
+      style: {
+        fontSize: CROSSING_TIMER_PAUSED_LABEL_SIZE,
+        fill: CROSSING_TIMER_PAUSED_LABEL_COLOR,
+        fontFamily: 'sans-serif',
+        fontWeight: 'bold',
+        stroke: { color: CROSSING_TIMER_PAUSED_LABEL_OUTLINE_COLOR, width: 2 },
+      },
+    });
+    this.pausedLabel.anchor.set(0.5, 0);
+    this.pausedLabel.y = CROSSING_TIMER_PAUSED_LABEL_Y_PX;
+    this.pausedLabel.visible = false;
+    hudContainer.addChild(this.pausedLabel);
   }
 
   /** Every landing candidate — both anchor blocks plus every active real and
@@ -226,17 +321,28 @@ export class CrossingSystem {
     return this.legDirection;
   }
 
-  /** See `ghostTouchedThisLeg`'s field doc. */
-  get hasTouchedGhostThisLeg(): boolean {
-    return this.ghostTouchedThisLeg;
+  /** 0..1, how far through the spatial difficulty ramp the run is —
+   * `crossings / CROSSING_DIFFICULTY_RAMP_CROSSINGS`, clamped. The single
+   * curve every "escalate through space, never through traffic" dial in this
+   * class (leg span, ghost gap safety factor) rides — see config.ts's
+   * CROSSING_DIFFICULTY_RAMP_CROSSINGS doc. Game.ts computes the same curve
+   * independently off `crossingsCompleted` for its own dials (landing-assist
+   * box, PERFECT precision) so the whole escalation reads as one thing. */
+  private get difficultyT(): number {
+    return clamp(this.crossings / CROSSING_DIFFICULTY_RAMP_CROSSINGS, 0, 1);
   }
 
-  /** Game.ts calls this on every landing (not just perfect ones) so a leg
-   * crossed even partly via a ghost platform is correctly disqualified from
-   * the no-ghost bonus, however the leg ultimately ends. A no-op for a
-   * landing on a real track or an anchor block. */
-  noteLanded(platform: Platform): void {
-    if (this.isGhostPlatform(platform)) this.ghostTouchedThisLeg = true;
+  /** Live anchor-block X centers (0..1 fraction of canvas width) — see
+   * CROSSING_LEFT/RIGHT_BLOCK_CENTER_X_FRACTION_EASY/HARD's doc in
+   * config.ts: the leg literally gets longer as the player gets better,
+   * which is "difficulty through space" applied to the crossing's own
+   * geometry rather than its timing or its traffic. */
+  private get leftBlockXFraction(): number {
+    return lerp(CROSSING_LEFT_BLOCK_CENTER_X_FRACTION_EASY, CROSSING_LEFT_BLOCK_CENTER_X_FRACTION_HARD, this.difficultyT);
+  }
+
+  private get rightBlockXFraction(): number {
+    return lerp(CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION_EASY, CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION_HARD, this.difficultyT);
   }
 
   /**
@@ -282,12 +388,11 @@ export class CrossingSystem {
     this.crossings = 0;
     this.timeSinceStableTrack = 0;
     this.ghostChainActive = false;
-    this.ghostTouchedThisLeg = false;
     this.candidates.length = 0;
     this.hideTrajectoryPreview();
 
-    this.leftBlock.activate(LEFT_BLOCK_TRACK_ID, CROSSING_LEFT_BLOCK_CENTER_X_FRACTION, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
-    this.rightBlock.activate(RIGHT_BLOCK_TRACK_ID, CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
+    this.leftBlock.activate(LEFT_BLOCK_TRACK_ID, this.leftBlockXFraction, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
+    this.rightBlock.activate(RIGHT_BLOCK_TRACK_ID, this.rightBlockXFraction, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
     this.retintBlocks();
   }
 
@@ -299,14 +404,29 @@ export class CrossingSystem {
       if (!track.stable) continue;
       this.timeSinceStableTrack = 0;
 
+      // Use the REFINED roof, not the detector's loose box. `surfaceY` is the
+      // actual roof line found inside the box and `surfaceLeft/Right` its true
+      // width — the box wraps mirrors, arches and some background, so landing
+      // on its top edge reads as landing on an invisible rectangle hovering
+      // near a car instead of on the car. The body still extends down to the
+      // box's bottom so the platform visually covers the vehicle; only the
+      // landing surface moves. See RoofFinder.ts; these always have a
+      // box-edge fallback, so no null handling is needed here.
+      const surfaceTop = track.surfaceY;
+      const bodyBottom = track.y + track.height / 2;
+      const roofHeight = Math.max(bodyBottom - surfaceTop, track.height * 0.2);
+      const roofCenterY = surfaceTop + roofHeight / 2;
+      const roofWidth = Math.max(track.surfaceRight - track.surfaceLeft, track.width * 0.2);
+      const roofCenterX = (track.surfaceLeft + track.surfaceRight) / 2;
+
       const existing = this.findRealByTrackId(track.id);
       if (existing) {
-        existing.retarget(track.x, track.y, track.width, track.height);
+        existing.retarget(roofCenterX, roofCenterY, roofWidth, roofHeight);
         continue;
       }
       const fresh = this.realPool.pop();
       if (!fresh) continue; // pool exhausted — extra tracks simply wait for a slot
-      fresh.activate(track.id, track.x, track.y, track.width, track.height);
+      fresh.activate(track.id, roofCenterX, roofCenterY, roofWidth, roofHeight);
       // Real platforms keep Platform's DEFAULT palette (cyan) — no
       // setPalette call — so they read as "the same kind of thing" as
       // whatever else is cyan-coded (the trajectory preview's landing zone).
@@ -320,8 +440,15 @@ export class CrossingSystem {
    * (`null` if airborne/unresolved) — see the file doc for the hard
    * never-vanish-underfoot guarantee this drives, and `setHorizonHint`'s doc
    * for how it doubles as the "safe to nudge the road" signal.
+   *
+   * `gyroOffsetXPx`/`gyroOffsetYPx` (default 0) is this frame's
+   * gyro-stabilisation correction (see GYRO_STABILIZATION_* in config.ts and
+   * Game.ts's leaky-integrator derivation) — applied ONLY to REAL tracked
+   * platforms (`updateRealPlatforms`), never to ghosts (synthetic, nothing
+   * to correct) or the anchor blocks (already smoothed independently via the
+   * horizon hint).
    */
-  update(dt: number, canvasWidth: number, canvasHeight: number, occupiedPlatform: Platform | null): void {
+  update(dt: number, canvasWidth: number, canvasHeight: number, occupiedPlatform: Platform | null, gyroOffsetXPx = 0, gyroOffsetYPx = 0): void {
     // Horizon hint: only ever nudges the road while the player isn't
     // mid-jump (approximated by "was resolved as grounded on something as
     // of last frame" — a one-frame staleness that's imperceptible at this
@@ -336,20 +463,30 @@ export class CrossingSystem {
       this.roadCenterYFraction = lerp(this.roadCenterYFraction, clampedHint, expDecay(CROSSING_HORIZON_BIAS_RATE, dt));
     }
 
-    // Anchor blocks: target tracks the live road height every frame;
-    // followT=1 (snap) since roadCenterYFraction is already the
-    // slow-smoothed value — Platform's own glide would just be redundant
-    // smoothing on top of smoothing.
-    this.leftBlock.retarget(CROSSING_LEFT_BLOCK_CENTER_X_FRACTION, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
-    this.rightBlock.retarget(CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
+    // Anchor blocks: X tracks the live spatial-difficulty span, Y tracks the
+    // live road height every frame; followT=1 (snap) since both are already
+    // the slow-smoothed/ramped values — Platform's own glide would just be
+    // redundant smoothing on top of smoothing.
+    const leftXFraction = this.leftBlockXFraction;
+    const rightXFraction = this.rightBlockXFraction;
+    this.leftBlock.retarget(leftXFraction, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
+    this.rightBlock.retarget(rightXFraction, this.roadCenterYFraction, CROSSING_BLOCK_WIDTH_FRACTION, CROSSING_BLOCK_HEIGHT_FRACTION);
     this.leftBlock.updateVisual(1, canvasWidth, canvasHeight, 1);
     this.rightBlock.updateVisual(1, canvasWidth, canvasHeight, 1);
 
-    this.updateRealPlatforms(dt, canvasWidth, canvasHeight, occupiedPlatform);
+    this.updateRealPlatforms(dt, canvasWidth, canvasHeight, occupiedPlatform, gyroOffsetXPx, gyroOffsetYPx);
     this.updateGhostPlatforms(dt, canvasWidth, canvasHeight);
 
     this.timeSinceStableTrack += dt;
     this.maybeSpawnGhostChain(canvasWidth);
+
+    // Pennant glyphs float above whichever block currently holds each role.
+    const startBlock = this.startBlock;
+    const goalBlock = this.goalBlock;
+    this.startFlag.x = (startBlock.left + startBlock.right) / 2;
+    this.startFlag.y = startBlock.top;
+    this.goalFlag.x = (goalBlock.left + goalBlock.right) / 2;
+    this.goalFlag.y = goalBlock.top;
 
     this.candidates.length = 0;
     this.candidates.push(this.leftBlock, this.rightBlock);
@@ -363,7 +500,12 @@ export class CrossingSystem {
   /** A crossing just completed: swap which block is start vs. goal, retint
    * both, and drop the ghost chain — the return leg gets a fresh chance at
    * real tracking before falling back again (maybeSpawnGhostChain re-engages
-   * on its own after CROSSING_GHOST_TRIGGER_SECONDS if it doesn't). */
+   * on its own after CROSSING_GHOST_TRIGGER_SECONDS if it doesn't). Does NOT
+   * itself reposition the blocks for the new `crossings` count (which just
+   * changed the spatial-difficulty span) — callers that need the new
+   * `startBlock`'s position synchronously (Game.ts's handleCrossingWin) must
+   * follow this with an `update(0, ...)` settle pass first, same convention
+   * `reset()`'s own doc already establishes. */
   completeCrossing(): void {
     this.crossings++;
     this.legDirection = this.legDirection === 1 ? -1 : 1;
@@ -375,7 +517,6 @@ export class CrossingSystem {
     }
     this.ghostChainActive = false;
     this.timeSinceStableTrack = 0;
-    this.ghostTouchedThisLeg = false;
   }
 
   /** Positions the pooled dotted arc along the parabola a jump launched from
@@ -437,22 +578,92 @@ export class CrossingSystem {
 
   hideTrajectoryPreview(): void {
     for (let i = 0; i < this.previewDots.length; i++) this.previewDots[i]!.visible = false;
+    this.cancelRing.visible = false;
   }
 
-  /** Redraws the timer bar (background once per width change, fill every
-   * call — its width changes essentially every frame) and updates the combo
-   * counter text (only touched when the count actually changes, since a
-   * Pixi Text content write re-lays-out glyphs). `timerFraction` is
-   * remaining/total, 0..1. */
   /**
-   * The timer bar is gone — a countdown punished the player for how much real
-   * traffic happened to exist, which they cannot control. Only the combo
-   * readout remains.
+   * The "release here to cancel" ring, drawn at the press point while aiming.
+   *
+   * The cancel gesture already existed — drag back to where you pressed — but
+   * nothing on screen said so, and the user reported it as missing. Drawing it
+   * is the whole fix; the logic was fine.
    */
-  updateHud(canvasWidth: number, comboCount: number): void {
+  showCancelRing(x: number, y: number, armed: boolean): void {
+    if (!this.cancelRingDrawn) {
+      this.cancelRingDrawn = true;
+      this.cancelRing
+        .circle(0, 0, CROSSING_AIM_CANCEL_RADIUS_PX)
+        .stroke({
+          width: CROSSING_AIM_CANCEL_RING_THICKNESS,
+          color: CROSSING_AIM_CANCEL_RING_COLOR,
+          alpha: 1,
+        });
+    }
+    this.cancelRing.x = x;
+    this.cancelRing.y = y;
+    this.cancelRing.visible = true;
+    // Solid when releasing would cancel; ghosted while it is merely available.
+    this.cancelRing.alpha = armed ? 1 : CROSSING_AIM_CANCEL_RING_ALPHA;
+    this.cancelRing.scale.set(armed ? 1.12 : 1);
+  }
+
+  /**
+   * The per-leg countdown, back — see Game.ts's `isProgressReachable`/
+   * `legTimeRemaining` for the fairness rule that makes this safe to have
+   * again: the clock only runs while a reachable landing spot exists, so it
+   * can only ever punish dithering, never the road. `timerFraction` is
+   * remaining/total (0..1, already computed by Game.ts); `timerPaused` is
+   * true whenever nothing is currently reachable.
+   *
+   * The bar's FILL geometry is drawn once (full width) the first time (or
+   * whenever `canvasWidth` actually changes) and animated every other frame
+   * purely via `.scale.x` (width) and `.tint` (color) — never re-drawn —
+   * because unlike Platform's box (which only changes shape occasionally),
+   * this literally changes every single frame the clock is running, and
+   * redrawing Graphics geometry every frame is exactly the per-frame
+   * allocation this whole layer is built to avoid.
+   */
+  updateHud(dt: number, canvasWidth: number, comboCount: number, timerFraction: number, timerPaused: boolean): void {
     if (Math.abs(canvasWidth - this.lastHudWidth) > 0.5) {
       this.lastHudWidth = canvasWidth;
       this.comboText.x = canvasWidth / 2;
+      this.pausedLabel.x = canvasWidth / 2;
+
+      this.timerBarWidth = canvasWidth * CROSSING_TIMER_BAR_WIDTH_FRACTION;
+      this.timerBarX = (canvasWidth - this.timerBarWidth) / 2;
+      const radius = CROSSING_TIMER_BAR_HEIGHT_PX / 2;
+      this.timerBarBg
+        .clear()
+        .roundRect(this.timerBarX, CROSSING_TIMER_BAR_TOP_MARGIN_PX, this.timerBarWidth, CROSSING_TIMER_BAR_HEIGHT_PX, radius)
+        .fill({ color: CROSSING_TIMER_BAR_BG_COLOR, alpha: CROSSING_TIMER_BAR_BG_ALPHA });
+      // Full-width fill geometry, local origin at its own left edge, so
+      // `.scale.x` alone can shrink it toward that edge without a redraw.
+      this.timerBarFill.clear().roundRect(0, 0, Math.max(1, this.timerBarWidth), CROSSING_TIMER_BAR_HEIGHT_PX, radius).fill({ color: 0xffffff });
+      this.timerBarFill.x = this.timerBarX;
+      this.timerBarFill.y = CROSSING_TIMER_BAR_TOP_MARGIN_PX;
+    }
+
+    const clampedFraction = clamp(timerFraction, 0, 1);
+    this.timerBarFill.scale.x = clampedFraction;
+    this.timerBarFill.visible = clampedFraction > 0.002;
+
+    if (timerPaused) {
+      this.pausedPulsePhase += CROSSING_TIMER_PAUSED_PULSE_RATE * dt;
+      const pulse = (Math.sin(this.pausedPulsePhase) + 1) * 0.5;
+      this.timerBarFill.tint = CROSSING_TIMER_BAR_COLOR_PAUSED;
+      this.timerBarFill.alpha = lerp(CROSSING_TIMER_PAUSED_ALPHA_MIN, CROSSING_TIMER_PAUSED_ALPHA_MAX, pulse);
+      this.pausedLabel.visible = true;
+      this.pausedLabel.alpha = lerp(CROSSING_TIMER_PAUSED_ALPHA_MIN, CROSSING_TIMER_PAUSED_ALPHA_MAX, pulse);
+    } else {
+      this.pausedPulsePhase = 0;
+      this.timerBarFill.alpha = 1;
+      this.pausedLabel.visible = false;
+      this.timerBarFill.tint =
+        clampedFraction <= CROSSING_TIMER_BAR_CRITICAL_FRACTION
+          ? CROSSING_TIMER_BAR_COLOR_CRITICAL
+          : clampedFraction <= CROSSING_TIMER_BAR_WARN_FRACTION
+            ? CROSSING_TIMER_BAR_COLOR_WARN
+            : CROSSING_TIMER_BAR_COLOR_SAFE;
     }
 
     if (comboCount !== this.lastComboDisplayed) {
@@ -465,6 +676,8 @@ export class CrossingSystem {
   private retintBlocks(): void {
     this.startBlock.setPalette(CROSSING_BLOCK_START_FILL, CROSSING_BLOCK_START_TOP_BAR);
     this.goalBlock.setPalette(CROSSING_BLOCK_GOAL_FILL, CROSSING_BLOCK_GOAL_TOP_BAR);
+    this.startFlag.tint = CROSSING_BLOCK_START_FILL;
+    this.goalFlag.tint = CROSSING_BLOCK_GOAL_FILL;
   }
 
   private findRealByTrackId(id: number): Platform | undefined {
@@ -475,14 +688,14 @@ export class CrossingSystem {
     return undefined;
   }
 
-  private isGhostPlatform(platform: Platform): boolean {
-    for (let i = 0; i < this.ghosts.length; i++) {
-      if (this.ghosts[i]!.platform === platform) return true;
-    }
-    return false;
-  }
-
-  private updateRealPlatforms(dt: number, canvasWidth: number, canvasHeight: number, occupiedPlatform: Platform | null): void {
+  private updateRealPlatforms(
+    dt: number,
+    canvasWidth: number,
+    canvasHeight: number,
+    occupiedPlatform: Platform | null,
+    gyroOffsetXPx: number,
+    gyroOffsetYPx: number,
+  ): void {
     const followT = expDecay(PLATFORM_FOLLOW_LERP_RATE, dt);
     const fadeStart = PLATFORM_GRACE_SECONDS - PLATFORM_FADE_SECONDS;
 
@@ -506,7 +719,9 @@ export class CrossingSystem {
       }
 
       const fadeAlpha = platform.missedTime <= fadeStart ? 1 : clamp(1 - (platform.missedTime - fadeStart) / PLATFORM_FADE_SECONDS, 0, 1);
-      platform.updateVisual(followT, canvasWidth, canvasHeight, fadeAlpha);
+      // Gyro-stabilisation nudge — REAL platforms only, see this method's
+      // caller and GYRO_STABILIZATION_* in config.ts.
+      platform.updateVisual(followT, canvasWidth, canvasHeight, fadeAlpha, gyroOffsetXPx, gyroOffsetYPx);
     }
   }
 

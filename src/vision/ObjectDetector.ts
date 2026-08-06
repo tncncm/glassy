@@ -41,6 +41,7 @@
  */
 
 import { createDetectionTracker, type DetectionTracker } from './DetectionTracker.ts';
+import { createRoofFinder, type RoofFinder } from './RoofFinder.ts';
 import type {
   ObjectDetector,
   ObjectDetectorOptions,
@@ -177,6 +178,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   let intervalMs = intervalForMode();
 
   const tracker: DetectionTracker = createDetectionTracker();
+  const roofFinder: RoofFinder = createRoofFinder();
   let lastTrackUpdateMs = 0;
 
   let currentState: DetectorState = { status: 'idle' };
@@ -321,7 +323,12 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     const now = performance.now();
     const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
     lastTrackUpdateMs = now;
-    options.onTrackedObjects(tracker.update(output, dt));
+    const trackedObjects = tracker.update(output, dt);
+    // Refine the loose detection box down to the actual roof line/width
+    // in place, before handing objects out. Falls back to the box's own
+    // top edge and sides (already written by the tracker) on any failure.
+    roofFinder.refine(video, trackedObjects, dt);
+    options.onTrackedObjects(trackedObjects);
   }
 
   function handleDetectResult(data: Extract<WorkerToMainMessage, { type: 'result' }>): void {
@@ -676,6 +683,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         worker = null;
       }
       output.length = 0;
+      roofFinder.stop();
       setState({ status: 'idle' });
     },
   };

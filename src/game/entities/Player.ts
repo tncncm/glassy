@@ -34,12 +34,25 @@ import {
   LAND_SQUASH_SCALE_Y,
   PLAYER_COLLISION_INSET_TOP,
   PLAYER_COLOR_BODY,
-  PLAYER_COLOR_EYE,
   PLAYER_COLOR_LIMB,
   PLAYER_COLOR_OUTLINE,
+  PLAYER_HALO_ALPHA,
+  PLAYER_HALO_COLOR,
+  PLAYER_HALO_RADIUS_PX,
   PLAYER_HEIGHT,
   PLAYER_LEG_LENGTH,
   PLAYER_LEG_WIDTH,
+  PLAYER_OUTLINE_WIDTH,
+  PLAYER_SHADOW_ALPHA_GROUNDED,
+  PLAYER_SHADOW_COLOR,
+  PLAYER_SHADOW_FADE_HEIGHT_PX,
+  PLAYER_SHADOW_HEIGHT_PX,
+  PLAYER_SHADOW_MIN_ALPHA_FRACTION,
+  PLAYER_SHADOW_MIN_SCALE,
+  PLAYER_SHADOW_WIDTH_PX,
+  PLAYER_VISOR_COLOR,
+  PLAYER_VISOR_HEIGHT,
+  PLAYER_VISOR_WIDTH,
   PLAYER_WIDTH,
   RUN_CYCLE_BASE_SPEED,
   RUN_LEG_SWING_RADIANS,
@@ -78,6 +91,14 @@ export class Player {
   private readonly legLeft: Container;
   private readonly legRight: Container;
   private readonly arm: Container;
+  /** Soft glow behind the rig — legibility over busy/bright video, see
+   * PLAYER_HALO_* in config.ts. Static geometry; only inherits the rig's own
+   * transform, never touched per frame. */
+  private readonly halo: Graphics;
+  /** Ground-contact shadow — pinned to the actual ground level (not the
+   * rig's own airborne Y) and counter-scaled against squash, see
+   * updateCrossing(). */
+  private readonly shadow: Graphics;
   /** Motion-trail streaks — read airborne speed each frame (see
    * updateCrossing), not any dash mechanic (there is none in crossing mode). */
   private readonly trailStreaks: Graphics[] = [];
@@ -116,12 +137,24 @@ export class Player {
     const bodyHeight = PLAYER_HEIGHT - PLAYER_LEG_LENGTH;
     const torsoCenterY = -PLAYER_HEIGHT + bodyHeight * 0.5;
 
+    // Ground shadow — local (0,0) is the rig's own foot point; positioned
+    // every frame in updateCrossing() to stay pinned at ground level while
+    // airborne. See PLAYER_SHADOW_* in config.ts for the legibility reasoning.
+    this.shadow = new Graphics().ellipse(0, 0, PLAYER_SHADOW_WIDTH_PX / 2, PLAYER_SHADOW_HEIGHT_PX / 2).fill({ color: PLAYER_SHADOW_COLOR });
+    this.shadow.alpha = PLAYER_SHADOW_ALPHA_GROUNDED;
+
+    // Soft glow halo, drawn once — see PLAYER_HALO_* in config.ts.
+    this.halo = new Graphics().circle(0, torsoCenterY, PLAYER_HALO_RADIUS_PX).fill({ color: PLAYER_HALO_COLOR });
+    this.halo.alpha = PLAYER_HALO_ALPHA;
+
+    // Visor stripe (not a naturalistic eye) — reads as a facing direction at
+    // icon scale, pictogram-style; see the redesign doc on PLAYER_COLOR_BODY.
     this.body = new Graphics()
       .roundRect(-PLAYER_WIDTH / 2, -PLAYER_HEIGHT, PLAYER_WIDTH, bodyHeight, 8)
       .fill({ color: PLAYER_COLOR_BODY })
-      .stroke({ width: 2, color: PLAYER_COLOR_OUTLINE })
-      .circle(PLAYER_WIDTH * 0.18, -PLAYER_HEIGHT + bodyHeight * 0.4, 3.2)
-      .fill({ color: PLAYER_COLOR_EYE });
+      .stroke({ width: PLAYER_OUTLINE_WIDTH, color: PLAYER_COLOR_OUTLINE })
+      .roundRect(PLAYER_WIDTH * 0.06, -PLAYER_HEIGHT + bodyHeight * 0.3, PLAYER_VISOR_WIDTH, PLAYER_VISOR_HEIGHT, PLAYER_VISOR_HEIGHT / 2)
+      .fill({ color: PLAYER_VISOR_COLOR });
 
     this.legLeft = buildLimb(PLAYER_COLOR_LIMB);
     this.legLeft.position.set(-PLAYER_WIDTH * 0.22, -PLAYER_LEG_LENGTH);
@@ -157,9 +190,9 @@ export class Player {
       this.trailBaseAlpha.push(CROSSING_TRAIL_MAX_ALPHA * (1 - i / CROSSING_TRAIL_STREAK_COUNT));
     }
 
-    // Draw order: trail behind everything, then legs behind the body, arm
-    // in front.
-    this.view.addChild(...this.trailStreaks);
+    // Draw order: shadow furthest back, then the glow halo, then the trail,
+    // then legs behind the body, arm in front.
+    this.view.addChild(this.shadow, this.halo, ...this.trailStreaks);
     this.view.addChild(this.legLeft, this.legRight, this.body, this.arm);
   }
 
@@ -195,6 +228,9 @@ export class Player {
     for (let i = 0; i < this.trailStreaks.length; i++) {
       this.trailStreaks[i]!.alpha = 0;
     }
+    this.shadow.y = 0;
+    this.shadow.scale.set(1, 1);
+    this.shadow.alpha = PLAYER_SHADOW_ALPHA_GROUNDED;
   }
 
   /** Crossing-mode-only: tints the body toward CROSSING_EDGE_WARNING_TINT as
@@ -334,6 +370,19 @@ export class Player {
     for (let i = 0; i < this.trailStreaks.length; i++) {
       this.trailStreaks[i]!.alpha = this.trailAlpha * this.trailBaseAlpha[i]!;
     }
+
+    // Ground-contact shadow: pinned to the actual ground level (world Y =
+    // view.y + airborneHeight = surfaceY, constant while the rig floats
+    // above it) rather than riding up with the rig — see PLAYER_SHADOW_*'s
+    // doc in config.ts for why this is the single strongest "standing on
+    // something" cue over a busy background. Counter-scaled against this
+    // frame's own squash/facing so it never itself stretches.
+    const shadowHeightT = clamp(this.airborneHeight / PLAYER_SHADOW_FADE_HEIGHT_PX, 0, 1);
+    const shadowScale = lerp(1, PLAYER_SHADOW_MIN_SCALE, shadowHeightT);
+    const signedScaleX = (this.facingRight ? 1 : -1) * this.squashX;
+    this.shadow.y = this.airborneHeight;
+    this.shadow.scale.set(shadowScale / signedScaleX, shadowScale / this.squashY);
+    this.shadow.alpha = PLAYER_SHADOW_ALPHA_GROUNDED * lerp(1, PLAYER_SHADOW_MIN_ALPHA_FRACTION, shadowHeightT);
 
     this.view.x = this.originX;
     this.view.y = this.footY;

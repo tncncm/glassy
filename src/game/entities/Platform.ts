@@ -17,11 +17,19 @@
 
 import { Graphics } from 'pixi.js';
 import {
+  PLATFORM_BRACKET_ALPHA,
+  PLATFORM_BRACKET_INSET_PX,
+  PLATFORM_BRACKET_LENGTH_PX,
+  PLATFORM_BRACKET_THICKNESS,
   PLATFORM_FILL_ALPHA,
   PLATFORM_FILL_COLOR,
   PLATFORM_OUTLINE_ALPHA,
   PLATFORM_OUTLINE_COLOR,
   PLATFORM_OUTLINE_WIDTH,
+  PLATFORM_SHADOW_ALPHA,
+  PLATFORM_SHADOW_COLOR,
+  PLATFORM_SHADOW_HEIGHT_PX,
+  PLATFORM_SHADOW_OFFSET_Y_PX,
   PLATFORM_TOP_BAR_ALPHA,
   PLATFORM_TOP_BAR_COLOR,
   PLATFORM_TOP_BAR_GLOW_ALPHA,
@@ -151,8 +159,16 @@ export class Platform {
    * `followT` (a single expDecay(dt) factor shared across every platform,
    * computed once by the owning system), recompute px extents against the
    * live canvas size, and redraw only if the box changed enough to matter.
+   *
+   * `offsetXPx`/`offsetYPx` (default 0) is an EXTRA px nudge folded straight
+   * into the same px extents the one-way collision test reads (`left`/
+   * `right`/`top`) — never just a rendering-only transform — so the visible
+   * box and the collidable box can never disagree. CrossingSystem uses this
+   * to apply gyro-stabilisation's hand-shake correction to REAL tracked
+   * platforms only (see GYRO_STABILIZATION_* in config.ts); every other
+   * caller passes 0,0.
    */
-  updateVisual(followT: number, canvasWidth: number, canvasHeight: number, fadeAlpha: number): void {
+  updateVisual(followT: number, canvasWidth: number, canvasHeight: number, fadeAlpha: number, offsetXPx = 0, offsetYPx = 0): void {
     this.currentCenterXFraction = lerp(this.currentCenterXFraction, this.targetCenterXFraction, followT);
     this.currentCenterYFraction = lerp(this.currentCenterYFraction, this.targetCenterYFraction, followT);
     this.currentWidthFraction = lerp(this.currentWidthFraction, this.targetWidthFraction, followT);
@@ -161,8 +177,8 @@ export class Platform {
 
     const widthPx = this.currentWidthFraction * canvasWidth;
     const heightPx = this.currentHeightFraction * canvasHeight;
-    const centerXPx = this.currentCenterXFraction * canvasWidth;
-    const topPx = this.currentCenterYFraction * canvasHeight - heightPx / 2;
+    const centerXPx = this.currentCenterXFraction * canvasWidth + offsetXPx;
+    const topPx = this.currentCenterYFraction * canvasHeight - heightPx / 2 + offsetYPx;
 
     this.leftPx = centerXPx - widthPx / 2;
     this.rightPx = centerXPx + widthPx / 2;
@@ -178,10 +194,18 @@ export class Platform {
     }
   }
 
-  /** Outline-over-reality body (low-alpha fill so the real vehicle stays
+  /**
+   * Outline-over-reality body (low-alpha fill so the real vehicle stays
    * visible) plus a bright top-edge bar — the actual landing-surface
    * indicator — echoing the ground line's own core+glow styling so a
-   * platform reads as "the same kind of thing as the ground" at a glance. */
+   * platform reads as "the same kind of thing as the ground" at a glance.
+   * Two legibility additions over a busy/bright camera feed: a soft drop
+   * shadow beneath the box (separates it from whatever is directly behind
+   * it) and four corner brackets in the platform's own hue — the same
+   * AR/target-lock visual language a HUD overlaid on a real camera feed
+   * should use, and strong short strokes read far better against clutter
+   * than a single thin outline alone.
+   */
   private redraw(widthPx: number, heightPx: number): void {
     this.lastDrawnWidthPx = widthPx;
     this.lastDrawnHeightPx = heightPx;
@@ -189,9 +213,16 @@ export class Platform {
     const h = Math.max(1, heightPx);
     const barSpanLeft = -PLATFORM_TOP_BAR_OVERHANG_PX;
     const barSpanWidth = w + PLATFORM_TOP_BAR_OVERHANG_PX * 2;
+    const bracket = Math.min(PLATFORM_BRACKET_LENGTH_PX, w / 2, h / 2);
+    const left = PLATFORM_BRACKET_INSET_PX;
+    const right = w - PLATFORM_BRACKET_INSET_PX;
+    const top = PLATFORM_BRACKET_INSET_PX;
+    const bottom = h - PLATFORM_BRACKET_INSET_PX;
 
     this.view.clear();
     this.view
+      .rect(0, h + PLATFORM_SHADOW_OFFSET_Y_PX, w, PLATFORM_SHADOW_HEIGHT_PX)
+      .fill({ color: PLATFORM_SHADOW_COLOR, alpha: PLATFORM_SHADOW_ALPHA })
       .rect(0, 0, w, h)
       .fill({ color: this.fillColor, alpha: PLATFORM_FILL_ALPHA })
       .rect(0, 0, w, h)
@@ -199,6 +230,19 @@ export class Platform {
       .rect(barSpanLeft, -PLATFORM_TOP_BAR_GLOW_THICKNESS / 2, barSpanWidth, PLATFORM_TOP_BAR_GLOW_THICKNESS)
       .fill({ color: this.topBarColor, alpha: PLATFORM_TOP_BAR_GLOW_ALPHA })
       .rect(barSpanLeft, -PLATFORM_TOP_BAR_THICKNESS / 2, barSpanWidth, PLATFORM_TOP_BAR_THICKNESS)
-      .fill({ color: this.topBarColor, alpha: PLATFORM_TOP_BAR_ALPHA });
+      .fill({ color: this.topBarColor, alpha: PLATFORM_TOP_BAR_ALPHA })
+      .moveTo(left, top + bracket)
+      .lineTo(left, top)
+      .lineTo(left + bracket, top)
+      .moveTo(right - bracket, top)
+      .lineTo(right, top)
+      .lineTo(right, top + bracket)
+      .moveTo(left, bottom - bracket)
+      .lineTo(left, bottom)
+      .lineTo(left + bracket, bottom)
+      .moveTo(right - bracket, bottom)
+      .lineTo(right, bottom)
+      .lineTo(right, bottom - bracket)
+      .stroke({ width: PLATFORM_BRACKET_THICKNESS, color: this.topBarColor, alpha: PLATFORM_BRACKET_ALPHA });
   }
 }

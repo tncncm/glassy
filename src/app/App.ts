@@ -32,11 +32,13 @@ import {
   type SoundName,
   type DetectorState,
   type ObjectDetector,
+  type MotionSensor,
   type SceneAnalyser,
   type TrackedObject,
   type UIController,
   type UIIntents,
 } from '../types.ts';
+import { createMotionSensor } from '../motion/MotionSensor.ts';
 import { createUIController } from '../ui/UIController.ts';
 import { createObjectDetector } from '../vision/ObjectDetector.ts';
 import { createSceneAnalyser } from '../vision/SceneAnalyser.ts';
@@ -70,6 +72,13 @@ const ROTATE_PROMPT_MAX_SHORT_EDGE = 820;
  * so it is cheap — but there is no point pushing faster than the analyser moves.
  */
 const HORIZON_PUSH_INTERVAL_MS = 200;
+
+/**
+ * How often the smoothed motion state is handed to the game. The sensor
+ * filters at its own (much higher) rate; this only reads what it already
+ * computed, so it is cheap — but the comfort cues want a steady feed.
+ */
+const MOTION_PUSH_INTERVAL_MS = 50;
 
 /** See the comment in `syncSceneAnalysis`. */
 const HORIZON_HINT_ENABLED = true;
@@ -134,6 +143,16 @@ export async function createApp(root: HTMLElement): Promise<App> {
     },
   });
 
+  /**
+   * The phone's own movement. Two uses: damping hand-shake out of platform
+   * positions, and driving the motion-comfort cues. Permission is iOS-only
+   * and must ride a gesture, so it is requested on the Play tap alongside
+   * audio unlock — never on load.
+   */
+  const motion: MotionSensor = createMotionSensor({});
+  let motionRequested = false;
+  let motionTimer: number | null = null;
+
   const game: Game = await createGame({
     container: stage,
     preferences,
@@ -164,6 +183,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
         // shows the explainer; from the explainer it actually asks.
         audio.play('click');
         unlockAudio();
+        unlockMotion();
         // Must ride this gesture — a fullscreen request outside one is refused.
         requestFullscreenIfSupported();
         if (state === 'home') {
@@ -233,6 +253,13 @@ export async function createApp(root: HTMLElement): Promise<App> {
         unlockAudio();
         ui.setCameraFailure(null);
         void requestCameraThenPlay();
+      },
+      onToggleMotionCues(): void {
+        audio.play('click');
+        const enabled = !preferences.getMotionCues();
+        preferences.setMotionCues(enabled);
+        ui.setMotionCues(enabled);
+        game.setMotionCuesEnabled(enabled);
       },
       onToggleVision(): void {
         audio.play('click');
@@ -520,6 +547,27 @@ export async function createApp(root: HTMLElement): Promise<App> {
   /* Helpers                                                           */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * iOS gates DeviceMotion behind a permission that must be requested from a
+   * user gesture, exactly like audio. Fire-and-forget: a refusal costs the
+   * comfort cues and the shake damping, nothing else.
+   */
+  function unlockMotion(): void {
+    if (motionRequested) return;
+    motionRequested = true;
+    void motion.request().then((granted) => {
+      if (!granted || destroyed) return;
+      motion.start();
+      if (motionTimer === null) {
+        motionTimer = window.setInterval(pushMotion, MOTION_PUSH_INTERVAL_MS);
+      }
+    });
+  }
+
+  function pushMotion(): void {
+    game.setMotion(motion.state);
+  }
+
   function unlockAudio(): void {
     if (audioUnlocked) return;
     audioUnlocked = true;
@@ -547,6 +595,9 @@ export async function createApp(root: HTMLElement): Promise<App> {
     ui.setInstallHintVisible(isIPhoneSafari() && !isStandalone());
     // Reflect the stored opt-in without starting a download on load.
     ui.setDetectorState({ status: preferences.getVisionEnabled() ? 'idle' : 'disabled' });
+    const cues = preferences.getMotionCues();
+    ui.setMotionCues(cues);
+    game.setMotionCuesEnabled(cues);
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be
@@ -569,6 +620,11 @@ export async function createApp(root: HTMLElement): Promise<App> {
     document.removeEventListener('visibilitychange', handleVisibility);
     scene.stop();
     detector.dispose();
+    motion.stop();
+    if (motionTimer !== null) {
+      window.clearInterval(motionTimer);
+      motionTimer = null;
+    }
     if (horizonTimer !== null) {
       window.clearInterval(horizonTimer);
       horizonTimer = null;

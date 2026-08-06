@@ -88,6 +88,7 @@ export function createDetectionTracker(): DetectionTracker {
   }));
   const output: TrackedObject[] = Array.from({ length: MAX_TRACKS }, () => ({
     id: 0, kind: 'vehicle', x: 0, y: 0, width: 0, height: 0, score: 0,
+    surfaceY: 0, surfaceLeft: 0, surfaceRight: 0,
     age: 0, stable: false,
   }));
   const live: TrackedObject[] = [];
@@ -183,6 +184,14 @@ export function createDetectionTracker(): DetectionTracker {
       slot.width = t.width;
       slot.height = t.height;
       slot.score = t.score;
+      // Fallback landing surface: the box's own top edge and sides. Callers
+      // (see ObjectDetector.ts) may refine this via RoofFinder before the
+      // object is handed out; if refinement doesn't run or doesn't trust
+      // its answer this tick, this is what ships — always populated, never
+      // left at a stale or zero value.
+      slot.surfaceY = t.y - t.height / 2;
+      slot.surfaceLeft = t.x - t.width / 2;
+      slot.surfaceRight = t.x + t.width / 2;
       slot.age = t.ageSeconds;
       slot.stable = t.confirmations >= CONFIRMATIONS_TO_STABILISE;
       live.push(slot);

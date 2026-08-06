@@ -1,6 +1,6 @@
 /**
- * localStorage wrapper — the ONLY three values Glassy ever persists:
- * `bestScore`, `muted`, `visionEnabled`. Nothing else.
+ * localStorage wrapper — the ONLY four values Glassy ever persists:
+ * `bestScore`, `muted`, `visionEnabled`, `motionCues`. Nothing else.
  *
  * Every read and write is wrapped in try/catch: Safari private mode throws on
  * write (and some private-mode configurations throw on read too). On any
@@ -12,6 +12,7 @@ import type { Preferences } from '../types.ts';
 const BEST_SCORE_KEY = 'bestScore';
 const MUTED_KEY = 'muted';
 const VISION_ENABLED_KEY = 'visionEnabled';
+const MOTION_CUES_KEY = 'motionCues';
 
 function parseBestScore(raw: string | null): number {
   if (raw === null) return 0;
@@ -31,6 +32,14 @@ function parseVisionEnabled(raw: string | null): boolean {
   return raw === 'true';
 }
 
+// Unlike the other flags, an ABSENT key means true, not false: motion-comfort
+// cues are a default-on comfort feature (see Preferences.getMotionCues in
+// types.ts), so only an explicit "false" ever turns them off.
+function parseMotionCues(raw: string | null): boolean {
+  if (raw === null) return true;
+  return raw === 'true';
+}
+
 export function createPreferences(): Preferences {
   // In-memory fallback, used whenever localStorage is unavailable or throws.
   let memoryBestScore = 0;
@@ -38,6 +47,9 @@ export function createPreferences(): Preferences {
   // Defaults to false: object detection costs a multi-megabyte download and
   // real battery, so it must be a deliberate opt-in, never default-on.
   let memoryVisionEnabled = false;
+  // Defaults to true: this is a comfort feature, and someone who needs it is
+  // unlikely to go hunting through settings before they feel unwell.
+  let memoryMotionCues = true;
 
   function readBestScore(): number {
     try {
@@ -90,6 +102,23 @@ export function createPreferences(): Preferences {
     }
   }
 
+  function readMotionCues(): boolean {
+    try {
+      return parseMotionCues(window.localStorage.getItem(MOTION_CUES_KEY));
+    } catch {
+      return memoryMotionCues;
+    }
+  }
+
+  function writeMotionCues(value: boolean): void {
+    memoryMotionCues = value;
+    try {
+      window.localStorage.setItem(MOTION_CUES_KEY, String(value));
+    } catch {
+      // Safari private mode (or any storage failure): keep the in-memory copy.
+    }
+  }
+
   return {
     getBestScore(): number {
       return readBestScore();
@@ -114,6 +143,12 @@ export function createPreferences(): Preferences {
     },
     setVisionEnabled(enabled: boolean): void {
       writeVisionEnabled(enabled);
+    },
+    getMotionCues(): boolean {
+      return readMotionCues();
+    },
+    setMotionCues(enabled: boolean): void {
+      writeMotionCues(enabled);
     },
   };
 }

@@ -4,6 +4,15 @@
  * A pure view: builds every screen once as static DOM, toggles visibility by
  * class/attribute, and emits typed intents. It never touches Pixi, the
  * camera, game state or localStorage directly.
+ *
+ * Information architecture: Play is the front screen. The home screen shows
+ * only what you need before you can plausibly ignore everything else — the
+ * mandatory safety line, a one-line reminder to point the phone at the
+ * windscreen, the Play button, mute, and best score. Everything explanatory
+ * (the full pitch, the privacy explanation, the detection opt-in and its
+ * cost, motion-comfort cues, the demo drive, the iOS install hint) lives one
+ * tap away behind the "About" affordance, in a slide-in sheet that is part of
+ * the `home` screen's own DOM — it is never a distinct `ScreenName`.
  */
 
 import type {
@@ -64,14 +73,23 @@ const MUTE_LABEL_OFF = 'Unmute sound';
 const MUTE_ICON_ON = '\u{1F50A}'; // speaker
 const MUTE_ICON_OFF = '\u{1F507}'; // muted speaker
 
-// Detection now does real work: with it off, the road has no real platforms
-// at all and the game falls back to synthetic ones, so the copy leads with
-// what turning it on actually buys the player, not just the cost.
+// Detection turns real vehicles into platforms; without it the game falls
+// back to synthetic platforms and plays fine either way, so the copy leads
+// with what turning it on buys the player, states the cost plainly, and never
+// implies that "off" or "no cars detected" is a worse or losing state — the
+// driver is sitting right there, and more traffic is never the goal.
 const VISION_TITLE = 'Turn traffic into platforms';
 const VISION_DESC = 'Spots real vehicles to land on. ~9 MB one-time download, more battery.';
 const VISION_ARIA_LABEL =
-  'Turn traffic into platforms. On-device AI spots real vehicles out the windscreen so you can land on them. Without it, only synthetic platforms appear. Uses a one-time about 9 megabyte download and more battery. Off by default.';
-const VISION_ICON = '\u{1F50D}'; // magnifying glass
+  'Turn traffic into platforms. On-device AI spots real vehicles out the windscreen so you can land on them. Without it, synthetic platforms appear instead. Uses a one-time about 9 megabyte download and more battery. Off by default.';
+
+// Motion-comfort cues: drifting dots that match the vehicle's real motion, the
+// idea behind iOS's Vehicle Motion Cues. Named for what it does, not framed as
+// "accessibility" — someone who needs it should be able to tell at a glance.
+const MOTION_CUES_TITLE = 'Motion comfort cues';
+const MOTION_CUES_DESC = "Drifting dots that match the car's real motion, to help with motion sickness.";
+const MOTION_CUES_ARIA_LABEL =
+  "Motion comfort cues. Drifting dots that match the car's real motion, to help with motion sickness. On by default.";
 
 /**
  * Whether the opt-in toggle should render as ON. `idle` (never asked to
@@ -98,48 +116,95 @@ const TEMPLATE = `
     <div class="loading__spinner" aria-hidden="true"></div>
   </div>
 
-  <div class="screen" data-screen="home">
-    <div class="panel home__panel">
-      <h1 class="home__title">Glassy</h1>
-      <p class="home__pitch">Hold your phone up to the windscreen and hop your character across real traffic, left block to right block. Don't fall.</p>
-      <div class="stat home__best">
-        <span class="stat__label">Best</span>
-        <span class="stat__value" data-role="home-best">0</span>
-      </div>
-      <div class="safety-line">
-        <span class="safety-line__icon" aria-hidden="true">⚠️</span>
-        <span>Passenger use only. Do not use while driving.</span>
-      </div>
-      <p class="privacy-line">Your camera shows the road live on your screen — it's never recorded. Glassy looks at the picture only on your phone, to find the horizon and, if you turn it on below, to spot real vehicles to jump on. Nothing is ever uploaded or sent anywhere — no frame and no detection is ever stored. The detection model downloads once to your phone and runs there; there's no server.</p>
-      <div class="vision" data-role="vision">
-        <button
-          type="button"
-          class="vision__toggle"
-          data-action="toggle-vision"
-          data-vision-button
-          aria-pressed="false"
-          aria-label="${VISION_ARIA_LABEL}"
-        >
-          <span class="vision__switch" aria-hidden="true"></span>
-          <span class="vision__copy">
-            <span class="vision__title">${VISION_TITLE}</span>
-            <span class="vision__desc">${VISION_DESC}</span>
-          </span>
-        </button>
-        <p class="vision__status" data-role="vision-status" hidden>
-          <span data-role="vision-status-text"></span>
-        </p>
-        <div class="vision__progress" data-role="vision-progress" hidden aria-hidden="true">
-          <div class="vision__progress-fill" data-role="vision-progress-fill"></div>
+  <div class="screen screen--home" data-screen="home">
+    <div class="home">
+      <div class="home__topbar">
+        <span class="home__wordmark">Glassy</span>
+        <div class="home__topbar-actions">
+          <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
+          <button type="button" class="btn btn--icon" data-action="toggle-settings" data-settings-button aria-expanded="false" aria-label="About Glassy and settings">ℹ️</button>
         </div>
       </div>
-      <div class="home__actions">
-        <button type="button" class="btn btn--primary btn--block" data-action="play">Play</button>
-        <button type="button" class="btn btn--icon home__mute" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
+
+      <div class="home__center">
+        <button type="button" class="btn btn--primary btn--play" data-action="play">Play</button>
+        <div class="home__best">
+          <span class="home__best-label">Best</span>
+          <span class="home__best-value" data-role="home-best">0</span>
+        </div>
       </div>
-      <p class="install-hint" data-install-hint hidden>
-        For true full screen on iPhone: tap <strong>Share</strong>, then <strong>Add to Home Screen</strong>, and open Glassy from there.
-      </p>
+
+      <div class="home__footer">
+        <p class="home__hint"><span aria-hidden="true">\u{1F697}</span> Point it at the windscreen, in landscape.</p>
+        <div class="safety-line">
+          <span class="safety-line__icon" aria-hidden="true">⚠️</span>
+          <span>Passenger use only. Do not use while driving.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sheet" data-role="settings-sheet" hidden>
+      <div class="sheet__scrim" data-action="close-settings" aria-hidden="true"></div>
+      <div class="sheet__panel" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+        <div class="sheet__header">
+          <h2 class="sheet__title" id="sheet-title">About Glassy</h2>
+          <button type="button" class="btn btn--icon" data-action="close-settings" data-settings-close aria-label="Close">✕</button>
+        </div>
+        <div class="sheet__body">
+          <p class="sheet__pitch">Hold your phone up to the windscreen and hop your character across real traffic — left block to right block. Don't fall.</p>
+
+          <p class="privacy-line">Your camera shows the road live on your screen — it's never recorded. Glassy looks at the picture only on your phone, to find the horizon and, if you turn on detection below, to spot real vehicles to jump on. Nothing is ever uploaded, sent anywhere, or saved — no frame and no detection is ever stored. The detection model downloads once to your phone and runs there; there's no server.</p>
+
+          <div class="toggle" data-role="vision">
+            <button
+              type="button"
+              class="toggle__control"
+              data-action="toggle-vision"
+              data-vision-button
+              aria-pressed="false"
+              aria-label="${VISION_ARIA_LABEL}"
+            >
+              <span class="toggle__switch" aria-hidden="true"></span>
+              <span class="toggle__copy">
+                <span class="toggle__title">${VISION_TITLE}</span>
+                <span class="toggle__desc">${VISION_DESC}</span>
+              </span>
+            </button>
+            <p class="toggle__status" data-role="vision-status" hidden>
+              <span data-role="vision-status-text"></span>
+            </p>
+            <div class="toggle__progress" data-role="vision-progress" hidden aria-hidden="true">
+              <div class="toggle__progress-fill" data-role="vision-progress-fill"></div>
+            </div>
+          </div>
+
+          <div class="toggle" data-role="motion-cues">
+            <button
+              type="button"
+              class="toggle__control"
+              data-action="toggle-motion-cues"
+              data-motion-cues-button
+              aria-pressed="true"
+              aria-label="${MOTION_CUES_ARIA_LABEL}"
+            >
+              <span class="toggle__switch" aria-hidden="true"></span>
+              <span class="toggle__copy">
+                <span class="toggle__title">${MOTION_CUES_TITLE}</span>
+                <span class="toggle__desc">${MOTION_CUES_DESC}</span>
+              </span>
+            </button>
+          </div>
+
+          <button type="button" class="btn btn--secondary btn--demo btn--block" data-action="play-demo">
+            Try the demo drive
+            <span class="btn__hint">Dashcam clip, no camera needed</span>
+          </button>
+
+          <p class="install-hint" data-install-hint hidden>
+            For true full screen on iPhone: tap <strong>Share</strong>, then <strong>Add to Home Screen</strong>, and open Glassy from there.
+          </p>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -148,7 +213,7 @@ const TEMPLATE = `
       <div class="permission__state" data-state="pre-request">
         <div class="permission__icon" aria-hidden="true">\u{1F4F7}</div>
         <h2 class="permission__title">Camera as your windscreen view</h2>
-        <p class="permission__body">Glassy uses your rear camera as a live view behind the game, as if you were looking through the windscreen. It looks at the picture only on your phone — to find the horizon and, if you turned on real-vehicle detection, to spot traffic to jump on. Nothing is ever recorded, saved or sent anywhere: no frame and no detection ever leaves your phone, and there's no server for it to reach.</p>
+        <p class="permission__body">Your rear camera becomes a live view behind the game, like looking through the windscreen. It's analysed only on your phone — to find the horizon, and to spot traffic if you turned that on. Nothing is recorded, saved, or sent anywhere; there's no server to send it to.</p>
         <div class="btn-row">
           <button type="button" class="btn btn--primary" data-action="continue">Continue</button>
         </div>
@@ -207,7 +272,6 @@ const TEMPLATE = `
       </div>
       <div class="btn-row">
         <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
-        <button type="button" class="btn btn--icon" data-action="toggle-vision" data-vision-button aria-pressed="false" aria-label="${VISION_ARIA_LABEL}">${VISION_ICON}</button>
       </div>
     </div>
   </div>
@@ -264,6 +328,12 @@ class GlassyUIController implements UIController {
   private readonly visionStatusTextEl: HTMLElement;
   private readonly visionProgressEl: HTMLElement;
   private readonly visionProgressFillEl: HTMLElement;
+  private readonly motionCuesButtons: HTMLButtonElement[];
+
+  private readonly settingsSheetEl: HTMLElement;
+  private readonly settingsButtonEl: HTMLButtonElement;
+  private readonly settingsCloseButtons: HTMLButtonElement[];
+  private readonly homeMainEl: HTMLElement;
 
   private currentScreen: ScreenName = 'loading';
   private lastScore = -1;
@@ -272,6 +342,8 @@ class GlassyUIController implements UIController {
   private hasCameraFailure = false;
   private lastDetectorStatus: DetectorStatus | null = null;
   private lastDetectorProgress: number | null = null;
+  private lastMotionCues: boolean | null = null;
+  private settingsOpen = false;
 
   constructor(root: HTMLElement, intents: UIIntents) {
     this.root = root;
@@ -317,6 +389,19 @@ class GlassyUIController implements UIController {
     this.visionStatusTextEl = requireElement(this.root, '[data-role="vision-status-text"]');
     this.visionProgressEl = requireElement(this.root, '[data-role="vision-progress"]');
     this.visionProgressFillEl = requireElement(this.root, '[data-role="vision-progress-fill"]');
+    this.motionCuesButtons = Array.from(
+      this.root.querySelectorAll<HTMLButtonElement>('[data-motion-cues-button]'),
+    );
+
+    this.settingsSheetEl = requireElement(this.root, '[data-role="settings-sheet"]');
+    this.settingsButtonEl = requireElement<HTMLButtonElement>(this.root, '[data-settings-button]');
+    // Deliberately excludes the scrim: it also closes the sheet (via the same
+    // data-action, handled generically in handleClick) but it isn't a real
+    // focusable control, so it must never be a candidate for focusSettingsClose().
+    this.settingsCloseButtons = Array.from(
+      this.root.querySelectorAll<HTMLButtonElement>('[data-settings-close]'),
+    );
+    this.homeMainEl = requireElement(this.root, '.home');
 
     this.focusTargets = {
       loading: null,
@@ -337,10 +422,12 @@ class GlassyUIController implements UIController {
     };
 
     this.root.addEventListener('click', this.handleClick);
+    this.root.addEventListener('keydown', this.handleKeydown);
 
     this.applyScreen(this.currentScreen);
     this.setMuted(false);
     this.setDetectorState({ status: 'idle' });
+    this.setMotionCues(true);
     this.setupViewportGuard();
   }
 
@@ -350,6 +437,11 @@ class GlassyUIController implements UIController {
 
   show(screen: ScreenName): void {
     this.currentScreen = screen;
+    // Leaving home closes the sheet instantly — nothing to animate, the
+    // screen it lives on is about to disappear anyway.
+    if (screen !== 'home' && this.settingsOpen) {
+      this.setSettingsOpen(false, { focusTrigger: false });
+    }
     this.applyScreen(screen);
   }
 
@@ -428,12 +520,12 @@ class GlassyUIController implements UIController {
         if (progress !== null) {
           const pct = Math.round(Math.min(1, Math.max(0, progress)) * 100);
           this.visionStatusTextEl.textContent = `Downloading on-device AI… ${pct}%`;
-          this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+          this.visionProgressEl.classList.remove('toggle__progress--indeterminate');
           this.visionProgressFillEl.style.width = `${pct}%`;
         } else {
           // No progress figure yet — show real motion, never a fabricated number.
           this.visionStatusTextEl.textContent = 'Downloading on-device AI…';
-          this.visionProgressEl.classList.add('vision__progress--indeterminate');
+          this.visionProgressEl.classList.add('toggle__progress--indeterminate');
           this.visionProgressFillEl.style.width = '';
         }
         break;
@@ -441,13 +533,13 @@ class GlassyUIController implements UIController {
       case 'ready':
         this.visionStatusEl.removeAttribute('hidden');
         this.visionProgressEl.setAttribute('hidden', '');
-        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        this.visionProgressEl.classList.remove('toggle__progress--indeterminate');
         this.visionStatusTextEl.textContent = 'On-device AI ready.';
         break;
       case 'unavailable':
         this.visionStatusEl.removeAttribute('hidden');
         this.visionProgressEl.setAttribute('hidden', '');
-        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        this.visionProgressEl.classList.remove('toggle__progress--indeterminate');
         this.visionStatusTextEl.textContent =
           "Detection couldn't start — the game plays normally without it.";
         break;
@@ -455,10 +547,18 @@ class GlassyUIController implements UIController {
       case 'disabled':
         this.visionStatusEl.setAttribute('hidden', '');
         this.visionProgressEl.setAttribute('hidden', '');
-        this.visionProgressEl.classList.remove('vision__progress--indeterminate');
+        this.visionProgressEl.classList.remove('toggle__progress--indeterminate');
         break;
       default:
         break;
+    }
+  }
+
+  setMotionCues(enabled: boolean): void {
+    if (enabled === this.lastMotionCues) return;
+    this.lastMotionCues = enabled;
+    for (const btn of this.motionCuesButtons) {
+      btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
     }
   }
 
@@ -495,6 +595,13 @@ class GlassyUIController implements UIController {
       }
     }
 
+    // The settings sheet overrides the home screen's own default focus
+    // target while it's open — it owns focus, not the Play button.
+    if (screen === 'home' && this.settingsOpen) {
+      this.focusSettingsClose();
+      return;
+    }
+
     const target =
       screen === 'permission'
         ? this.hasCameraFailure
@@ -507,6 +614,42 @@ class GlassyUIController implements UIController {
       } catch {
         // Focus can fail in exotic embedding contexts; never fatal.
       }
+    }
+  }
+
+  /**
+   * Opens/closes the "About" sheet. Purely presentational: this never
+   * touches game state or preferences, and never emits a UIIntent by itself
+   * — only the toggles and buttons inside it do that.
+   */
+  private setSettingsOpen(open: boolean, options: { focusTrigger: boolean }): void {
+    this.settingsOpen = open;
+    if (open) {
+      this.settingsSheetEl.removeAttribute('hidden');
+      this.homeMainEl.setAttribute('inert', '');
+      this.settingsButtonEl.setAttribute('aria-expanded', 'true');
+      this.focusSettingsClose();
+    } else {
+      this.settingsSheetEl.setAttribute('hidden', '');
+      this.homeMainEl.removeAttribute('inert');
+      this.settingsButtonEl.setAttribute('aria-expanded', 'false');
+      if (options.focusTrigger) {
+        try {
+          this.settingsButtonEl.focus({ preventScroll: true });
+        } catch {
+          // Never fatal.
+        }
+      }
+    }
+  }
+
+  private focusSettingsClose(): void {
+    const closeButton = this.settingsCloseButtons[0];
+    if (!closeButton) return;
+    try {
+      closeButton.focus({ preventScroll: true });
+    } catch {
+      // Never fatal.
     }
   }
 
@@ -540,6 +683,15 @@ class GlassyUIController implements UIController {
       case 'toggle-vision':
         this.intents.onToggleVision();
         break;
+      case 'toggle-motion-cues':
+        this.intents.onToggleMotionCues();
+        break;
+      case 'toggle-settings':
+        this.setSettingsOpen(!this.settingsOpen, { focusTrigger: true });
+        break;
+      case 'close-settings':
+        this.setSettingsOpen(false, { focusTrigger: true });
+        break;
       case 'play-without-camera-pre':
       case 'play-without-camera-fail':
         this.intents.onPlayWithoutCamera();
@@ -548,10 +700,20 @@ class GlassyUIController implements UIController {
         this.intents.onRetryCamera();
         break;
       case 'play-demo':
+        // The demo can be launched from the settings sheet on home; close it
+        // first so the click doesn't leave a stray open sheet on whatever
+        // screen we land on next.
+        if (this.settingsOpen) this.setSettingsOpen(false, { focusTrigger: false });
         this.intents.onPlayDemoVideo();
         break;
       default:
         break;
+    }
+  };
+
+  private readonly handleKeydown = (event: KeyboardEvent): void => {
+    if (event.key === 'Escape' && this.settingsOpen) {
+      this.setSettingsOpen(false, { focusTrigger: true });
     }
   };
 

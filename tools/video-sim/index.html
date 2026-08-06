@@ -74,9 +74,24 @@
           ctx.setLineDash(o.stable ? [] : [4, 4]);
           ctx.strokeRect(x, y, w, hh);
           ctx.setLineDash([]);
+
+          // The REFINED roof line (RoofFinder), drawn distinctly from the
+          // raw box top: bright yellow, only across surfaceLeft..surfaceRight
+          // rather than the box's full width, so a landing surface that is
+          // narrower than the box is visibly narrower on screen too.
+          const sx = o.surfaceLeft * overlay.width;
+          const sw = (o.surfaceRight - o.surfaceLeft) * overlay.width;
+          const sy = o.surfaceY * overlay.height;
+          ctx.strokeStyle = o.stable ? '#ffe234' : 'rgba(255,226,52,0.5)';
+          ctx.lineWidth = o.stable ? 3 : 1.5;
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(sx + sw, sy);
+          ctx.stroke();
+
           if (o.stable) {
             ctx.fillStyle = '#39ff88';
-            ctx.fillRect(x, y - 3, w, 4);       // the landing surface
+            ctx.fillRect(x, y - 3, w, 4);       // the raw box top, for comparison
             ctx.font = 'bold 12px monospace';
             ctx.fillText(`#${o.id} ${o.kind}`, x + 3, y - 8);
           }
@@ -117,7 +132,9 @@
           for (const o of tracked) {
             log.tracked.push({ t: +video.currentTime.toFixed(2), id: o.id, kind: o.kind,
               x: +o.x.toFixed(3), y: +o.y.toFixed(3), w: +o.width.toFixed(3),
-              h: +o.height.toFixed(3), stable: o.stable });
+              h: +o.height.toFixed(3), stable: o.stable,
+              surfaceY: +o.surfaceY.toFixed(3), surfaceLeft: +o.surfaceLeft.toFixed(3),
+              surfaceRight: +o.surfaceRight.toFixed(3) });
           }
         },
         onDetections: (dets) => {
