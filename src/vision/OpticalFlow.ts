@@ -70,14 +70,14 @@
  *      there" in a driving scene. Adjacent flagged blocks are flood-filled
  *      into boxes and handed out as candidates.
  *   5. Reject the obvious junk before any of the above sees it: the bonnet
- *      at the bottom of frame (excluded by row), and — this is the
- *      important one — anything with too little texture to match reliably.
- *      A flat grey road or the sky gives a confident-LOOKING but meaningless
- *      match (every candidate shift scores about the same), so blocks are
- *      gated on match QUALITY (how much the winning shift stands out from
- *      the rest) and on raw texture variance, not on the winning shift
- *      alone. This one gate is what keeps the sky and a featureless lane out
- *      without hand-picking a fixed "sky region".
+ *      at the bottom of frame and a sky band at the top (both excluded by
+ *      row — see the honest note below on why the sky needed a row cutoff
+ *      after all, not just a texture gate), and — this is the important
+ *      one — anything with too little texture to match reliably. A flat
+ *      grey road gives a confident-LOOKING but meaningless match (every
+ *      candidate shift scores about the same), so blocks are gated on
+ *      match QUALITY (how much the winning shift stands out from the rest)
+ *      and on raw texture variance, not on the winning shift alone.
  *
  * HONESTY. This cannot say "that is a truck" — it has no concept of objects,
  * only of "this patch of pixels moved differently than the road did". It
@@ -90,6 +90,19 @@
  * `DetectedKind`'s `'vehicle'` bucket means in this game. It is never
  * `'person'` or `'sign'`; optical flow alone cannot tell those apart from a
  * car-sized static object, and guessing would be worse than not guessing.
+ *
+ * A second, more structural honesty note, from testing this against real
+ * dashcam footage: the residual model in step 4 only knows one depth for
+ * the whole "static world" — the road surface's own expansion rate. A
+ * roadside embankment, an overpass, a hillside or a streetlight are ALSO
+ * static, but they sit at a different depth/height than the road, so they
+ * ALSO produce a real, honest residual against that single-depth model —
+ * not because they're independently moving, but because a flat-road-plane
+ * assumption doesn't hold off the road. That shows up as false positives
+ * concentrated in the upper third of frame and along roadside structure,
+ * which is what `SKY_MARGIN_FRACTION` and the cluster shape/size sanity
+ * checks in step 4's box-building are for — cheap backstops, not a real
+ * fix. See the module report for how much junk got through anyway.
  */
 
 import type { DetectedKind, Detection } from '../types.ts';
@@ -123,6 +136,18 @@ const SEARCH_RADIUS = 6;
 /** Ignore the bottom slice of frame — the bonnet/dashboard, always present,
  * nearly static regardless of ego-motion, and not part of the road ahead. */
 const BONNET_MARGIN_FRACTION = 0.12;
+/**
+ * Ignore the top slice of frame — measured against real footage (see the
+ * module report), this is overwhelmingly sky, and sky is exactly the
+ * "textureless" case the quality gate is meant to catch, EXCEPT for a thin
+ * high-contrast edge (a streetlight arm, a wire, a treeline against blue)
+ * which passes the texture/quality gate easily while telling the radial
+ * model nothing useful — it sits far from the road's depth, so it reads as
+ * a confident "deviant" candidate despite being static roadside furniture,
+ * not a vehicle. Excluding the row band outright is a coarser, cheaper fix
+ * than trying to model sky depth.
+ */
+const SKY_MARGIN_FRACTION = 0.15;
 
 /**
  * Peak-to-mean SAD contrast (0..1, see `matchBlock`) below which a block's
@@ -196,6 +221,18 @@ const RESIDUAL_REL_FACTOR = 0.6;
  * a single stray block is exactly the kind of one-off noise this whole
  * design tries to avoid trusting. */
 const MIN_CLUSTER_BLOCKS = 2;
+/**
+ * Cluster shape/size sanity backstop against the single-depth false
+ * positives described in the file header's HONESTY note: a real vehicle at
+ * a plausible distance reads as a roughly car-shaped box, not a sliver
+ * (a streetlight, a wire) or a strip spanning most of the frame width
+ * (an embankment, an overpass edge). Cheap and imperfect on purpose — this
+ * is a backstop, not a shape classifier.
+ */
+const MAX_CLUSTER_ASPECT = 3.2;
+const MIN_CLUSTER_ASPECT = 1 / 3.2;
+const MAX_CLUSTER_WIDTH_FRACTION = 0.5;
+const MAX_CLUSTER_HEIGHT_FRACTION = 0.5;
 /** Hard cap on candidates handed out per tick. */
 const MAX_CANDIDATES = 8;
 
@@ -636,6 +673,7 @@ export function createOpticalFlow(options: OpticalFlowOptions): OpticalFlow {
       }
 
       const bonnetRowStart = Math.floor(gridRows * (1 - BONNET_MARGIN_FRACTION));
+      const skyRowEnd = Math.ceil(gridRows * SKY_MARGIN_FRACTION);
 
       // Pass 1: block matching.
       for (let r = 0; r < gridRows; r++) {
@@ -646,8 +684,9 @@ export function createOpticalFlow(options: OpticalFlowOptions): OpticalFlow {
           flowField.dy[i] = matchDy;
           flowField.quality[i] = matchQuality;
           const inBonnet = r >= bonnetRowStart;
+          const inSky = r < skyRowEnd;
           blockValid[i] =
-            !inBonnet && matchQuality >= MIN_BLOCK_QUALITY && matchVariance >= MIN_TEXTURE_VARIANCE ? 1 : 0;
+            !inBonnet && !inSky && matchQuality >= MIN_BLOCK_QUALITY && matchVariance >= MIN_TEXTURE_VARIANCE ? 1 : 0;
         }
       }
 
@@ -889,6 +928,12 @@ export function createOpticalFlow(options: OpticalFlowOptions): OpticalFlow {
           const right = (maxCol + 1) / gridCols;
           const top = minRow / gridRows;
           const bottom = (maxRow + 1) / gridRows;
+          const boxWidth = right - left;
+          const boxHeight = bottom - top;
+          if (boxWidth > MAX_CLUSTER_WIDTH_FRACTION || boxHeight > MAX_CLUSTER_HEIGHT_FRACTION) continue;
+          const aspect = boxWidth / Math.max(boxHeight, EPSILON);
+          if (aspect > MAX_CLUSTER_ASPECT || aspect < MIN_CLUSTER_ASPECT) continue;
+
           const slot = candidatesPool[candidatesLive.length];
           if (!slot) continue;
           slot.kind = CANDIDATE_KIND;
