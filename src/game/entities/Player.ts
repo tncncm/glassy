@@ -15,6 +15,10 @@ import { Container, Graphics } from 'pixi.js';
 import {
   AIRBORNE_LEG_ANGLE,
   COYOTE_TIME_SECONDS,
+  CROSSING_COYOTE_TIME_SECONDS,
+  CROSSING_EDGE_WARNING_TINT,
+  CROSSING_JUMP_BUFFER_SECONDS,
+  CROSSING_WALK_SPEED,
   DASH_COOLDOWN_SECONDS,
   DASH_DECAY_RATE,
   DASH_INDICATOR_CHARGING_ALPHA_MIN,
@@ -58,7 +62,7 @@ import {
   SLAM_DROP_SPEED,
   SQUASH_STRETCH_RATE,
 } from '../config.ts';
-import { clamp, expDecay, lerp } from '../util/math.ts';
+import { clamp, expDecay, lerp, lerpColor } from '../util/math.ts';
 
 /** Builds one leg/arm: a small pivoting container with the limb drawn
  * hanging down from its local origin, so rotating the container swings it
@@ -128,6 +132,29 @@ export class Player {
   private dashCooldownTimer = 0;
   /** True from the moment a slam triggers until the player lands. */
   private isSlamming = false;
+
+  // --- Crossing-mode-only state (see updateCrossing/resetForCrossing and
+  // the other crossing-only methods below). The runner's own update()/
+  // resetToIdle()/launchJump() never read or write any of these fields, so
+  // 'runner' mode is provably unaffected by their existence. ---
+
+  /** World-space horizontal velocity, px/s, positive = rightward on screen
+   * (screen space, NOT mirrored by facing — unlike the runner, crossing
+   * mode's player genuinely moves left/right, so unlike `velocityY` there is
+   * no runner equivalent to reuse). Driven directly while grounded (see
+   * setWalkVelocity), carried ballistically (unchanged) while airborne. */
+  private velocityX = 0;
+  /** Which way the rig faces — true = unmirrored (the art's native
+   * "runs right" orientation, see the constructor's dash-trail comment),
+   * false = mirrored. The runner permanently mirrors (always false,
+   * decided once in resetToIdle/update); crossing flips this live to track
+   * the player's actual direction of travel. */
+  private facingRight = true;
+  /** Buffered directional-jump velocity, consumed by the same
+   * jumpBufferTimer the runner's plain vertical jump already uses — see
+   * requestDirectionalJump(). */
+  private pendingJumpVX = 0;
+  private pendingJumpVY = 0;
 
   constructor() {
     const bodyHeight = PLAYER_HEIGHT - PLAYER_LEG_LENGTH;
@@ -260,6 +287,12 @@ export class Player {
     this.dashInvulnTimer = 0;
     this.dashCooldownTimer = 0;
     this.isSlamming = false;
+    this.velocityX = 0;
+    // Undo any crossing-mode hiding of the dash rig (see resetForCrossing) —
+    // runner mode always shows it. Also clear any edge-carry warning tint
+    // left over from a crossing-mode switch (see setEdgeWarningIntensity).
+    this.dashIndicator.visible = true;
+    this.body.tint = 0xffffff;
     for (let i = 0; i < this.dashTrailStreaks.length; i++) {
       this.dashTrailStreaks[i]!.alpha = 0;
     }
@@ -385,6 +418,214 @@ export class Player {
     this.isSlamming = false;
     this.squashX = JUMP_SQUASH_SCALE_X;
     this.squashY = JUMP_SQUASH_SCALE_Y;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Crossing mode only — see the field-group comment above for the      */
+  /* isolation argument. Nothing runner-mode calls (update, resetToIdle,  */
+  /* requestJump, launchJump, ...) reads any field only these methods     */
+  /* write, and vice versa, so the two physics models can never interfere.*/
+  /* ------------------------------------------------------------------ */
+
+  /** Stand at a fixed world position (e.g. the start block) facing a given
+   * direction — the crossing-mode equivalent of resetToIdle(). */
+  resetForCrossing(x: number, y: number, facingRight: boolean): void {
+    this.originX = x;
+    this.airborneHeight = 0;
+    this.velocityY = 0;
+    this.velocityX = 0;
+    this.grounded = true;
+    this.coyoteTimer = 0;
+    this.jumpBufferTimer = 0;
+    this.pendingJumpVX = 0;
+    this.pendingJumpVY = 0;
+    this.hasDoubleJumped = false;
+    this.runPhase = 0;
+    this.squashX = 1;
+    this.squashY = 1;
+    this.footY = y;
+    this.facingRight = facingRight;
+    this.legLeft.rotation = 0;
+    this.legRight.rotation = 0;
+    this.arm.rotation = 0;
+    this.view.x = x;
+    this.view.y = y;
+    this.view.scale.set(facingRight ? 1 : -1, 1);
+    this.justJumped = false;
+    this.justDoubleJumped = false;
+    this.justLanded = false;
+    this.justDashed = false;
+    this.justSlamLanded = false;
+    this.dashRequested = false;
+    this.slamRequested = false;
+    this.dashBoost = 0;
+    this.dashInvulnTimer = 0;
+    this.dashCooldownTimer = 0;
+    this.isSlamming = false;
+    // The dash mechanic doesn't exist in crossing mode — hide its rig
+    // entirely rather than let a stale "ready" indicator float over the
+    // player's head for a mode that never reads dashRequested. Restored by
+    // resetToIdle() if the player switches back to 'runner'.
+    this.dashIndicator.visible = false;
+    this.body.tint = 0xffffff;
+    for (let i = 0; i < this.dashTrailStreaks.length; i++) {
+      this.dashTrailStreaks[i]!.alpha = 0;
+    }
+  }
+
+  /** Crossing-mode-only: tints the body toward CROSSING_EDGE_WARNING_TINT as
+   * `intensity` (0..1) rises — the visible telegraph Game.ts drives before a
+   * platform carrying the player horizontally off the frame ends the run.
+   * `0` clears it back to neutral. A cheap tint write, never a redraw. */
+  setEdgeWarningIntensity(intensity: number): void {
+    this.body.tint = lerpColor(0xffffff, CROSSING_EDGE_WARNING_TINT, intensity);
+  }
+
+  /** Grounded-only lateral control: set every frame from the current input
+   * state (0 when nothing is held) — NOT a one-shot request like
+   * requestJump. Airborne calls are silently ignored, which is what gives
+   * an in-flight jump its ballistic, no-air-control feel: velocityX only
+   * ever changes here or at the instant a jump launches. */
+  setWalkVelocity(vx: number): void {
+    if (!this.grounded) return;
+    this.velocityX = vx;
+    if (vx > 1) this.facingRight = true;
+    else if (vx < -1) this.facingRight = false;
+  }
+
+  /** Passive horizontal nudge — used to carry the player along with the
+   * real/ghost platform box they're currently riding, so a drifting vehicle
+   * can visibly carry them toward (or off) an edge, not just support them
+   * vertically. Not gated on `grounded` internally: callers (Game.ts) only
+   * invoke this while a platform is actively selected as the current
+   * standing surface, which already implies it. */
+  driftX(dx: number): void {
+    this.originX += dx;
+  }
+
+  /** Buffers an aim-and-release jump; consumed on the next updateCrossing()
+   * where the player is grounded or within coyote time — same
+   * buffer-then-consume shape as requestJump()/the runner's jumpBufferTimer,
+   * just carrying a velocity vector instead of a fixed constant. */
+  requestDirectionalJump(vx: number, vy: number): void {
+    this.jumpBufferTimer = CROSSING_JUMP_BUFFER_SECONDS;
+    this.pendingJumpVX = vx;
+    this.pendingJumpVY = vy;
+  }
+
+  /**
+   * Free 2D physics step: gravity + vertical integration exactly like
+   * update()'s, PLUS horizontal integration (the runner's x never moves).
+   * `surfaceY` plays the same role `groundY` does in update() — the
+   * currently-resolved landing surface's top, in the same relative-height
+   * encoding syncGroundReference() rebases onto for a pop-free switch
+   * between surfaces (a real platform's glide, a ghost's drift, or either
+   * anchor block). See Game.ts's crossing surface-resolution block, which
+   * mirrors the runner's one-way resolution but adds the generous landing
+   * assist the brief requires.
+   *
+   * `surfaceAvailable` is what keeps this genuinely different from the
+   * runner's update(): the runner ALWAYS has a real ground line to compare
+   * `airborneHeight <= 0` against, so reaching it always means "landed".
+   * Crossing mode has no such universal floor — when Game.ts's resolution
+   * found no qualifying platform this frame, `surfaceY` is just whatever
+   * height was last recorded (frozen, per that resolution's own doc), and
+   * `airborneHeight` mathematically returns to exactly 0 there the instant
+   * ANY jump arcs back down through its own launch height — a phantom floor
+   * with nothing under it. Landing must only ever happen when Game.ts says
+   * there is actually something to land ON; otherwise this keeps `grounded`
+   * false and lets `airborneHeight` run past zero into negative territory,
+   * which is exactly "falling further below the frozen reference" — i.e.
+   * genuinely falling, unobstructed, toward the fall-below-frame loss.
+   */
+  updateCrossing(dt: number, surfaceY: number, surfaceAvailable: boolean): void {
+    this.justJumped = false;
+    this.justLanded = false;
+    // Runner-only flags (dash/slam don't exist in crossing mode) — cleared
+    // every frame here too so a flag left true from a mode switch mid-gesture
+    // can never read as a stale event to crossing-mode code.
+    this.justDoubleJumped = false;
+    this.justDashed = false;
+    this.justSlamLanded = false;
+
+    this.velocityY -= GRAVITY * dt;
+    this.airborneHeight += this.velocityY * dt;
+    this.originX += this.velocityX * dt;
+
+    if (surfaceAvailable && this.airborneHeight <= 0) {
+      const wasAirborne = !this.grounded;
+      this.airborneHeight = 0;
+      this.velocityY = 0;
+      // Land cleanly, no residual slide — keeps "which surface is the
+      // player standing on" unambiguous for the frame right after landing.
+      this.velocityX = 0;
+      this.grounded = true;
+      this.coyoteTimer = CROSSING_COYOTE_TIME_SECONDS;
+      if (wasAirborne) {
+        this.justLanded = true;
+        this.squashX = LAND_SQUASH_SCALE_X;
+        this.squashY = LAND_SQUASH_SCALE_Y;
+      }
+    } else {
+      this.grounded = false;
+      if (this.coyoteTimer > 0) {
+        this.coyoteTimer = Math.max(0, this.coyoteTimer - dt);
+      }
+    }
+
+    if (this.jumpBufferTimer > 0) {
+      if (this.grounded || this.coyoteTimer > 0) {
+        this.launchCrossingJump(this.pendingJumpVX, this.pendingJumpVY);
+        this.justJumped = true;
+      } else {
+        this.jumpBufferTimer = Math.max(0, this.jumpBufferTimer - dt);
+      }
+    }
+
+    this.footY = surfaceY - this.airborneHeight;
+
+    const relax = expDecay(SQUASH_STRETCH_RATE, dt);
+    this.squashX = lerp(this.squashX, 1, relax);
+    this.squashY = lerp(this.squashY, 1, relax);
+
+    if (this.grounded) {
+      const walkRatio = clamp(Math.abs(this.velocityX) / CROSSING_WALK_SPEED, 0, 1);
+      const poseRelax = expDecay(SQUASH_STRETCH_RATE, dt);
+      if (walkRatio > 0.02) {
+        this.runPhase += RUN_CYCLE_BASE_SPEED * Math.max(0.4, walkRatio) * dt;
+        const swing = Math.sin(this.runPhase) * RUN_LEG_SWING_RADIANS;
+        this.legLeft.rotation = swing;
+        this.legRight.rotation = -swing;
+        this.arm.rotation = -swing * 0.6;
+      } else {
+        this.legLeft.rotation = lerp(this.legLeft.rotation, 0, poseRelax);
+        this.legRight.rotation = lerp(this.legRight.rotation, 0, poseRelax);
+        this.arm.rotation = lerp(this.arm.rotation, 0, poseRelax);
+      }
+    } else {
+      const poseRelax = expDecay(SQUASH_STRETCH_RATE, dt);
+      this.legLeft.rotation = lerp(this.legLeft.rotation, AIRBORNE_LEG_ANGLE, poseRelax);
+      this.legRight.rotation = lerp(this.legRight.rotation, AIRBORNE_LEG_ANGLE, poseRelax);
+      this.arm.rotation = lerp(this.arm.rotation, -AIRBORNE_LEG_ANGLE * 0.6, poseRelax);
+    }
+
+    this.view.x = this.originX;
+    this.view.y = this.footY;
+    // Unlike the runner's permanent mirror, crossing faces the player's
+    // actual direction of travel (see the `facingRight` field doc).
+    this.view.scale.set((this.facingRight ? 1 : -1) * this.squashX, this.squashY);
+  }
+
+  private launchCrossingJump(vx: number, vy: number): void {
+    this.velocityX = vx;
+    this.velocityY = vy;
+    this.grounded = false;
+    this.coyoteTimer = 0;
+    this.jumpBufferTimer = 0;
+    this.squashX = JUMP_SQUASH_SCALE_X;
+    this.squashY = JUMP_SQUASH_SCALE_Y;
+    if (vx > 0.01) this.facingRight = true;
+    else if (vx < -0.01) this.facingRight = false;
   }
 
   /** Color/alpha of the dash-ready indicator dot — the only per-frame touch

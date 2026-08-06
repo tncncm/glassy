@@ -52,6 +52,9 @@ export interface Preferences {
   /** Which way the phone is pointed. Defaults to 'window'. */
   getVisionMode(): VisionMode;
   setVisionMode(mode: VisionMode): void;
+  /** Which game is being played. Defaults to 'runner'. */
+  getGameMode(): GameMode;
+  setGameMode(mode: GameMode): void;
 }
 
 /* ------------------------------------------------------------------ */
@@ -246,6 +249,19 @@ export interface TrackedObject {
   stable: boolean;
 }
 
+/**
+ * Two genuinely different games sharing one engine.
+ *
+ * 'runner' is the validated endless runner: the world scrolls, the player runs
+ * at a fixed x, detections only flavour what spawns.
+ *
+ * 'crossing' needs windscreen framing. The camera IS the level: the player
+ * starts on a fixed block at the left edge and must reach a fixed block at the
+ * right, hopping across real vehicles. Nothing scrolls; falling off the bottom
+ * ends the attempt.
+ */
+export type GameMode = 'runner' | 'crossing';
+
 export type DetectorStatus =
   /** Never asked to load. */
   | 'idle'
@@ -399,6 +415,11 @@ export interface Game {
   onTrackedObjects(objects: readonly TrackedObject[]): void;
   /** Changes how detections are used. See VisionMode. */
   setVisionMode(mode: VisionMode): void;
+  /**
+   * Switch between the endless runner and the crossing game. 'crossing' only
+   * makes sense with windscreen framing; the caller enforces that pairing.
+   */
+  setGameMode(mode: GameMode): void;
   /** Tear down Pixi and remove all listeners. */
   destroy(): void;
 }
@@ -448,6 +469,8 @@ export interface UIIntents {
   onToggleVision(): void;
   /** The user switched between side-window and windscreen framing. */
   onSelectVisionMode(mode: VisionMode): void;
+  /** The user chose the runner or the crossing game. */
+  onSelectGameMode(mode: GameMode): void;
 }
 
 export interface UIController {
@@ -472,6 +495,8 @@ export interface UIController {
   setDetectorState(state: DetectorState): void;
   /** Reflect the current framing choice in the mode selector. */
   setVisionMode(mode: VisionMode): void;
+  /** Reflect the current game choice in the selector. */
+  setGameMode(mode: GameMode): void;
   /**
    * Show the "Add to Home Screen" hint. Only meaningful on iOS Safari, where
    * the Fullscreen API does not exist and installing the PWA is the only way

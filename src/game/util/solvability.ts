@@ -60,6 +60,7 @@
  */
 
 import {
+  CROSSING_MAX_JUMP_HORIZONTAL_FRACTION,
   DASH_INVULN_SECONDS,
   GAP_REACTION_TIME_SECONDS,
   GAP_SAFETY_FACTOR,
@@ -214,3 +215,63 @@ export function maxDashClearableObstacleWidth(worldSpeed: number): number {
  */
 export const OVERHEAD_HAZARD_CLEARANCE_PX =
   PLAYER_HEIGHT - PLAYER_COLLISION_INSET_TOP + OVERHEAD_CLEARANCE_MARGIN_PX;
+
+/* ------------------------------------------------------------------ */
+/* Crossing mode — free 2D aim-and-release jumps, no world scroll.      */
+/*                                                                      */
+/* Unlike the runner (fixed player x, jump is purely vertical, obstacle */
+/* geometry is derived from a fixed jump), crossing mode launches the   */
+/* player at an arbitrary angle and power the player themselves choose. */
+/* What has to be DERIVED here instead is: (a) the launch-speed cap that */
+/* keeps a single full-power jump from crossing the whole screen, and   */
+/* (b) given that cap, the farthest horizontal distance a jump can ever  */
+/* cover between two points at a given height difference — which is     */
+/* exactly the number the ghost-platform fallback (CrossingSystem) needs */
+/* to GUARANTEE a spawned chain is actually reachable, the same role     */
+/* `minSafeGap` plays for the runner.                                    */
+/*                                                                        */
+/* Both use the up-positive vertical convention Player.ts already uses   */
+/* (velocityY > 0 means moving up) — GRAVITY decelerates it exactly as it */
+/* does there. Canvas-space px (y increases downward) map onto it as     */
+/* `dropPx = landingCanvasY - launchCanvasY` (positive when landing is    */
+/* BELOW the launch point), which is what the functions below expect.    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Launch-speed cap (px/s) for a full-power crossing jump, derived from
+ * CROSSING_MAX_JUMP_HORIZONTAL_FRACTION so "a single jump can't cross the
+ * whole screen" holds on any canvas size. Inverts the classic same-height
+ * projectile range formula `range = v^2 / g` (maximised at a 45° launch
+ * angle) for the range we're willing to allow:
+ * `maxRangePx = canvasWidth * CROSSING_MAX_JUMP_HORIZONTAL_FRACTION`, so
+ * `v = sqrt(maxRangePx * g)`.
+ */
+export function crossingMaxJumpSpeed(canvasWidth: number): number {
+  const maxRangePx = canvasWidth * CROSSING_MAX_JUMP_HORIZONTAL_FRACTION;
+  return Math.sqrt(maxRangePx * GRAVITY);
+}
+
+/**
+ * Farthest horizontal distance (px) a full-power crossing jump (speed
+ * `crossingMaxJumpSpeed(canvasWidth)`) can cover, MAXIMISED OVER LAUNCH
+ * ANGLE, between a launch point and a landing point `dropPx` BELOW it
+ * (negative `dropPx` = landing is ABOVE launch). This is the closed-form
+ * solution to "maximum projectile range to a target at a given height
+ * difference": for launch speed v, gravity g and up-positive height
+ * difference `h = -dropPx` (target height relative to launch),
+ *
+ *   R = (v / g) * sqrt(v^2 - 2*g*h) = (v / g) * sqrt(v^2 + 2*g*dropPx)
+ *
+ * which reduces to the plain `v^2/g` range formula when dropPx = 0 (same
+ * height), and correctly GROWS for a lower landing point (more fall time =
+ * more range) and SHRINKS for a higher one. Returns 0 if the landing point
+ * is higher than this jump could ever reach regardless of angle (i.e. the
+ * term under the root would be negative) — that target simply isn't
+ * reachable by a full-power jump from this launch height, at any distance.
+ */
+export function crossingMaxHorizontalReach(canvasWidth: number, dropPx: number): number {
+  const v = crossingMaxJumpSpeed(canvasWidth);
+  const term = v * v + 2 * GRAVITY * dropPx;
+  if (term <= 0) return 0;
+  return (v / GRAVITY) * Math.sqrt(term);
+}

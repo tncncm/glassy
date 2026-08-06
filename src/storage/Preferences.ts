@@ -1,18 +1,19 @@
 /**
  * localStorage wrapper — the ONLY four values Glassy ever persists:
- * `bestScore`, `muted`, `visionEnabled`, `visionMode`. Nothing else.
+ * `bestScore`, `muted`, `visionEnabled`, `visionMode`, `gameMode`. Nothing else.
  *
  * Every read and write is wrapped in try/catch: Safari private mode throws on
  * write (and some private-mode configurations throw on read too). On any
  * failure we fall back to an in-memory value so the app keeps working.
  */
 
-import type { Preferences, VisionMode } from '../types.ts';
+import type { GameMode, Preferences, VisionMode } from '../types.ts';
 
 const BEST_SCORE_KEY = 'bestScore';
 const MUTED_KEY = 'muted';
 const VISION_ENABLED_KEY = 'visionEnabled';
 const VISION_MODE_KEY = 'visionMode';
+const GAME_MODE_KEY = 'gameMode';
 
 function parseBestScore(raw: string | null): number {
   if (raw === null) return 0;
@@ -35,6 +36,11 @@ function parseVisionEnabled(raw: string | null): boolean {
 // Defensive parsing: anything that isn't exactly one of the two known modes
 // (missing key, corrupted value, a future/former variant) falls back to the
 // 'window' default rather than propagating garbage into the game layer.
+/** Anything that isn't the literal 'crossing' falls back to the runner. */
+function parseGameMode(raw: string | null): GameMode {
+  return raw === 'crossing' ? 'crossing' : 'runner';
+}
+
 function parseVisionMode(raw: string | null): VisionMode {
   return raw === 'windscreen' ? 'windscreen' : 'window';
 }
@@ -102,6 +108,25 @@ export function createPreferences(): Preferences {
     }
   }
 
+  let memoryGameMode: GameMode = 'runner';
+
+  function readGameMode(): GameMode {
+    try {
+      return parseGameMode(window.localStorage.getItem(GAME_MODE_KEY));
+    } catch {
+      return memoryGameMode;
+    }
+  }
+
+  function writeGameMode(value: GameMode): void {
+    memoryGameMode = value;
+    try {
+      window.localStorage.setItem(GAME_MODE_KEY, value);
+    } catch {
+      // Safari private mode (or any storage failure): keep the in-memory copy.
+    }
+  }
+
   function readVisionMode(): VisionMode {
     try {
       return parseVisionMode(window.localStorage.getItem(VISION_MODE_KEY));
@@ -149,6 +174,12 @@ export function createPreferences(): Preferences {
     },
     setVisionMode(mode: VisionMode): void {
       writeVisionMode(mode);
+    },
+    getGameMode(): GameMode {
+      return readGameMode();
+    },
+    setGameMode(mode: GameMode): void {
+      writeGameMode(mode);
     },
   };
 }

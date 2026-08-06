@@ -12,11 +12,21 @@
  */
 
 import { Application, Container, Graphics, Text } from 'pixi.js';
-import type { CreateGame, Detection, Game, GameOptions, GameOverResult, GameStatus, TrackedObject, VisionMode } from '../types.ts';
+import type { CreateGame, Detection, Game, GameMode, GameOptions, GameOverResult, GameStatus, TrackedObject, VisionMode } from '../types.ts';
 import {
   BASE_WORLD_SPEED,
   COLLECTIBLE_SCORE_BONUS,
   COLLISION_SHAKE_TRAUMA,
+  CROSSING_EDGE_MARGIN_PX,
+  CROSSING_EDGE_WARNING_SECONDS,
+  CROSSING_FALL_MARGIN_PX,
+  CROSSING_LANDING_ASSIST_HORIZONTAL_PX,
+  CROSSING_LANDING_ASSIST_VERTICAL_PX,
+  CROSSING_MIN_JUMP_VERTICAL_FRACTION,
+  CROSSING_SCORE_BONUS_PER_CROSSING,
+  CROSSING_SCORE_PER_PIXEL_PROGRESS,
+  CROSSING_SCORE_PER_SECOND,
+  CROSSING_WALK_SPEED,
   DASH_THROUGH_BONUS_SCORE,
   DASH_THROUGH_SHAKE_TRAUMA,
   DEBUG_TEXT_COLOR,
@@ -57,12 +67,57 @@ import {
 import { Player } from './entities/Player.ts';
 import type { Platform } from './entities/Platform.ts';
 import { GameLoop } from './GameLoop.ts';
+import { CrossingSystem } from './systems/CrossingSystem.ts';
 import { InputSystem } from './systems/InputSystem.ts';
 import { ObstacleSystem } from './systems/ObstacleSystem.ts';
 import { ParticleSystem } from './systems/ParticleSystem.ts';
 import { PickupSystem } from './systems/PickupSystem.ts';
 import { PlatformSystem } from './systems/PlatformSystem.ts';
 import { aabbOverlap, clamp, expDecay, lerp } from './util/math.ts';
+import { crossingMaxJumpSpeed } from './util/solvability.ts';
+
+/**
+ * Scratch object reused by computeCrossingJumpVelocity, below — never
+ * reallocated, so the per-frame keyboard-charge poll
+ * (InputSystem.updateCrossingAim → onCrossingAimChange) allocates nothing.
+ * Safe because every caller reads it synchronously, immediately after the
+ * call — the same "reused, read synchronously" contract every pooled system
+ * in this codebase already follows for its own active/reused arrays.
+ */
+const crossingJumpVelocityScratch = { vx: 0, vy: 0 };
+
+/**
+ * Converts a raw screen-space aim vector (y-down, arbitrary magnitude) plus
+ * a 0..1 power into a launch velocity in the up-positive convention
+ * Player/util/solvability.ts use. Enforces
+ * CROSSING_MIN_JUMP_VERTICAL_FRACTION so every jump has real liftoff — see
+ * that constant's doc in config.ts for why that also matters for
+ * landing-assist correctness, not just game feel.
+ */
+function computeCrossingJumpVelocity(dirX: number, dirY: number, power: number, maxSpeed: number): { vx: number; vy: number } {
+  let nx = dirX;
+  let ny = dirY;
+  let length = Math.sqrt(nx * nx + ny * ny);
+  if (length < 1e-4) {
+    // No meaningful direction (e.g. a keyboard charge released with zero
+    // held keys and no vertical bias) — default to forward-and-up.
+    nx = 1;
+    ny = -1;
+    length = Math.SQRT2;
+  }
+  nx /= length;
+  ny /= length;
+  let upVy = -ny;
+  if (upVy < CROSSING_MIN_JUMP_VERTICAL_FRACTION) {
+    upVy = CROSSING_MIN_JUMP_VERTICAL_FRACTION;
+    const horizontalMagnitude = Math.sqrt(Math.max(0, 1 - upVy * upVy));
+    nx = nx >= 0 ? horizontalMagnitude : -horizontalMagnitude;
+  }
+  const speed = clamp(power, 0, 1) * maxSpeed;
+  crossingJumpVelocityScratch.vx = nx * speed;
+  crossingJumpVelocityScratch.vy = upVy * speed;
+  return crossingJumpVelocityScratch;
+}
 
 /** Off-screen margin used to size the ground-line rects so they always
  * cover the canvas even mid-resize, without needing a per-frame redraw. */
@@ -104,6 +159,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
 
   const groundGraphics = new Graphics();
   const platformLayer = new Container();
+  const crossingLayer = new Container();
   const obstacleLayer = new Container();
   const pickupLayer = new Container();
   const particleLayer = new Container();
@@ -111,12 +167,16 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   // platformLayer sits above the ground line but below obstacles/player, so
   // a windscreen platform reads as part of the "ground" the player can
   // stand on rather than something floating in front of the action.
-  worldContainer.addChild(groundGraphics, platformLayer, obstacleLayer, pickupLayer, player.view, particleLayer);
+  // crossingLayer sits right beside it for the same reason — it's the
+  // 'crossing'-mode equivalent (see CrossingSystem) and the two are never
+  // both visible at once (see setGameMode below).
+  worldContainer.addChild(groundGraphics, platformLayer, crossingLayer, obstacleLayer, pickupLayer, player.view, particleLayer);
 
   const obstacles = new ObstacleSystem(obstacleLayer);
   const pickups = new PickupSystem(pickupLayer);
   const particles = new ParticleSystem(particleLayer);
   const platforms = new PlatformSystem(platformLayer);
+  const crossing = new CrossingSystem(crossingLayer);
 
   let debugText: Text | null = null;
   if (debug === true) {
@@ -147,6 +207,36 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
   // tracks — see the one-way surface-resolution block in update() and
   // Player.syncGroundReference's doc. `null` means "the real ground line".
   let currentSurfacePlatform: Platform | null = null;
+
+  // --- Crossing-mode-only state (see updateCrossing/setGameMode below).
+  // 'runner' mode never reads any of these — see the isolation argument in
+  // this file's setGameMode doc. ---
+  let gameMode: GameMode = 'runner';
+  /** Which platform (real/ghost/anchor block) the player currently stands
+   * on, crossing-mode's equivalent of `currentSurfacePlatform` — kept as a
+   * SEPARATE variable rather than reused, precisely so a mode switch can
+   * never accidentally carry a stale reference from one mode's resolution
+   * logic into the other's. */
+  let currentCrossingPlatform: Platform | null = null;
+  /** The height-reference `player.updateCrossing(dt, surfaceY)` integrates
+   * against — see the doc above updateCrossing() below for why this is
+   * "live while grounded/selected, frozen while genuinely airborne with no
+   * candidate" rather than always resolving to some universal fallback the
+   * way the runner's real ground line does. */
+  let crossingSurfaceReferenceY = 0;
+  /** For the horizontal "ride along with the platform" effect (see
+   * updateCrossing) — the standing platform's own center X the LAST frame it
+   * was observed, so this frame's delta can be applied to the player. Reset
+   * to `null` whenever the standing platform changes identity. */
+  let crossingRideAlongPlatform: Platform | null = null;
+  let crossingRideAlongCenterX = 0;
+  /** Seconds the player has been grounded and outside the visible frame's
+   * horizontal bounds — the edge-carry-off-frame loss telegraph (see
+   * CROSSING_EDGE_WARNING_SECONDS in config.ts). */
+  let crossingEdgeWarningTimer = 0;
+  /** player.x as of the end of the previous updateCrossing() call — the
+   * baseline the distance-progress score term measures against. */
+  let crossingLastPlayerX = 0;
 
   // --- Horizon hint state (see setHorizonHint on the returned Game) --------
   /** Latest estimate from setHorizonHint; null = no usable estimate. */
@@ -185,19 +275,25 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     canvasWidth = width;
     canvasHeight = height;
     app.renderer.resize(width, height);
-    player.setX(width * PLAYER_X_FRACTION);
+    if (gameMode === 'runner') {
+      player.setX(width * PLAYER_X_FRACTION);
+    }
     redrawGround(width);
     groundY = groundTargetPx();
     groundGraphics.y = groundY;
     // Re-project every active platform's box against the NEW canvas size
     // right away (dt=0, so no timer advances) — otherwise a platform would
     // sit at a stale pixel rect from before the resize/orientation-change
-    // until the next running update() call ticks it forward.
+    // until the next running update() call ticks it forward. Same idea for
+    // crossing mode's own anchor blocks/platforms below.
     platforms.update(0, width, height, groundY);
+    if (gameMode === 'crossing') {
+      crossing.update(0, width, height, currentCrossingPlatform);
+    }
     if (status !== 'running') {
       // Keep the idle/paused/game-over frame visually in sync with the new
       // size instead of waiting for a step that will never come.
-      if (status === 'idle') {
+      if (status === 'idle' && gameMode === 'runner') {
         player.resetToIdle(groundY);
       }
       app.render();
@@ -221,6 +317,16 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
 
   function update(dt: number): void {
     if (status !== 'running') return;
+    // 'crossing' is an entirely separate physics/world model — see
+    // updateCrossing()'s doc below. Branching here, before a single line of
+    // the runner body executes, is what makes 'runner' mode provably
+    // byte-for-byte unchanged: every statement from here to this function's
+    // closing brace is EXACTLY what shipped before 'crossing' existed, and
+    // none of it runs unless gameMode === 'runner'.
+    if (gameMode !== 'runner') {
+      updateCrossing(dt);
+      return;
+    }
 
     // --- Horizon hint: locked out for a while after any manual drag, and
     // even when accepted only ever nudges the TARGET a small fraction of
@@ -455,6 +561,214 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     app.render();
   }
 
+  /**
+   * 'crossing' mode's entire per-frame step — the counterpart to the runner
+   * body above, sharing only the Player rig, the pooled particle/audio
+   * systems, and `handleCollision()` (reused as-is for the fall/edge-carry
+   * loss: its body already only reads player.x/groundContactY/scoreInt and
+   * fires the generic particles/shake/sounds/best-score/callback, none of
+   * which is runner-specific).
+   *
+   * SURFACE RESOLUTION mirrors the runner's one-way platform rule above
+   * (same "only while not rising, pick the highest qualifying candidate"
+   * shape) but widened into a genuine landing-assist magnet
+   * (CROSSING_LANDING_ASSIST_VERTICAL_PX/HORIZONTAL_PX, generous by design —
+   * see those constants' doc) and, critically, with NO real-ground-line
+   * fallback: when nothing qualifies, `crossingSurfaceReferenceY` is left
+   * exactly where it was rather than snapping to some universal floor that
+   * doesn't exist in this mode, so free-fall physics stay perfectly
+   * continuous whether that's mid-jump-arc or genuinely falling with
+   * nothing below.
+   */
+  function updateCrossing(dt: number): void {
+    inputSystem.updateCrossingAim();
+
+    // Positions (blocks/real-track glide/ghost drift/ghost-chain fallback)
+    // are settled BEFORE resolution reads them below — same ordering as the
+    // runner's own `platforms.update()` → one-way-resolution sequence above,
+    // so the resolution loop always sees this frame's fresh boxes, not last
+    // frame's. `currentCrossingPlatform` here is still last frame's
+    // resolved surface, which is exactly the "occupied as of now" moment the
+    // never-vanish-underfoot freeze needs.
+    crossing.update(dt, canvasWidth, canvasHeight, currentCrossingPlatform);
+
+    const prevFootY = player.groundContactY;
+    const wasRising = player.verticalVelocity > 0;
+    let selectedPlatform: Platform | null = null;
+    if (!wasRising) {
+      const candidates = crossing.platforms;
+      for (let i = 0; i < candidates.length; i++) {
+        const platform = candidates[i]!;
+        if (player.x < platform.left - CROSSING_LANDING_ASSIST_HORIZONTAL_PX || player.x > platform.right + CROSSING_LANDING_ASSIST_HORIZONTAL_PX) continue;
+        if (prevFootY > platform.top + CROSSING_LANDING_ASSIST_VERTICAL_PX) continue;
+        if (selectedPlatform === null || platform.top < crossingSurfaceReferenceY) {
+          selectedPlatform = platform;
+          crossingSurfaceReferenceY = platform.top;
+        }
+      }
+    }
+    if (selectedPlatform !== null) {
+      // Ride every frame it stays selected, not just on identity change —
+      // this is what makes standing on a gliding real/ghost platform track
+      // its motion smoothly instead of only snapping in on first contact.
+      crossingSurfaceReferenceY = selectedPlatform.top;
+    }
+    if (selectedPlatform !== currentCrossingPlatform) {
+      // Deliberately does NOT rebase onto anything when the NEW surface is
+      // `null` (see this function's doc) — only a genuine new candidate
+      // ever moves the reference; losing a candidate just freezes it.
+      if (selectedPlatform !== null) {
+        player.syncGroundReference(crossingSurfaceReferenceY);
+      }
+      currentCrossingPlatform = selectedPlatform;
+    }
+
+    // Horizontal ride-along: a platform can carry the player, not just
+    // support them — required for "a vehicle carries the player off the
+    // edge" to be physically possible at all (see the edge-carry check
+    // below). Computed from the SAME platform's own delta since last frame,
+    // so walking freely on top of it still works independently.
+    if (selectedPlatform !== null) {
+      const centerX = (selectedPlatform.left + selectedPlatform.right) / 2;
+      if (crossingRideAlongPlatform === selectedPlatform) {
+        player.driftX(centerX - crossingRideAlongCenterX);
+      }
+      crossingRideAlongPlatform = selectedPlatform;
+      crossingRideAlongCenterX = centerX;
+    } else {
+      crossingRideAlongPlatform = null;
+    }
+
+    player.updateCrossing(dt, crossingSurfaceReferenceY, selectedPlatform !== null);
+    if (player.justJumped) {
+      particles.spawnDust(player.x, player.groundContactY);
+      callbacks.onSound('jump');
+      crossing.hideTrajectoryPreview();
+    }
+    if (player.justLanded) {
+      particles.spawnDust(player.x, player.groundContactY);
+      callbacks.onSound('land');
+    }
+
+    // --- Win: grounded on the currently-designated goal block. ---
+    if (selectedPlatform !== null && player.isGrounded && crossing.isGoal(selectedPlatform)) {
+      handleCrossingWin();
+      app.render();
+      return;
+    }
+
+    // --- Lose #1: fell below the visible frame. ---
+    if (player.top > canvasHeight + CROSSING_FALL_MARGIN_PX) {
+      handleCollision();
+      return;
+    }
+
+    // --- Lose #2: carried (or walked) out of the horizontal frame while
+    // grounded — telegraphed via a reddening body tint for
+    // CROSSING_EDGE_WARNING_SECONDS before it actually ends the run, per the
+    // brief ("must be visibly telegraphed first").
+    const outsideFrame = player.x < -CROSSING_EDGE_MARGIN_PX || player.x > canvasWidth + CROSSING_EDGE_MARGIN_PX;
+    if (player.isGrounded && outsideFrame) {
+      crossingEdgeWarningTimer += dt;
+      player.setEdgeWarningIntensity(clamp(crossingEdgeWarningTimer / CROSSING_EDGE_WARNING_SECONDS, 0, 1));
+      if (crossingEdgeWarningTimer >= CROSSING_EDGE_WARNING_SECONDS) {
+        handleCollision();
+        return;
+      }
+    } else if (crossingEdgeWarningTimer > 0) {
+      crossingEdgeWarningTimer = 0;
+      player.setEdgeWarningIntensity(0);
+    }
+
+    // --- Score: survival + any horizontal movement (walking OR being
+    // carried both count — this is a "keep moving" incentive, not a
+    // direction-specific one). ---
+    scoreAccumulator += CROSSING_SCORE_PER_SECOND * dt + Math.abs(player.x - crossingLastPlayerX) * CROSSING_SCORE_PER_PIXEL_PROGRESS;
+    crossingLastPlayerX = player.x;
+    const newScoreInt = Math.floor(scoreAccumulator);
+    if (newScoreInt !== scoreInt) {
+      scoreInt = newScoreInt;
+      callbacks.onScoreChange(scoreInt);
+    }
+
+    if (shakeTrauma > 0) {
+      shakeTrauma = Math.max(0, shakeTrauma - SHAKE_DECAY_RATE * dt);
+      const magnitude = shakeTrauma * shakeTrauma * SHAKE_MAGNITUDE_PX;
+      worldContainer.x = (Math.random() * 2 - 1) * magnitude;
+      worldContainer.y = (Math.random() * 2 - 1) * magnitude;
+    } else if (worldContainer.x !== 0 || worldContainer.y !== 0) {
+      worldContainer.x = 0;
+      worldContainer.y = 0;
+    }
+
+    if (debugText !== null) {
+      debugAccumulator += dt;
+      if (debugAccumulator >= DEBUG_TEXT_UPDATE_INTERVAL_SECONDS) {
+        debugAccumulator = 0;
+        const fps = dt > 0 ? 1 / dt : 0;
+        debugText.text =
+          `fps ${fps.toFixed(0)}  score ${scoreInt}  crossings ${crossing.crossingsCompleted}` +
+          `  platforms ${crossing.platforms.length}  mode crossing`;
+      }
+    }
+
+    app.render();
+  }
+
+  /** Reaching the goal block: score it, celebrate briefly, swap which block
+   * is start vs. goal (CrossingSystem.completeCrossing), and re-anchor the
+   * player standing exactly on the block they just reached so the return
+   * leg begins cleanly. Endless — never ends the run. */
+  function handleCrossingWin(): void {
+    crossing.completeCrossing();
+    scoreAccumulator += CROSSING_SCORE_BONUS_PER_CROSSING;
+    particles.spawnSparkle(player.x, player.groundContactY, PICKUP_COLLECTIBLE_COLOR);
+    shakeTrauma = Math.min(1, shakeTrauma + DASH_THROUGH_SHAKE_TRAUMA);
+    callbacks.onSound('score');
+
+    const newStart = crossing.startBlock;
+    const newStartTopY = newStart.top;
+    const newStartCenterX = (newStart.left + newStart.right) / 2;
+    const facingRight = crossing.direction === 1;
+    player.resetForCrossing(newStartCenterX, newStartTopY, facingRight);
+    currentCrossingPlatform = newStart;
+    crossingSurfaceReferenceY = newStartTopY;
+    crossingRideAlongPlatform = null;
+    crossingEdgeWarningTimer = 0;
+    crossingLastPlayerX = newStartCenterX;
+
+    const newScoreInt = Math.floor(scoreAccumulator);
+    if (newScoreInt !== scoreInt) {
+      scoreInt = newScoreInt;
+      callbacks.onScoreChange(scoreInt);
+    }
+  }
+
+  /** Shared by start()/reset() for 'crossing' mode: drops every crossing
+   * entity/timer back to a fresh attempt standing on the LEFT block, facing
+   * right. Does not touch `status` or the render loop — callers decide
+   * those, same division of responsibility the runner's own inline reset
+   * blocks already have. */
+  function resetCrossingEntities(): void {
+    particles.reset();
+    crossing.reset();
+    // Settle the anchor blocks' pixel positions against the live canvas
+    // size immediately (dt=0) — same "layout, then a zero-dt settle pass"
+    // Game.ts already uses for the runner's own platforms in applyLayout.
+    crossing.update(0, canvasWidth, canvasHeight, null);
+    const start = crossing.startBlock;
+    const startCenterX = (start.left + start.right) / 2;
+    player.resetForCrossing(startCenterX, start.top, true);
+    currentCrossingPlatform = start;
+    crossingSurfaceReferenceY = start.top;
+    crossingRideAlongPlatform = null;
+    crossingEdgeWarningTimer = 0;
+    crossingLastPlayerX = startCenterX;
+    shakeTrauma = 0;
+    worldContainer.x = 0;
+    worldContainer.y = 0;
+  }
+
   const loop = new GameLoop(update);
 
   const inputSystem = new InputSystem({
@@ -484,6 +798,27 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         // start pulling the target back the instant this drag ends.
         horizonLockoutTimer = HORIZON_HINT_LOCKOUT_SECONDS;
       },
+      onCrossingWalk(direction: -1 | 0 | 1): void {
+        if (status === 'running' && gameMode === 'crossing') {
+          player.setWalkVelocity(direction * CROSSING_WALK_SPEED);
+        }
+      },
+      onCrossingAimChange(dirX: number, dirY: number, power: number): void {
+        if (status !== 'running' || gameMode !== 'crossing') return;
+        const maxSpeed = crossingMaxJumpSpeed(canvasWidth);
+        const velocity = computeCrossingJumpVelocity(dirX, dirY, power, maxSpeed);
+        crossing.showTrajectoryPreview(player.x, player.groundContactY, velocity.vx, velocity.vy, canvasWidth, canvasHeight);
+      },
+      onCrossingJumpRelease(dirX: number, dirY: number, power: number): void {
+        crossing.hideTrajectoryPreview();
+        if (status !== 'running' || gameMode !== 'crossing') return;
+        const maxSpeed = crossingMaxJumpSpeed(canvasWidth);
+        const velocity = computeCrossingJumpVelocity(dirX, dirY, power, maxSpeed);
+        player.requestDirectionalJump(velocity.vx, velocity.vy);
+      },
+      onCrossingAimCancel(): void {
+        crossing.hideTrajectoryPreview();
+      },
     },
   });
 
@@ -502,20 +837,24 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     start(): void {
       scoreAccumulator = 0;
       scoreInt = 0;
-      groundY = groundTargetPx();
-      player.resetToIdle(groundY);
-      obstacles.reset();
-      pickups.reset();
-      particles.reset();
-      platforms.reset();
-      currentSurfacePlatform = null;
-      shakeTrauma = 0;
-      worldContainer.x = 0;
-      worldContainer.y = 0;
-      groundGraphics.y = groundY;
-      vehicleDetectionCooldown = 0;
-      personDetectionCooldown = 0;
-      signDetectionCooldown = 0;
+      if (gameMode === 'runner') {
+        groundY = groundTargetPx();
+        player.resetToIdle(groundY);
+        obstacles.reset();
+        pickups.reset();
+        particles.reset();
+        platforms.reset();
+        currentSurfacePlatform = null;
+        shakeTrauma = 0;
+        worldContainer.x = 0;
+        worldContainer.y = 0;
+        groundGraphics.y = groundY;
+        vehicleDetectionCooldown = 0;
+        personDetectionCooldown = 0;
+        signDetectionCooldown = 0;
+      } else {
+        resetCrossingEntities();
+      }
       status = 'running';
       loop.start();
     },
@@ -537,20 +876,24 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       status = 'idle';
       scoreAccumulator = 0;
       scoreInt = 0;
-      obstacles.reset();
-      pickups.reset();
-      particles.reset();
-      platforms.reset();
-      currentSurfacePlatform = null;
-      shakeTrauma = 0;
-      worldContainer.x = 0;
-      worldContainer.y = 0;
-      groundY = groundTargetPx();
-      groundGraphics.y = groundY;
-      player.resetToIdle(groundY);
-      vehicleDetectionCooldown = 0;
-      personDetectionCooldown = 0;
-      signDetectionCooldown = 0;
+      if (gameMode === 'runner') {
+        obstacles.reset();
+        pickups.reset();
+        particles.reset();
+        platforms.reset();
+        currentSurfacePlatform = null;
+        shakeTrauma = 0;
+        worldContainer.x = 0;
+        worldContainer.y = 0;
+        groundY = groundTargetPx();
+        groundGraphics.y = groundY;
+        player.resetToIdle(groundY);
+        vehicleDetectionCooldown = 0;
+        personDetectionCooldown = 0;
+        signDetectionCooldown = 0;
+      } else {
+        resetCrossingEntities();
+      }
       app.render();
     },
 
@@ -608,7 +951,11 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
      * `Game` interface's contract.
      */
     onSceneDetections(detections: readonly Detection[]): void {
-      if (status !== 'running') return;
+      // Scene-detection-flavoured hazards/pickups are a 'runner'-only
+      // concept — crossing mode has no obstacles or pickups, so this is a
+      // guaranteed no-op there regardless of what App.ts happens to still be
+      // calling during/after a mode switch.
+      if (status !== 'running' || gameMode !== 'runner') return;
       for (let i = 0; i < detections.length; i++) {
         const detection = detections[i]!;
         if (detection.score < DETECTION_MIN_SCORE) continue;
@@ -638,10 +985,20 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     },
 
     /**
-     * Windscreen mode: real objects ahead, tracked across frames. Purely a
-     * pass-through to PlatformSystem.onTrackedObjects (see that class's doc
-     * for the full matching/spawn/expiry logic) — gated on BOTH `status`
-     * (nothing should spawn while the loop isn't stepping, same reasoning as
+     * Windscreen mode: real objects ahead, tracked across frames.
+     *
+     * 'crossing' mode routes straight to CrossingSystem.onTrackedObjects,
+     * UNGATED by `visionMode` — the type doc on GameMode already says
+     * 'crossing' only makes sense paired with windscreen framing and that
+     * the CALLER (App.ts) enforces that pairing, so re-checking it here
+     * would just be redundant. This also matches how the mode is tested
+     * (synthetic TrackedObjects fed directly via the debug handle without
+     * necessarily also calling setVisionMode).
+     *
+     * 'runner' mode is otherwise a pass-through to
+     * PlatformSystem.onTrackedObjects (see that class's doc for the full
+     * matching/spawn/expiry logic) — gated on BOTH `status` (nothing should
+     * spawn while the loop isn't stepping, same reasoning as
      * onSceneDetections above) and `visionMode`, so a stray call in 'window'
      * mode (or before the player has switched modes at all) is a guaranteed
      * no-op. That guarantee is exactly what keeps 'window' mode's gameplay
@@ -651,7 +1008,12 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
      * types.ts; never retains the array or its elements past this call.
      */
     onTrackedObjects(objects: readonly TrackedObject[]): void {
-      if (status !== 'running' || visionMode !== 'windscreen') return;
+      if (status !== 'running') return;
+      if (gameMode === 'crossing') {
+        crossing.onTrackedObjects(objects);
+        return;
+      }
+      if (visionMode !== 'windscreen') return;
       platforms.onTrackedObjects(objects);
     },
 
@@ -680,6 +1042,81 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       // The next update() simply resumes using the real ground line, same
       // as if no platform had ever existed.
       currentSurfacePlatform = null;
+    },
+
+    /**
+     * Switch between the endless runner and the crossing game.
+     *
+     * ISOLATION: every layer this touches is either (a) a Container's
+     * `.visible` flag — the runner's ground/obstacle/pickup/platform layers
+     * and crossing's own layer are mutually exclusive, so whichever mode
+     * isn't active renders nothing, at negligible cost — or (b) a full
+     * `reset()`-equivalent on the systems that own per-run state, so no
+     * entity or timer from the mode being left can leak into the one being
+     * entered. `gameMode` itself is the ONE flag every runner-mode code path
+     * in `update()`/`start()`/`reset()` above branches on FIRST, before any
+     * of the original runner logic — see those functions' own comments.
+     *
+     * Safe to call from any GameStatus, including mid-run (`running`): the
+     * brief requires a mid-session switch to be clean, not merely a
+     * between-runs one. If currently running, the newly-entered mode starts
+     * stepping immediately from its own fresh state (equivalent to calling
+     * start() for that mode) rather than leaving the loop stepping over a
+     * half-initialised world.
+     */
+    setGameMode(mode: GameMode): void {
+      if (gameMode === mode) return;
+      const wasRunning = status === 'running';
+      gameMode = mode;
+      inputSystem.setMode(mode);
+
+      // Drop every per-mode entity/timer regardless of prior status, so a
+      // switch from 'paused' or 'over' can't leave stale obstacles/platforms
+      // sitting around for whichever mode is entered next either.
+      obstacles.reset();
+      pickups.reset();
+      platforms.reset();
+      currentSurfacePlatform = null;
+      crossing.reset();
+      currentCrossingPlatform = null;
+      crossingRideAlongPlatform = null;
+      crossingEdgeWarningTimer = 0;
+      shakeTrauma = 0;
+      worldContainer.x = 0;
+      worldContainer.y = 0;
+
+      const enteringCrossing = mode === 'crossing';
+      groundGraphics.visible = !enteringCrossing;
+      platformLayer.visible = !enteringCrossing;
+      obstacleLayer.visible = !enteringCrossing;
+      pickupLayer.visible = !enteringCrossing;
+      crossingLayer.visible = enteringCrossing;
+
+      if (enteringCrossing) {
+        resetCrossingEntities();
+      } else {
+        // Crossing mode leaves `player`'s x wherever the player last walked/
+        // jumped/drifted to (originX has no fixed-column concept there) —
+        // resetToIdle() re-applies whatever originX already holds, it does
+        // NOT restore the runner's fixed column, so that has to happen
+        // explicitly here. Without this, switching back to 'runner' mid-
+        // session would resume with the player stranded at its last
+        // crossing-mode x instead of PLAYER_X_FRACTION, until the next
+        // resize happened to fix it via applyLayout's own player.setX() call.
+        player.setX(canvasWidth * PLAYER_X_FRACTION);
+        groundY = groundTargetPx();
+        groundGraphics.y = groundY;
+        player.resetToIdle(groundY);
+      }
+
+      if (wasRunning) {
+        scoreAccumulator = 0;
+        scoreInt = 0;
+        callbacks.onScoreChange(scoreInt);
+        status = 'running';
+      } else {
+        app.render();
+      }
     },
 
     destroy(): void {

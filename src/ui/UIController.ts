@@ -8,6 +8,7 @@
 
 import type {
   CameraFailure,
+  GameMode,
   DetectorState,
   DetectorStatus,
   GameOverResult,
@@ -92,6 +93,66 @@ const VISION_MODE_OPTIONS: readonly VisionModeOption[] = [
     desc: 'Phone pointed forward. Jump onto the vehicle ahead.',
   },
 ];
+
+interface GameModeOption {
+  mode: GameMode;
+  label: string;
+  desc: string;
+}
+
+// Two genuinely different games. The copy has to make the goal legible, not
+// just name the mode — nobody should have to play both to find out.
+const GAME_MODE_OPTIONS: readonly GameModeOption[] = [
+  {
+    mode: 'runner',
+    label: 'Runner',
+    desc: 'Endless run. Jump and dash past obstacles.',
+  },
+  {
+    mode: 'crossing',
+    label: 'Crossing',
+    desc: 'Hop across real traffic, left to right. Needs windscreen.',
+  },
+];
+
+/** Narrows a raw dataset string to GameMode, or null if it isn't one. */
+function parseGameMode(value: string | undefined): GameMode | null {
+  return value === 'runner' || value === 'crossing' ? value : null;
+}
+
+function gameModeOptionHtml(option: GameModeOption): string {
+  const checked = option.mode === 'runner';
+  return `
+    <button
+      type="button"
+      class="vision-mode__option"
+      data-action="select-game-mode"
+      data-game-mode-button
+      data-mode="${option.mode}"
+      role="radio"
+      aria-checked="${checked ? 'true' : 'false'}"
+      tabindex="${checked ? '0' : '-1'}"
+      aria-label="${option.label}. ${option.desc}"
+    >
+      <span class="vision-mode__dot" aria-hidden="true"></span>
+      <span class="vision-mode__text">
+        <span class="vision-mode__label">${option.label}</span>
+        <span class="vision-mode__desc">${option.desc}</span>
+      </span>
+    </button>`;
+}
+
+function gameModeGroupHtml(compact: boolean): string {
+  const options = GAME_MODE_OPTIONS.map((opt) => gameModeOptionHtml(opt)).join('');
+  return `
+    <div
+      class="vision-mode${compact ? ' vision-mode--compact' : ''}"
+      data-role="game-mode-group"
+      role="radiogroup"
+      aria-label="Game"
+    >${options}
+    </div>`;
+}
 
 /** Narrows a raw dataset string to VisionMode, or null if it isn't one. */
 function parseVisionMode(value: string | undefined): VisionMode | null {
@@ -203,6 +264,7 @@ const TEMPLATE = `
         <div class="vision__progress" data-role="vision-progress" hidden aria-hidden="true">
           <div class="vision__progress-fill" data-role="vision-progress-fill"></div>
         </div>
+        ${gameModeGroupHtml(false)}
         ${visionModeGroupHtml(false)}
       </div>
       <div class="home__actions">
@@ -281,6 +343,7 @@ const TEMPLATE = `
         <button type="button" class="btn btn--icon" data-action="toggle-mute" data-mute-button aria-pressed="false" aria-label="${MUTE_LABEL_ON}">${MUTE_ICON_ON}</button>
         <button type="button" class="btn btn--icon" data-action="toggle-vision" data-vision-button aria-pressed="false" aria-label="${VISION_ARIA_LABEL}">${VISION_ICON}</button>
       </div>
+      ${gameModeGroupHtml(true)}
       ${visionModeGroupHtml(true)}
     </div>
   </div>
@@ -338,6 +401,7 @@ class GlassyUIController implements UIController {
   private readonly visionProgressEl: HTMLElement;
   private readonly visionProgressFillEl: HTMLElement;
   private readonly visionModeButtons: HTMLButtonElement[];
+  private readonly gameModeButtons: HTMLButtonElement[];
   private readonly visionModeGroups: HTMLElement[];
 
   private currentScreen: ScreenName = 'loading';
@@ -348,6 +412,7 @@ class GlassyUIController implements UIController {
   private lastDetectorStatus: DetectorStatus | null = null;
   private lastDetectorProgress: number | null = null;
   private lastVisionMode: VisionMode | null = null;
+  private lastGameMode: GameMode | null = null;
 
   constructor(root: HTMLElement, intents: UIIntents) {
     this.root = root;
@@ -393,6 +458,9 @@ class GlassyUIController implements UIController {
     this.visionStatusTextEl = requireElement(this.root, '[data-role="vision-status-text"]');
     this.visionProgressEl = requireElement(this.root, '[data-role="vision-progress"]');
     this.visionProgressFillEl = requireElement(this.root, '[data-role="vision-progress-fill"]');
+    this.gameModeButtons = Array.from(
+      this.root.querySelectorAll<HTMLButtonElement>('[data-game-mode-button]'),
+    );
     this.visionModeButtons = Array.from(
       this.root.querySelectorAll<HTMLButtonElement>('[data-vision-mode-button]'),
     );
@@ -553,6 +621,16 @@ class GlassyUIController implements UIController {
     }
   }
 
+  setGameMode(mode: GameMode): void {
+    if (mode === this.lastGameMode) return;
+    this.lastGameMode = mode;
+    for (const btn of this.gameModeButtons) {
+      const checked = parseGameMode(btn.dataset['mode']) === mode;
+      btn.setAttribute('aria-checked', checked ? 'true' : 'false');
+      btn.tabIndex = checked ? 0 : -1;
+    }
+  }
+
   setVisionMode(mode: VisionMode): void {
     if (mode === this.lastVisionMode) return;
     this.lastVisionMode = mode;
@@ -641,6 +719,11 @@ class GlassyUIController implements UIController {
       case 'toggle-vision':
         this.intents.onToggleVision();
         break;
+      case 'select-game-mode': {
+        const mode = parseGameMode(actionEl.dataset['mode']);
+        if (mode) this.intents.onSelectGameMode(mode);
+        break;
+      }
       case 'select-vision-mode': {
         const mode = parseVisionMode(actionEl.dataset['mode']);
         if (mode) this.intents.onSelectVisionMode(mode);

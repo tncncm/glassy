@@ -59,6 +59,14 @@ export class Platform {
   private targetHeightFraction = 0;
   private currentAlpha = 1;
 
+  // --- Palette override — see setPalette(). Defaults to the module
+  // constants below, which is what makes every PlatformSystem-owned
+  // instance (the ONLY caller in 'runner' mode) render byte-identically to
+  // before this existed: nothing in that call path ever calls setPalette. ---
+  private fillColor: number = PLATFORM_FILL_COLOR;
+  private topBarColor: number = PLATFORM_TOP_BAR_COLOR;
+  private paletteDirty = false;
+
   // --- Current px extents, recomputed every `updateVisual` call against the
   // live canvas size. Read by Game.ts for the one-way collision test. ---
   private leftPx = 0;
@@ -119,6 +127,26 @@ export class Platform {
   }
 
   /**
+   * Overrides the fill/top-bar hue for THIS instance only — used by
+   * CrossingSystem to tell real / ghost / start / goal apart at a glance
+   * (a plain `Container.tint` multiply can't do this well: it can only ever
+   * DARKEN a channel, never raise one, so multiplying this class's cyan base
+   * toward "gold" just produces a muddy yellow-green — a distinct override
+   * color gets an actually legible, intentional hue instead). Forces the
+   * next `updateVisual` to redraw even if the box's size hasn't changed.
+   * Alpha/outline/thickness stay shared (PLATFORM_*_ALPHA etc.) — only the
+   * two hues vary, so every platform still reads as "the same KIND of
+   * thing", just color-coded. Never called anywhere in 'runner' mode (only
+   * PlatformSystem owns platforms there), so its instances keep the default
+   * palette forever — byte-identical to before this method existed.
+   */
+  setPalette(fillColor: number, topBarColor: number): void {
+    this.fillColor = fillColor;
+    this.topBarColor = topBarColor;
+    this.paletteDirty = true;
+  }
+
+  /**
    * Per-frame update: glide current→target and current alpha→fadeAlpha at
    * `followT` (a single expDecay(dt) factor shared across every platform,
    * computed once by PlatformSystem.update), recompute px extents against
@@ -147,7 +175,8 @@ export class Platform {
     this.view.y = topPx;
     this.view.alpha = this.currentAlpha;
 
-    if (Math.abs(widthPx - this.lastDrawnWidthPx) > REDRAW_EPSILON_PX || Math.abs(heightPx - this.lastDrawnHeightPx) > REDRAW_EPSILON_PX) {
+    if (this.paletteDirty || Math.abs(widthPx - this.lastDrawnWidthPx) > REDRAW_EPSILON_PX || Math.abs(heightPx - this.lastDrawnHeightPx) > REDRAW_EPSILON_PX) {
+      this.paletteDirty = false;
       this.redraw(widthPx, heightPx);
     }
   }
@@ -167,12 +196,12 @@ export class Platform {
     this.view.clear();
     this.view
       .rect(0, 0, w, h)
-      .fill({ color: PLATFORM_FILL_COLOR, alpha: PLATFORM_FILL_ALPHA })
+      .fill({ color: this.fillColor, alpha: PLATFORM_FILL_ALPHA })
       .rect(0, 0, w, h)
       .stroke({ width: PLATFORM_OUTLINE_WIDTH, color: PLATFORM_OUTLINE_COLOR, alpha: PLATFORM_OUTLINE_ALPHA })
       .rect(barSpanLeft, -PLATFORM_TOP_BAR_GLOW_THICKNESS / 2, barSpanWidth, PLATFORM_TOP_BAR_GLOW_THICKNESS)
-      .fill({ color: PLATFORM_TOP_BAR_COLOR, alpha: PLATFORM_TOP_BAR_GLOW_ALPHA })
+      .fill({ color: this.topBarColor, alpha: PLATFORM_TOP_BAR_GLOW_ALPHA })
       .rect(barSpanLeft, -PLATFORM_TOP_BAR_THICKNESS / 2, barSpanWidth, PLATFORM_TOP_BAR_THICKNESS)
-      .fill({ color: PLATFORM_TOP_BAR_COLOR, alpha: PLATFORM_TOP_BAR_ALPHA });
+      .fill({ color: this.topBarColor, alpha: PLATFORM_TOP_BAR_ALPHA });
   }
 }

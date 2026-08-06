@@ -608,6 +608,161 @@ export const PLATFORM_TOP_BAR_GLOW_ALPHA = 0.22;
 export const PLATFORM_TOP_BAR_OVERHANG_PX = 6;
 
 /* ------------------------------------------------------------------ */
+/* Crossing mode — src/game/systems/CrossingSystem.ts and the           */
+/* crossing-only methods on src/game/entities/Player.ts.                */
+/*                                                                       */
+/* A different game sharing this engine (see GameMode in types.ts):     */
+/* nothing scrolls; the player crosses the STATIC camera frame left to  */
+/* right, then right to left, endlessly, by walking and aim-jumping     */
+/* across real tracked vehicles turned into platforms. 'runner' mode    */
+/* never reads anything below this point, and nothing above this point */
+/* is read by crossing mode — the two games are tuned independently.    */
+/* ------------------------------------------------------------------ */
+
+/* --- Start/goal anchor blocks — fixed, always present regardless of
+ * detection. Both position AND size are stored as fractions of the canvas
+ * (the same convention TrackedObject/Platform already use) so they survive
+ * resize/orientation-change with no extra bookkeeping. */
+export const CROSSING_BLOCK_WIDTH_FRACTION = 0.1;
+export const CROSSING_BLOCK_HEIGHT_FRACTION = 0.055;
+/** Vertical center of both blocks — "a sensible height in the road area",
+ * deliberately close to where the runner's own ground line defaults to
+ * (GROUND_Y_DEFAULT_FRACTION) so the two modes feel like the same world. */
+export const CROSSING_BLOCK_CENTER_Y_FRACTION = 0.62;
+export const CROSSING_LEFT_BLOCK_CENTER_X_FRACTION = 0.07;
+export const CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION = 0.93;
+/** Palettes (see Platform.setPalette) applied to whichever block is
+ * currently the player's start vs. their goal — swapped, not redrawn, when
+ * a crossing completes (see CrossingSystem.completeCrossing). Distinct hue
+ * FAMILIES (green vs. gold), not just different shades, so they read apart
+ * at a glance even on a small phone screen. */
+export const CROSSING_BLOCK_START_FILL = 0x2ecc71;
+export const CROSSING_BLOCK_START_TOP_BAR = 0x8fffb0;
+export const CROSSING_BLOCK_GOAL_FILL = 0xffb020;
+export const CROSSING_BLOCK_GOAL_TOP_BAR = 0xffd23f;
+
+/* --- Player walk/jump kinematics ---------------------------------- */
+
+/** px/s lateral speed while grounded and holding a walk input. */
+export const CROSSING_WALK_SPEED = 210;
+/** Fraction of canvasWidth a single FULL-POWER jump can cover on level
+ * ground. `crossingMaxJumpSpeed` in util/solvability.ts inverts the classic
+ * projectile range formula (range = v^2/g) to derive the launch-speed cap
+ * from this fraction, so "a single jump can't cross the whole screen" stays
+ * true on every device/orientation instead of baking in a fixed px number
+ * that would be trivial on a phone and impossible on a tablet. */
+export const CROSSING_MAX_JUMP_HORIZONTAL_FRACTION = 0.4;
+/** Minimum fraction of a jump's launch speed that must point upward,
+ * regardless of how flat/downward the raw drag or keyboard aim was.
+ * Guarantees every jump has real liftoff (feet visibly leave the surface
+ * before falling again), which is also what keeps the landing-assist magnet
+ * (CROSSING_LANDING_ASSIST_*) from being able to immediately re-catch the
+ * platform a jump just launched from — see CrossingSystem's landing-assist
+ * doc for the full argument. */
+export const CROSSING_MIN_JUMP_VERTICAL_FRACTION = 0.18;
+/** Grace window after walking off a platform's edge during which a jump
+ * still fires — deliberately more generous than the runner's
+ * COYOTE_TIME_SECONDS: an aim-and-release gesture takes longer to execute
+ * than a tap, so the window it can still land in must be longer too. */
+export const CROSSING_COYOTE_TIME_SECONDS = 0.2;
+/** Grace window a completed aim-and-release is remembered before landing,
+ * so a jump released a moment before touchdown still fires the instant the
+ * player is grounded/within coyote time, rather than being silently eaten. */
+export const CROSSING_JUMP_BUFFER_SECONDS = 0.2;
+
+/* --- Aim gesture (touch) -------------------------------------------- */
+
+/** Past this drag distance (px) a pointer gesture commits to AIMING instead
+ * of walking — short of this it reads as "hold to walk". Same
+ * threshold-then-commit shape InputSystem already uses for runner gestures,
+ * see that file's doc for the crossing-mode gesture set in full. */
+export const CROSSING_AIM_DEADZONE_PX = 14;
+/** Drag distance (px) that reads as FULL power (100%); clamped above this so
+ * dragging off-canvas doesn't over-charge the jump. */
+export const CROSSING_AIM_MAX_DRAG_PX = 160;
+
+/* --- Aim gesture (keyboard) ------------------------------------------ */
+
+/** Seconds of holding Space to reach full power. */
+export const CROSSING_KEYBOARD_CHARGE_SECONDS = 1.1;
+
+/* --- Landing assist — deliberately generous. The tracker reports at 6Hz
+ * with interpolation (~150ms of real lag is normal), and real vehicles
+ * drift unpredictably between samples, so aiming at a moving target with no
+ * help would be genuinely unfair, not just hard. If a descending trajectory
+ * passes within this box of a platform's top edge, CrossingSystem snaps the
+ * player onto it outright (see resolveCrossingSurface in Game.ts). */
+export const CROSSING_LANDING_ASSIST_VERTICAL_PX = 46;
+export const CROSSING_LANDING_ASSIST_HORIZONTAL_PX = 34;
+
+/* --- Trajectory preview arc — dotted, pooled, cheap to draw ---------- */
+
+export const CROSSING_PREVIEW_DOT_COUNT = 14;
+export const CROSSING_PREVIEW_DOT_RADIUS = 3;
+export const CROSSING_PREVIEW_DOT_COLOR = 0xffffff;
+export const CROSSING_PREVIEW_DOT_ALPHA = 0.75;
+/** Seconds of flight the preview samples across, evenly spaced across the
+ * dot count — independent of the actual jump's own flight time so the dots
+ * always read as one smooth, evenly-spaced arc regardless of power. Dots
+ * past the point the arc leaves the canvas are simply hidden. */
+export const CROSSING_PREVIEW_DURATION_SECONDS = 1.4;
+
+/* --- Ghost platform fallback — the crossing-mode equivalent of the
+ * runner's derived obstacle spacing (util/solvability.ts): if real tracking
+ * goes quiet, the level must still be solvable. See
+ * CrossingSystem.maybeSpawnGhostChain's doc for the full derivation. */
+
+/** Seconds with no STABLE tracked object update at all before the fallback
+ * engages — "a few seconds", per the brief. */
+export const CROSSING_GHOST_TRIGGER_SECONDS = 3.5;
+/** Fraction of the full-power max reach actually budgeted between two
+ * consecutive ghost platforms — leaves margin the same way GAP_SAFETY_FACTOR
+ * does for the runner, so a hop timed slightly early or late still lands. */
+export const CROSSING_GHOST_GAP_SAFETY_FACTOR = 0.62;
+/** Hard cap on simultaneous ghost platforms. The chain spawned by
+ * maybeSpawnGhostChain is sized to the live canvas width but never asked to
+ * exceed this pool — see that method's doc for why it never needs to. */
+export const CROSSING_GHOST_POOL_SIZE = 6;
+export const CROSSING_GHOST_WIDTH_FRACTION = 0.1;
+export const CROSSING_GHOST_HEIGHT_FRACTION = 0.05;
+/** Gentle side-to-side drift so a ghost platform reads as "moving like
+ * traffic" rather than static geometry. Small relative to
+ * CROSSING_GHOST_GAP_SAFETY_FACTOR's own margin so it can never itself
+ * widen a gap past what a full-power jump can cover. */
+export const CROSSING_GHOST_DRIFT_RANGE_PX = 16;
+export const CROSSING_GHOST_DRIFT_SPEED_RADIANS_PER_SECOND = 0.9;
+/** Palette (see Platform.setPalette) that gives ghost platforms a distinct
+ * violet hue from real tracked ones (PLATFORM_FILL_COLOR's cyan) — the
+ * player must always be able to tell what's real. Reuses the runner's own
+ * "wide obstacle" violet (OBSTACLE_COLOR_WIDE) for palette consistency
+ * across modes rather than inventing an unrelated purple. */
+export const CROSSING_GHOST_FILL = 0x9b6bff;
+export const CROSSING_GHOST_TOP_BAR = 0xc9adff;
+
+/* --- Edge-carry loss telegraph — a platform (real or ghost) drifting the
+ * standing player horizontally off the visible frame is a legitimate loss,
+ * but must be visibly telegraphed first — see updateCrossing in Game.ts. */
+export const CROSSING_EDGE_MARGIN_PX = 40;
+export const CROSSING_EDGE_WARNING_SECONDS = 1.1;
+/** Tint the player's body flashes toward while the edge-carry warning is
+ * counting down — 0 (start of warning) is untinted (0xffffff = no-op tint). */
+export const CROSSING_EDGE_WARNING_TINT = 0xff4a4a;
+
+/* --- Fall-below-frame loss -------------------------------------------- */
+
+/** Player's top must fall this far past canvasHeight before the run ends —
+ * a small buffer so the character is clearly, unambiguously gone (matches
+ * the spirit of every other *_DESPAWN_MARGIN in this file) rather than
+ * ending the instant a single pixel crosses the edge. */
+export const CROSSING_FALL_MARGIN_PX = 60;
+
+/* --- Scoring ------------------------------------------------------------ */
+
+export const CROSSING_SCORE_PER_SECOND = 4;
+export const CROSSING_SCORE_PER_PIXEL_PROGRESS = 0.05;
+export const CROSSING_SCORE_BONUS_PER_CROSSING = 150;
+
+/* ------------------------------------------------------------------ */
 /* Debug overlay                                                       */
 /* ------------------------------------------------------------------ */
 

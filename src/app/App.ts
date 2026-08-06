@@ -35,6 +35,7 @@ import {
   type ObjectDetector,
   type SceneAnalyser,
   type TrackedObject,
+  type GameMode,
   type VisionMode,
   type UIController,
   type UIIntents,
@@ -247,6 +248,21 @@ export async function createApp(root: HTMLElement): Promise<App> {
         unlockAudio();
         ui.setCameraFailure(null);
         void requestCameraThenPlay();
+      },
+      onSelectGameMode(mode: GameMode): void {
+        audio.play('click');
+        preferences.setGameMode(mode);
+        ui.setGameMode(mode);
+        game.setGameMode(mode);
+        // Crossing only makes sense pointed forward — the level IS what the
+        // camera sees. Switch framing with it rather than letting someone pick
+        // a combination that can't work.
+        if (mode === 'crossing' && preferences.getVisionMode() !== 'windscreen') {
+          preferences.setVisionMode('windscreen');
+          ui.setVisionMode('windscreen');
+          detector.setMode('windscreen');
+          game.setVisionMode('windscreen');
+        }
       },
       onSelectVisionMode(mode: VisionMode): void {
         audio.play('click');
@@ -571,6 +587,9 @@ export async function createApp(root: HTMLElement): Promise<App> {
     const savedMode = preferences.getVisionMode();
     ui.setVisionMode(savedMode);
     game.setVisionMode(savedMode);
+    const savedGameMode = preferences.getGameMode();
+    ui.setGameMode(savedGameMode);
+    game.setGameMode(savedGameMode);
     handleResize();
 
     // Opportunistic only — unsupported on iOS Safari and must never be
