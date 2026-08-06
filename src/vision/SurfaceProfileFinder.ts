@@ -66,9 +66,39 @@
  * edge and sides into `surfaceY`/`surfaceLeft`/`surfaceRight`, and a flat
  * `surfaceProfile` matching it, before this runs — an honest "we don't know,
  * use the flat box" beats a confident, jagged guess.
+ *
+ * WHAT THE MOTION MASK ADDED, AND WHY IT WAS NEEDED
+ *
+ * Everything above assumes the box is roughly the vehicle. On a close,
+ * well-framed vehicle it is, and the scan traces the roofline properly. On a
+ * loosely-boxed one — a tall van being overtaken, a truck with open sky above
+ * it — the box can be half sky, and the scan meets a power line, a treeline
+ * or a sign gantry on the way down and locks onto that instead. It is doing
+ * exactly what it was told; it was pointed at the wrong rows.
+ *
+ * So before scanning, `FlowSupport` is asked which rows and columns inside
+ * the box are actually moving WITH US rather than sweeping past with the
+ * static world (see that file for the physics and its failure cases). When it
+ * has an answer, three things change:
+ *
+ *   1. The band the edge scan may search starts below the sky and ends at
+ *      the vehicle's base, so a background edge is not merely outvoted, it is
+ *      never offered.
+ *   2. The per-column profile domain and the reported surfaceLeft/Right are
+ *      the vehicle's own width, not the padded box's.
+ *   3. Even when the edge scan then finds nothing it trusts, the fallback is
+ *      the motion-derived top edge rather than the padded box's top edge —
+ *      a coarse but honestly-placed surface instead of a confidently-placed
+ *      wrong one.
+ *
+ * When it has NO answer — too small a box, too little texture, a gap in
+ * sampling, a scene where nothing is moving — every one of those reverts to
+ * the box exactly as before. The mask can only ever narrow what this file
+ * looks at; it never widens it, and it never invents a surface.
  */
 
 import { SURFACE_PROFILE_SAMPLES, type TrackedObject } from '../types.ts';
+import { createFlowSupport, type FlowSupport, type SupportRegion } from './FlowSupport.ts';
 
 /**
  * Offscreen sample size. Small on purpose, same reasoning as SceneAnalyser:
@@ -266,6 +296,34 @@ interface SurfaceTrack {
   pendingCount: number;
 }
 
+/**
+ * Diagnostic-only view of what the motion mask decided this tick. Every array
+ * is preallocated and mutated in place; nothing here is read by production
+ * code, and nothing here is retained past the next `refine()`. It exists so
+ * tools/video-sim can DRAW the mask rather than argue about it.
+ */
+export interface SurfaceFlowDebug {
+  canvasWidth: number;
+  canvasHeight: number;
+  cellCols: number;
+  cellRows: number;
+  cellSize: number;
+  /** Per-cell flags, see FlowSupport's CELL_* constants. */
+  cells: Uint8Array;
+  /** Number of valid entries in `regions`. */
+  regionCount: number;
+  /** 6 floats per entry: id, decided (0/1), left, top, right, bottom — the
+   * last four as 0..1 frame fractions. */
+  regions: Float32Array;
+  /** Running totals since construction, for cost/coverage reporting. */
+  ticks: number;
+  boxesSeen: number;
+  boxesDecided: number;
+  boxesTightened: number;
+  costMsTotal: number;
+  lastCostMs: number;
+}
+
 export interface SurfaceProfileFinder {
   /**
    * Draws the current video frame once, then refines `surfaceY`/
@@ -281,7 +339,30 @@ export interface SurfaceProfileFinder {
   /** Drop working buffers and forget all per-object smoothing state.
    * Idempotent. */
   stop(): void;
+  /** Diagnostic view of the motion mask — see `SurfaceFlowDebug`. Never read
+   * by the game; tools/video-sim draws it. */
+  readonly flowDebug: SurfaceFlowDebug;
 }
+
+/** Max diagnostic region slots — matches DetectionTracker's MAX_TRACKS with
+ * room to spare, allocated once. */
+const MAX_DEBUG_REGIONS = 16;
+
+/**
+ * A tightening smaller than this fraction of the box's own height/width is
+ * counted as "no meaningful change" in the diagnostic totals — a box that was
+ * already tight around its vehicle reports a cell-quantisation nudge and
+ * nothing more, and counting those as successes would flatter the numbers.
+ */
+const MEANINGFUL_TIGHTEN_FRACTION = 0.08;
+
+/** Handed back in place of a real answer when the mask is switched off for a
+ * diagnostic run — one shared frozen object, never mutated. */
+const NO_SUPPORT: SupportRegion = {
+  decided: false,
+  left: 0, top: 0, right: 0, bottom: 0,
+  vehicleCells: 0, backgroundCells: 0, unknownCells: 0,
+};
 
 function clamp01(value: number): number {
   return value < 0 ? 0 : value > 1 ? 1 : value;
@@ -301,7 +382,18 @@ function smoothingFactor(rate: number, dt: number): number {
   return 1 - Math.exp(-rate * dt);
 }
 
-export function createSurfaceProfileFinder(): SurfaceProfileFinder {
+export interface SurfaceProfileFinderOptions {
+  /**
+   * Diagnostic escape hatch, for tools/video-sim only: run the pre-mask
+   * algorithm so an A/B against it is a comparison of the SAME build rather
+   * than of two git revisions. Production never sets this — the mask is not
+   * an experiment to be toggled, it is the fallback-safe path.
+   */
+  disableFlowMask?: boolean;
+}
+
+export function createSurfaceProfileFinder(options?: SurfaceProfileFinderOptions): SurfaceProfileFinder {
+  const flowMaskEnabled = options?.disableFlowMask !== true;
   let ctx: Context2D | null = null;
   let luma: Float32Array | null = null; // ROI_CANVAS_WIDTH * ROI_CANVAS_HEIGHT
   // Scratch row-score buffer, sized once to the tallest possible search band
@@ -318,6 +410,38 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
   const profileCandidateScratch = new Float32Array(SURFACE_PROFILE_SAMPLES);
   let disabledBySecurityError = false;
   let warnedOnce = false;
+
+  /**
+   * The motion mask. Shares this file's luma buffer rather than sampling the
+   * video a second time — one `drawImage`/`getImageData` per tick is already
+   * the expensive part, and the mask needs exactly the same pixels.
+   */
+  const flowSupport: FlowSupport = createFlowSupport({
+    width: ROI_CANVAS_WIDTH,
+    height: ROI_CANVAS_HEIGHT,
+  });
+  /** Wall-clock time of the last frame actually drawn into `luma`, so the
+   * mask compares against a KNOWN gap. The caller's `dt` is the gap between
+   * emitTracked calls, which is not the same thing on any tick where this
+   * function returned early. */
+  let lastDrawAtMs = 0;
+
+  const flowDebug: SurfaceFlowDebug = {
+    canvasWidth: ROI_CANVAS_WIDTH,
+    canvasHeight: ROI_CANVAS_HEIGHT,
+    cellCols: flowSupport.cellCols,
+    cellRows: flowSupport.cellRows,
+    cellSize: flowSupport.cellSize,
+    cells: flowSupport.cells,
+    regionCount: 0,
+    regions: new Float32Array(MAX_DEBUG_REGIONS * 6),
+    ticks: 0,
+    boxesSeen: 0,
+    boxesDecided: 0,
+    boxesTightened: 0,
+    costMsTotal: 0,
+    lastCostMs: 0,
+  };
 
   const tracks: SurfaceTrack[] = Array.from({ length: MAX_SURFACE_TRACKS }, () => ({
     id: 0,
@@ -726,22 +850,105 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
       // `imageData`/`data` are never referenced again — everything past
       // this point reads only the reused `luma` scratch buffer.
 
+      // Open the motion-mask tick against the gap since the last frame this
+      // function actually DREW — not the caller's dt, which is the gap
+      // between its own calls and diverges from ours whenever this function
+      // returned early (no objects, video not ready, buffers missing).
+      const nowMs = performance.now();
+      const flowDt = lastDrawAtMs === 0 ? Number.POSITIVE_INFINITY : (nowMs - lastDrawAtMs) / 1000;
+      lastDrawAtMs = nowMs;
+      if (flowMaskEnabled) flowSupport.beginTick(luma, flowDt);
+      flowDebug.ticks++;
+      flowDebug.regionCount = 0;
+
       for (let i = 0; i < objects.length; i++) {
         const obj = objects[i];
         if (!obj) continue;
 
-        const boxLeftFrac = obj.x - obj.width / 2;
-        const boxRightFrac = obj.x + obj.width / 2;
-        const boxTopFrac = obj.y - obj.height / 2;
-        const boxBottomFrac = obj.y + obj.height / 2;
+        const rawLeftFrac = obj.x - obj.width / 2;
+        const rawRightFrac = obj.x + obj.width / 2;
+        const rawTopFrac = obj.y - obj.height / 2;
+        const rawBottomFrac = obj.y + obj.height / 2;
 
-        const left = Math.max(0, Math.round(boxLeftFrac * ROI_CANVAS_WIDTH));
-        const right = Math.min(ROI_CANVAS_WIDTH, Math.round(boxRightFrac * ROI_CANVAS_WIDTH));
-        const top = Math.max(1, Math.round(boxTopFrac * ROI_CANVAS_HEIGHT));
-        const bottom = Math.min(ROI_CANVAS_HEIGHT, Math.round(boxBottomFrac * ROI_CANVAS_HEIGHT));
+        const rawLeft = Math.max(0, Math.round(rawLeftFrac * ROI_CANVAS_WIDTH));
+        const rawRight = Math.min(ROI_CANVAS_WIDTH, Math.round(rawRightFrac * ROI_CANVAS_WIDTH));
+        const rawTop = Math.max(1, Math.round(rawTopFrac * ROI_CANVAS_HEIGHT));
+        const rawBottom = Math.min(ROI_CANVAS_HEIGHT, Math.round(rawBottomFrac * ROI_CANVAS_HEIGHT));
+
+        // Ask the motion mask which part of this box is actually travelling
+        // with us. Everything downstream then works against `left/right/
+        // top/bottom` — the vehicle's extent when the mask had an answer,
+        // the raw box when it didn't. Nothing below can tell the difference,
+        // which is the point: one code path, two levels of information.
+        flowDebug.boxesSeen++;
+        const support = flowMaskEnabled
+          ? flowSupport.supportFor(obj.id, rawLeft, rawTop, rawRight, rawBottom, flowDt)
+          : NO_SUPPORT;
+        let left = rawLeft;
+        let right = rawRight;
+        let top = rawTop;
+        let bottom = rawBottom;
+        if (support.decided) {
+          left = Math.max(rawLeft, Math.round(support.left));
+          right = Math.min(rawRight, Math.round(support.right));
+          top = Math.max(rawTop, Math.round(support.top));
+          bottom = Math.min(rawBottom, Math.round(support.bottom));
+          if (right - left < MIN_ROI_WIDTH_PX || bottom - top < MIN_ROI_HEIGHT_PX) {
+            // The mask narrowed it past what the gradient scan can work
+            // with. Keep the raw box rather than scan a sliver.
+            left = rawLeft;
+            right = rawRight;
+            top = rawTop;
+            bottom = rawBottom;
+          } else {
+            flowDebug.boxesDecided++;
+            const rawH = rawBottom - rawTop;
+            const rawW = rawRight - rawLeft;
+            if (
+              top - rawTop > MEANINGFUL_TIGHTEN_FRACTION * rawH ||
+              rawBottom - bottom > MEANINGFUL_TIGHTEN_FRACTION * rawH ||
+              left - rawLeft > MEANINGFUL_TIGHTEN_FRACTION * rawW ||
+              rawRight - right > MEANINGFUL_TIGHTEN_FRACTION * rawW
+            ) {
+              flowDebug.boxesTightened++;
+            }
+          }
+        }
+        if (flowDebug.regionCount < MAX_DEBUG_REGIONS) {
+          const o = flowDebug.regionCount * 6;
+          flowDebug.regions[o] = obj.id;
+          flowDebug.regions[o + 1] = support.decided ? 1 : 0;
+          flowDebug.regions[o + 2] = left / ROI_CANVAS_WIDTH;
+          flowDebug.regions[o + 3] = top / ROI_CANVAS_HEIGHT;
+          flowDebug.regions[o + 4] = right / ROI_CANVAS_WIDTH;
+          flowDebug.regions[o + 5] = bottom / ROI_CANVAS_HEIGHT;
+          flowDebug.regionCount++;
+        }
+
+        // Everything below reasons in "the region we believe is the vehicle"
+        // — fractions and pixel bounds alike. On an undecided tick these are
+        // identical to the raw box, so this is the pre-existing algorithm
+        // unchanged.
+        const boxLeftFrac = left / ROI_CANVAS_WIDTH;
+        const boxRightFrac = right / ROI_CANVAS_WIDTH;
+        const boxTopFrac = top / ROI_CANVAS_HEIGHT;
+        const effWidth = boxRightFrac - boxLeftFrac;
+        const effHeight = bottom / ROI_CANVAS_HEIGHT - boxTopFrac;
 
         const track = findOrClaimTrack(obj.id);
         if (track) track.touchedTick = tickCounter;
+
+        // The motion-derived top edge is a better fallback than the padded
+        // box top DetectionTracker wrote, so install it now — before the
+        // gradient scan, which may or may not improve on it. Coarse (one
+        // cell, ~4% of frame height) but honestly placed, where the box top
+        // on a loosely-framed vehicle can be 30-60% of frame height out.
+        if (support.decided) {
+          obj.surfaceY = clamp01(boxTopFrac);
+          obj.surfaceLeft = clamp01(boxLeftFrac);
+          obj.surfaceRight = clamp01(boxRightFrac);
+          for (let p = 0; p < SURFACE_PROFILE_SAMPLES; p++) obj.surfaceProfile[p] = obj.surfaceY;
+        }
 
         if (right - left < MIN_ROI_WIDTH_PX || bottom - top < MIN_ROI_HEIGHT_PX) {
           // Too small to say anything — leave the caller's box-top/flat
@@ -763,11 +970,11 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
               // box bounds first, since the box may have moved or resized
               // underneath the held value.
               const holdLo = boxTopFrac;
-              const holdHi = boxTopFrac + SEARCH_BAND_FRACTION * obj.height;
+              const holdHi = boxTopFrac + SEARCH_BAND_FRACTION * effHeight;
               const clampedY = clamp(track.smoothedY, holdLo, holdHi);
               const clampedLeft = clamp(track.smoothedLeft, boxLeftFrac, boxRightFrac);
               const clampedRight = clamp(track.smoothedRight, boxLeftFrac, boxRightFrac);
-              if (clampedRight - clampedLeft >= MIN_SURFACE_WIDTH_FRACTION_OF_BOX * obj.width * 0.5) {
+              if (clampedRight - clampedLeft >= MIN_SURFACE_WIDTH_FRACTION_OF_BOX * effWidth * 0.5) {
                 obj.surfaceY = clamp01(clampedY);
                 obj.surfaceLeft = clamp01(clampedLeft);
                 obj.surfaceRight = clamp01(clampedRight);
@@ -787,9 +994,9 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
         let candLeft = hit.runLeft / ROI_CANVAS_WIDTH;
         let candRight = hit.runRight / ROI_CANVAS_WIDTH;
 
-        // Never report a surface narrower than a fraction of the box's own
+        // Never report a surface narrower than a fraction of the region's
         // width — expand symmetrically around the found run's centre.
-        const minWidth = MIN_SURFACE_WIDTH_FRACTION_OF_BOX * obj.width;
+        const minWidth = MIN_SURFACE_WIDTH_FRACTION_OF_BOX * effWidth;
         if (candRight - candLeft < minWidth) {
           const centre = (candLeft + candRight) / 2;
           candLeft = centre - minWidth / 2;
@@ -841,7 +1048,7 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
           continue;
         }
 
-        applyCandidate(track, step, candY, candLeft, candRight, profileCandidateScratch, obj.height);
+        applyCandidate(track, step, candY, candLeft, candRight, profileCandidateScratch, effHeight);
         obj.surfaceY = clamp01(track.smoothedY);
         obj.surfaceLeft = clamp01(track.smoothedLeft);
         obj.surfaceRight = clamp01(track.smoothedRight);
@@ -851,6 +1058,9 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
       }
 
       sweepStaleTracks();
+      if (flowMaskEnabled) flowSupport.endTick();
+      flowDebug.lastCostMs = flowSupport.lastTickCostMs;
+      flowDebug.costMsTotal += flowSupport.lastTickCostMs;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'SecurityError') {
         disabledBySecurityError = true;
@@ -872,6 +1082,8 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
     refine,
     stop(): void {
       dropBuffers();
+      flowSupport.reset();
+      lastDrawAtMs = 0;
       for (let i = 0; i < tracks.length; i++) {
         const t = tracks[i];
         if (t) {
@@ -879,6 +1091,9 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
           t.hasEstimate = false;
         }
       }
+    },
+    get flowDebug(): SurfaceFlowDebug {
+      return flowDebug;
     },
   };
 }

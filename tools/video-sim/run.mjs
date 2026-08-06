@@ -28,10 +28,28 @@ const flag = (name, fallback) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 && args[i + 1] ? Number(args[i + 1]) : fallback;
 };
+const strFlag = (name, fallback) => {
+  const i = args.indexOf(`--${name}`);
+  return i >= 0 && args[i + 1] ? String(args[i + 1]) : fallback;
+};
 const playbackRate = flag('rate', 1);
 const maxSeconds = flag('seconds', 60);
 const shotCount = flag('shots', 8);
 const mode = args.includes('--windscreen') ? 'windscreen' : 'window';
+/**
+ * `--tag before` prefixes every written PNG so an A/B pair survives two runs
+ * instead of the second overwriting the first. `--at 12.3,20` additionally
+ * grabs the annotated frame at those exact playback times — the only way to
+ * revisit one specific vehicle, which is what a before/after on a named
+ * failure case needs.
+ */
+const tag = strFlag('tag', '');
+const prefix = tag ? `${tag}-` : '';
+const explicitShots = strFlag('at', '')
+  .split(',')
+  .map((s) => Number(s.trim()))
+  .filter((n) => Number.isFinite(n))
+  .sort((a, b) => a - b);
 
 if (!videoArg) {
   console.error('Usage: node tools/video-sim/run.mjs <video.mp4> [--rate 2] [--seconds 60]');
@@ -77,7 +95,8 @@ const page = await (await browser.newContext({ viewport: { width: 1280, height: 
 page.on('pageerror', (e) => console.error('  page error:', e.message));
 page.on('console', (m) => { if (m.type() === 'error') console.error('  console:', m.text().slice(0, 200)); });
 
-await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}`, { waitUntil: 'load' });
+const maskQuery = (args.includes('--mask') ? '&mask=1' : '') + (args.includes('--nomask') ? '&nomask=1' : '');
+await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}${maskQuery}`, { waitUntil: 'load' });
 
 const meta = await page.evaluate(
   ([src, rate]) => window.__simStart(src, rate),
@@ -89,23 +108,36 @@ const wallLimit = Math.min(meta.duration / playbackRate, maxSeconds / playbackRa
 const started = Date.now();
 const shotAt = Array.from({ length: shotCount }, (_, i) => ((i + 0.5) / shotCount) * Math.min(meta.duration, maxSeconds));
 let nextShot = 0;
+const atQueue = explicitShots.slice();
+let nextAt = 0;
 
 while (Date.now() - started < wallLimit) {
   const done = await page.evaluate(() => window.__simDone);
   const t = await page.evaluate(() => document.getElementById('v').currentTime);
+  if (nextAt < atQueue.length && t >= atQueue[nextAt]) {
+    // Freeze the overlay, park the video on the exact requested time, shoot,
+    // resume. Two runs then differ only in what the annotation says, not in
+    // which frame it is drawn over.
+    const at = atQueue[nextAt];
+    const landed = await page.evaluate((target) => window.__simFreezeAt(target), at);
+    await page.locator('#wrap').screenshot({ path: join(outDir, `${prefix}at-${at.toFixed(1)}.png`) });
+    await page.evaluate(() => window.__simResume());
+    if (landed === undefined) console.warn('  freeze failed at', at);
+    nextAt++;
+  }
   if (nextShot < shotAt.length && t >= shotAt[nextShot]) {
-    await page.locator('#wrap').screenshot({ path: join(outDir, `frame-${String(nextShot + 1).padStart(2, '0')}.png`) });
+    await page.locator('#wrap').screenshot({ path: join(outDir, `${prefix}frame-${String(nextShot + 1).padStart(2, '0')}.png`) });
     nextShot++;
   }
   if (done || t >= maxSeconds) break;
-  await new Promise((r) => setTimeout(r, 200));
+  await new Promise((r) => setTimeout(r, 120));
 }
 
 const log = await page.evaluate(() => window.__simLog);
 await browser.close();
 stopVite();
 
-await writeFile(join(outDir, 'log.json'), JSON.stringify(log, null, 2));
+await writeFile(join(outDir, `${prefix}log.json`), JSON.stringify(log, null, 2));
 
 /* ---------------------------- report ---------------------------- */
 
@@ -248,6 +280,22 @@ if (spreads.length) {
 }
 if (colSteps.length) {
   console.log(`  per-column frame-to-frame jump (stable tracks): median ${colMedStep.toFixed(4)}  p90 ${colP90Step.toFixed(4)}  ${colMedStep > 0.02 ? '← jittery' : '← steady'}`);
+}
+
+// Motion-mask report: how often flow had an answer inside a detection box,
+// how often that answer meaningfully tightened the box, and what it cost.
+const flow = log.flow;
+const flowCost = (log.flowCost ?? []).slice().sort((a, b) => a - b);
+const costAt = (q) => (flowCost.length ? flowCost[Math.min(flowCost.length - 1, Math.floor(q * flowCost.length))] : NaN);
+console.log('\n══════════ MOTION MASK (flow inside the box) ══════════');
+if (!flow) {
+  console.log('  no mask samples');
+} else {
+  console.log(`  boxes examined       : ${flow.boxesSeen}`);
+  console.log(`  flow had an answer   : ${flow.boxesDecided} (${((100 * flow.boxesDecided) / (flow.boxesSeen || 1)).toFixed(1)}%)`);
+  console.log(`  too weak → fell back : ${flow.boxesSeen - flow.boxesDecided} (${((100 * (flow.boxesSeen - flow.boxesDecided)) / (flow.boxesSeen || 1)).toFixed(1)}%)`);
+  console.log(`  meaningfully tightened: ${flow.boxesTightened} (${((100 * flow.boxesTightened) / (flow.boxesSeen || 1)).toFixed(1)}% of boxes, ${((100 * flow.boxesTightened) / (flow.boxesDecided || 1)).toFixed(1)}% of decided)`);
+  console.log(`  cost per detector tick: median ${costAt(0.5).toFixed(2)}ms  p90 ${costAt(0.9).toFixed(2)}ms  max ${flowCost.length ? flowCost[flowCost.length - 1].toFixed(2) : 'n/a'}ms  (${flow.ticks} ticks)`);
 }
 
 console.log(`\nAnnotated frames: ${outDir}/frame-*.png`);

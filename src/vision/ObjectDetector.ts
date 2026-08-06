@@ -41,7 +41,7 @@
  */
 
 import { createDetectionTracker, type DetectionTracker } from './DetectionTracker.ts';
-import { createSurfaceProfileFinder, type SurfaceProfileFinder } from './SurfaceProfileFinder.ts';
+import { createSurfaceProfileFinder, type SurfaceFlowDebug, type SurfaceProfileFinder } from './SurfaceProfileFinder.ts';
 import { createSceneAnalyser } from './SceneAnalyser.ts';
 import { createCarriagewayFilter, type CarriagewayFilter, type CarriagewayRejectReason } from './CarriagewayFilter.ts';
 import type {
@@ -66,6 +66,13 @@ import type {
  * caller depends on — purely additive, purely diagnostic.
  */
 interface ObjectDetectorDebugOptions {
+  /** Motion-mask diagnostics — what FlowSupport decided per box this tick,
+   * plus its cell grid, so the harness can draw the mask instead of
+   * reasoning about it. Never set by App.ts. */
+  onSurfaceFlowDebug?: (debug: SurfaceFlowDebug) => void;
+  /** Diagnostic only: run SurfaceProfileFinder's pre-mask algorithm, so the
+   * harness can A/B the same build against itself. Never set by App.ts. */
+  disableFlowMask?: boolean;
   onCarriagewayDebug?: (
     kept: readonly TrackedObject[],
     rejected: readonly TrackedObject[],
@@ -202,7 +209,9 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   let intervalMs = intervalForMode();
 
   const tracker: DetectionTracker = createDetectionTracker();
-  const surfaceFinder: SurfaceProfileFinder = createSurfaceProfileFinder();
+  const surfaceFinder: SurfaceProfileFinder = createSurfaceProfileFinder({
+    disableFlowMask: (options as ObjectDetectorOptions & ObjectDetectorDebugOptions).disableFlowMask === true,
+  });
   /**
    * ObjectDetector owns its own SceneAnalyser instance rather than taking
    * the horizon as an option — `ObjectDetectorOptions` is frozen (see
@@ -357,7 +366,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
    */
   function emitTracked(): void {
     const debugOptions = options as ObjectDetectorOptions & ObjectDetectorDebugOptions;
-    if (!options.onTrackedObjects && !debugOptions.onCarriagewayDebug) return;
+    if (!options.onTrackedObjects && !debugOptions.onCarriagewayDebug && !debugOptions.onSurfaceFlowDebug) return;
     const now = performance.now();
     const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
     lastTrackUpdateMs = now;
@@ -367,6 +376,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     // Falls back to the box's own top edge and sides (already written by
     // the tracker) on any failure.
     surfaceFinder.refine(video, trackedObjects, dt);
+    debugOptions.onSurfaceFlowDebug?.(surfaceFinder.flowDebug);
     // Keep only vehicles plausibly travelling with us on our own
     // carriageway (see CarriagewayFilter.ts for the full reasoning).
     // person/sign objects pass through untouched. Falls back to the

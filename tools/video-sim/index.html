@@ -37,7 +37,8 @@
       const ctx = overlay.getContext('2d');
 
       /** Everything observed, drained by the Node runner at the end. */
-      const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [], carriageway: [] };
+      const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [], carriageway: [],
+                    flow: null, flowRegions: [], flowCost: [] };
       let tracked = [];
       window.__simLog = log;
       window.__simDone = false;
@@ -54,6 +55,17 @@
       let rejected = [];
       let rejectedReasons = [];
       let carriagewayHorizonY = null;
+
+      // Motion-mask diagnostics (FlowSupport via SurfaceProfileFinder).
+      // `?mask=1` paints the per-cell classification over the video so the
+      // question "does flow actually separate the vehicle from the sky?"
+      // gets looked at rather than argued about. The tightened region is
+      // always drawn — it is what the surface scan was actually pointed at.
+      const SHOW_MASK = new URLSearchParams(location.search).get('mask') === '1';
+      let flowCells = null;      // Uint8Array copy
+      let flowGrid = null;       // { cols, rows, size, canvasWidth, canvasHeight }
+      let flowRegions = [];      // { id, decided, left, top, right, bottom }
+      let flowTotals = null;
       const REASON_COLORS = {
         corridor: '#ff9d3d',
         size: '#c86bff',
@@ -62,6 +74,12 @@
       };
 
       function draw() {
+        // While frozen the overlay is left exactly as it was last painted and
+        // the runner seeks the video to an exact time underneath it. That is
+        // what makes a before/after pair comparable: both runs show the SAME
+        // video frame, each with the annotation its own build computed on the
+        // tick just before it. Resizing/clearing here would wipe it.
+        if (window.__simFreeze) { requestAnimationFrame(draw); return; }
         overlay.width = video.clientWidth;
         overlay.height = video.clientHeight;
         ctx.clearRect(0, 0, overlay.width, overlay.height);
@@ -108,6 +126,41 @@
           ctx.closePath();
           ctx.fill();
           ctx.stroke();
+        }
+
+        // The motion mask, cell by cell. Green = "moves with us" (vehicle),
+        // red = "moves with the world" (sky edge, treeline, wire, road),
+        // nothing drawn = no texture to judge by. Only under ?mask=1 — it
+        // covers the picture, which is exactly what you want when checking
+        // the mask and exactly what you don't when checking the surface.
+        if (SHOW_MASK && flowCells && flowGrid) {
+          const cw = (flowGrid.size / flowGrid.canvasWidth) * overlay.width;
+          const ch = (flowGrid.size / flowGrid.canvasHeight) * overlay.height;
+          for (let r = 0; r < flowGrid.rows; r++) {
+            for (let c = 0; c < flowGrid.cols; c++) {
+              const v = flowCells[r * flowGrid.cols + c];
+              if (v === 0 || v === 1) continue; // unevaluated / unknown
+              ctx.fillStyle = v === 2 ? 'rgba(60,255,120,0.42)' : 'rgba(255,60,60,0.30)';
+              ctx.fillRect(c * cw, r * ch, cw - 1, ch - 1);
+            }
+          }
+        }
+
+        // The region the surface scan was actually pointed at. Solid cyan
+        // when the mask decided it, so a tightened box is instantly
+        // distinguishable from an untouched one on a still frame.
+        for (const reg of flowRegions) {
+          if (!reg.decided) continue;
+          ctx.strokeStyle = 'rgba(0,229,255,0.9)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([2, 2]);
+          ctx.strokeRect(
+            reg.left * overlay.width,
+            reg.top * overlay.height,
+            (reg.right - reg.left) * overlay.width,
+            (reg.bottom - reg.top) * overlay.height,
+          );
+          ctx.setLineDash([]);
         }
 
         // Rejected objects — dropped by CarriagewayFilter this tick. Thick
@@ -215,7 +268,8 @@
           `t=${video.currentTime.toFixed(1)}s / ${(video.duration || 0).toFixed(1)}s   ` +
           `horizon=${h.y === null ? 'null' : h.y.toFixed(3)} conf=${h.confidence.toFixed(2)}   ` +
           `detections=${latest.length}   detector=${detector.state.status}   ` +
-          `carriageway: kept=${tracked.length} rejected=${rejected.length}`;
+          `carriageway: kept=${tracked.length} rejected=${rejected.length}   ` +
+          (flowTotals ? `mask: ${flowTotals.boxesDecided}/${flowTotals.boxesSeen} decided, ${flowTotals.lastCostMs.toFixed(2)}ms` : 'mask: -');
 
         if (!window.__simDone) requestAnimationFrame(draw);
       }
@@ -248,6 +302,33 @@
         // type, not part of the frozen ObjectDetectorOptions contract (see
         // ObjectDetector.ts) — exists purely so this harness can see what
         // the carriageway filter dropped and why.
+        // Diagnostic-only, same escape hatch as onCarriagewayDebug: the
+        // arrays handed over are reused by the finder, so copy anything the
+        // next rAF will still want to draw.
+        onSurfaceFlowDebug: (d) => {
+          flowGrid = { cols: d.cellCols, rows: d.cellRows, size: d.cellSize,
+                       canvasWidth: d.canvasWidth, canvasHeight: d.canvasHeight };
+          flowCells = Uint8Array.from(d.cells);
+          flowRegions = [];
+          for (let i = 0; i < d.regionCount; i++) {
+            const o = i * 6;
+            flowRegions.push({ id: d.regions[o], decided: d.regions[o + 1] === 1,
+              left: d.regions[o + 2], top: d.regions[o + 3],
+              right: d.regions[o + 4], bottom: d.regions[o + 5] });
+          }
+          flowTotals = { ticks: d.ticks, boxesSeen: d.boxesSeen, boxesDecided: d.boxesDecided,
+            boxesTightened: d.boxesTightened, costMsTotal: d.costMsTotal, lastCostMs: d.lastCostMs };
+          log.flow = flowTotals;
+          for (const reg of flowRegions) {
+            log.flowRegions.push({ t: +video.currentTime.toFixed(2), id: reg.id, decided: reg.decided,
+              left: +reg.left.toFixed(4), top: +reg.top.toFixed(4),
+              right: +reg.right.toFixed(4), bottom: +reg.bottom.toFixed(4) });
+          }
+          log.flowCost.push(+d.lastCostMs.toFixed(3));
+        },
+        // Diagnostic A/B switch: `?nomask=1` runs SurfaceProfileFinder's
+        // pre-mask algorithm, so "before" and "after" are the same build.
+        disableFlowMask: new URLSearchParams(location.search).get('nomask') === '1',
         onCarriagewayDebug: (kept, rej, reasons, horizonY) => {
           rejected = rej.map((o) => ({ ...o }));
           rejectedReasons = reasons.slice();
@@ -274,6 +355,30 @@
       });
 
       window.addEventListener('error', (e) => log.errors.push(String(e.message)));
+
+      /**
+       * Park the picture on an exact video time without letting the analysis
+       * see the seek. `draw()` stops repainting first, so the overlay keeps
+       * the annotation computed from real playback; then the video is paused
+       * and seeked, which would otherwise hand the motion mask a discontinuity
+       * (and a paused frame, where nothing moves and everything reads as
+       * "with us"). `__simResume` puts it back.
+       */
+      window.__simFreezeAt = async (t) => {
+        window.__simFreeze = true;
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        video.pause();
+        await new Promise((res) => {
+          const done = () => { video.removeEventListener('seeked', done); res(); };
+          video.addEventListener('seeked', done);
+          video.currentTime = t;
+        });
+        return +video.currentTime.toFixed(3);
+      };
+      window.__simResume = async () => {
+        window.__simFreeze = false;
+        await video.play();
+      };
 
       window.__simStart = async (src, playbackRate) => {
         video.src = src;
