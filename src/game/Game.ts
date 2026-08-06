@@ -28,7 +28,6 @@ import {
   CROSSING_GOAL_SHAKE_TRAUMA,
   CROSSING_GOAL_SPARKLE_COLOR,
   CROSSING_HITSTOP_SECONDS,
-  CROSSING_HOP_REACTION_SECONDS,
   CROSSING_LANDING_ASSIST_HORIZONTAL_PX_EASY,
   CROSSING_LANDING_ASSIST_HORIZONTAL_PX_HARD,
   CROSSING_LANDING_ASSIST_VERTICAL_PX_EASY,
@@ -47,10 +46,6 @@ import {
   CROSSING_SCORE_BONUS_PER_CROSSING,
   CROSSING_SCORE_PER_PIXEL_PROGRESS,
   CROSSING_SCORE_PER_SECOND,
-  CROSSING_TARGET_HOPS_PER_CROSSING,
-  CROSSING_TIMER_FLOOR_GENEROSITY,
-  CROSSING_TIMER_SHRINK_PER_CROSSING_SECONDS,
-  CROSSING_TIMER_START_GENEROSITY,
   CROSSING_WALK_SPEED,
   DEBUG_TEXT_COLOR,
   DEBUG_TEXT_SIZE,
@@ -204,40 +199,11 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
    * the distance-progress score term measures against. */
   let crossingLastPlayerX = 0;
 
-  /** Per-leg countdown — the pressure mechanic. `crossingTimeTotal` is this
-   * leg's starting budget (see crossingLegTimeSeconds), used only to derive
-   * the HUD bar's fraction; `crossingTimeRemaining` is what actually ends
-   * the run at 0. */
-  let crossingTimeTotal = 0;
-  let crossingTimeRemaining = 0;
   /** Consecutive PERFECT landings (see CROSSING_PERFECT_LANDING_WIDTH_
    * FRACTION) — broken by any non-perfect landing, persists across
    * completed crossings within a single run. Scales the perfect-landing
    * score bonus and drives the visible combo counter in the HUD. */
   let comboCount = 0;
-
-  /**
-   * This leg's countdown budget: `CROSSING_TARGET_HOPS_PER_CROSSING` hops,
-   * each budgeted a full-power jump's own flight time
-   * (`crossingFullPowerFlightTimeSeconds` — see util/solvability.ts; the
-   * longest a hop normally takes, so this is already generous for the
-   * common shorter/weaker hop) plus CROSSING_HOP_REACTION_SECONDS of
-   * aim/walk time. The very first leg gets CROSSING_TIMER_START_GENEROSITY
-   * times that bare budget; each completed crossing shaves
-   * CROSSING_TIMER_SHRINK_PER_CROSSING_SECONDS off, down to a floor of
-   * CROSSING_TIMER_FLOOR_GENEROSITY times the bare budget — strictly above
-   * 1x, so the leg always stays theoretically completable at exactly
-   * CROSSING_TARGET_HOPS_PER_CROSSING back-to-back hops, at any difficulty.
-   */
-  function crossingLegTimeSeconds(crossingsCompleted: number): number {
-    const hopSeconds = crossingFullPowerFlightTimeSeconds(canvasWidth);
-    const perHopBudget = hopSeconds + CROSSING_HOP_REACTION_SECONDS;
-    const bareBudget = CROSSING_TARGET_HOPS_PER_CROSSING * perHopBudget;
-    const startTime = bareBudget * CROSSING_TIMER_START_GENEROSITY;
-    const floorTime = bareBudget * CROSSING_TIMER_FLOOR_GENEROSITY;
-    const shrunk = startTime - crossingsCompleted * CROSSING_TIMER_SHRINK_PER_CROSSING_SECONDS;
-    return Math.max(floorTime, shrunk);
-  }
 
   function applyLayout(width: number, height: number): void {
     canvasWidth = width;
@@ -431,14 +397,10 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       player.setEdgeWarningIntensity(0);
     }
 
-    // --- Lose #3: the per-leg countdown ran out — the pressure mechanic.
-    // Telegraphed by the HUD timer bar's own color shift (see
-    // CrossingSystem.updateHud) well before it actually fires.
-    crossingTimeRemaining -= dt;
-    if (crossingTimeRemaining <= 0) {
-      handleCollision();
-      return;
-    }
+    // NO COUNTDOWN, deliberately. A per-leg timer was tried and cut: it
+    // punished the player for the one thing they cannot control — how much
+    // real traffic happens to be on the road. On an empty stretch you were
+    // racing a clock with nothing to land on. Falling is the only failure.
 
     // --- Score: survival + any horizontal movement (walking OR being
     // carried both count — this is a "keep moving" incentive, not a
@@ -461,7 +423,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
       worldContainer.y = 0;
     }
 
-    crossing.updateHud(canvasWidth, crossingTimeTotal > 0 ? crossingTimeRemaining / crossingTimeTotal : 0, comboCount);
+    crossing.updateHud(canvasWidth, comboCount);
 
     if (debugText !== null) {
       debugAccumulator += dt;
@@ -470,7 +432,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
         const fps = dt > 0 ? 1 / dt : 0;
         debugText.text =
           `fps ${fps.toFixed(0)}  score ${scoreInt}  crossings ${crossing.crossingsCompleted}` +
-          `  platforms ${crossing.platforms.length}  timer ${crossingTimeRemaining.toFixed(1)}/${crossingTimeTotal.toFixed(1)}` +
+          `  platforms ${crossing.platforms.length}` +
           `  combo ${comboCount}`;
       }
     }
@@ -510,8 +472,6 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     crossingEdgeWarningTimer = 0;
     crossingLastPlayerX = newStartCenterX;
 
-    crossingTimeTotal = crossingLegTimeSeconds(crossing.crossingsCompleted);
-    crossingTimeRemaining = crossingTimeTotal;
 
     const newScoreInt = Math.floor(scoreAccumulator);
     if (newScoreInt !== scoreInt) {
@@ -543,9 +503,7 @@ export const createGame: CreateGame = async (options: GameOptions): Promise<Game
     comboCount = 0;
     worldContainer.x = 0;
     worldContainer.y = 0;
-    crossingTimeTotal = crossingLegTimeSeconds(0);
-    crossingTimeRemaining = crossingTimeTotal;
-    crossing.updateHud(canvasWidth, 1, 0);
+    crossing.updateHud(canvasWidth, 0);
   }
 
   const loop = new GameLoop(update);

@@ -46,7 +46,6 @@ import {
   CROSSING_COMBO_TEXT_COLOR,
   CROSSING_COMBO_TEXT_OUTLINE_COLOR,
   CROSSING_COMBO_TEXT_SIZE,
-  CROSSING_COMBO_TEXT_Y_PX,
   CROSSING_DIFFICULTY_RAMP_CROSSINGS,
   CROSSING_GHOST_DRIFT_RANGE_PX,
   CROSSING_GHOST_DRIFT_SPEED_RADIANS_PER_SECOND,
@@ -66,16 +65,6 @@ import {
   CROSSING_PREVIEW_DOT_COUNT,
   CROSSING_PREVIEW_DOT_RADIUS,
   CROSSING_RIGHT_BLOCK_CENTER_X_FRACTION,
-  CROSSING_TIMER_BAR_BG_ALPHA,
-  CROSSING_TIMER_BAR_BG_COLOR,
-  CROSSING_TIMER_BAR_COLOR_CRITICAL,
-  CROSSING_TIMER_BAR_COLOR_SAFE,
-  CROSSING_TIMER_BAR_COLOR_WARN,
-  CROSSING_TIMER_BAR_CRITICAL_FRACTION,
-  CROSSING_TIMER_BAR_HEIGHT_PX,
-  CROSSING_TIMER_BAR_TOP_MARGIN_PX,
-  CROSSING_TIMER_BAR_WARN_FRACTION,
-  CROSSING_TIMER_BAR_WIDTH_FRACTION,
   GRAVITY,
   PLATFORM_FADE_SECONDS,
   PLATFORM_FOLLOW_LERP_RATE,
@@ -455,46 +444,22 @@ export class CrossingSystem {
    * counter text (only touched when the count actually changes, since a
    * Pixi Text content write re-lays-out glyphs). `timerFraction` is
    * remaining/total, 0..1. */
-  updateHud(canvasWidth: number, timerFraction: number, comboCount: number): void {
-    const barWidth = canvasWidth * CROSSING_TIMER_BAR_WIDTH_FRACTION;
-    const barX = (canvasWidth - barWidth) / 2;
-    const barY = CROSSING_TIMER_BAR_TOP_MARGIN_PX;
-
+  /**
+   * The timer bar is gone — a countdown punished the player for how much real
+   * traffic happened to exist, which they cannot control. Only the combo
+   * readout remains.
+   */
+  updateHud(canvasWidth: number, comboCount: number): void {
     if (Math.abs(canvasWidth - this.lastHudWidth) > 0.5) {
       this.lastHudWidth = canvasWidth;
-      this.timerBarBg.clear().roundRect(0, 0, barWidth, CROSSING_TIMER_BAR_HEIGHT_PX, CROSSING_TIMER_BAR_HEIGHT_PX / 2).fill({
-        color: CROSSING_TIMER_BAR_BG_COLOR,
-        alpha: CROSSING_TIMER_BAR_BG_ALPHA,
-      });
-      this.timerBarBg.x = barX;
-      this.timerBarBg.y = barY;
       this.comboText.x = canvasWidth / 2;
     }
 
-    const fraction = clamp(timerFraction, 0, 1);
-    const color =
-      fraction <= CROSSING_TIMER_BAR_CRITICAL_FRACTION
-        ? CROSSING_TIMER_BAR_COLOR_CRITICAL
-        : fraction <= CROSSING_TIMER_BAR_WARN_FRACTION
-          ? CROSSING_TIMER_BAR_COLOR_WARN
-          : CROSSING_TIMER_BAR_COLOR_SAFE;
-    this.timerBarFill.clear();
-    if (fraction > 0) {
-      this.timerBarFill.roundRect(0, 0, Math.max(1, barWidth * fraction), CROSSING_TIMER_BAR_HEIGHT_PX, CROSSING_TIMER_BAR_HEIGHT_PX / 2).fill({ color });
-    }
-    this.timerBarFill.x = barX;
-    this.timerBarFill.y = barY;
-
     if (comboCount !== this.lastComboDisplayed) {
       this.lastComboDisplayed = comboCount;
-      if (comboCount >= 1) {
-        this.comboText.text = `PERFECT x${comboCount}`;
-        this.comboText.visible = true;
-      } else {
-        this.comboText.visible = false;
-      }
+      this.comboText.visible = comboCount > 1;
+      if (comboCount > 1) this.comboText.text = `PERFECT x${comboCount}`;
     }
-    this.comboText.y = CROSSING_COMBO_TEXT_Y_PX;
   }
 
   private retintBlocks(): void {
