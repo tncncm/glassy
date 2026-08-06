@@ -75,7 +75,7 @@ const { chromium } = await import(
 const browser = await chromium.launch();
 const page = await (await browser.newContext({ viewport: { width: 1280, height: 720 } })).newPage();
 page.on('pageerror', (e) => console.error('  page error:', e.message));
-page.on('console', (m) => { if (m.type() === 'error' || m.text().startsWith('[PROFDBG')) console.error('  console:', m.text().slice(0, 300)); });
+page.on('console', (m) => { if (m.type() === 'error') console.error('  console:', m.text().slice(0, 200)); });
 
 await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}`, { waitUntil: 'load' });
 

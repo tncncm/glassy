@@ -318,8 +318,6 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
   const profileCandidateScratch = new Float32Array(SURFACE_PROFILE_SAMPLES);
   let disabledBySecurityError = false;
   let warnedOnce = false;
-  // TEMP DEBUG — remove before shipping.
-  const __dbg = { calls: 0, pass1Total: 0, pass1Nan: 0, outlierRejected: 0, bigCalls: 0, tickCostSum: 0, tickCostCount: 0, tickCostMax: 0 };
 
   const tracks: SurfaceTrack[] = Array.from({ length: MAX_SURFACE_TRACKS }, () => ({
     id: 0,
@@ -558,18 +556,6 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
       const row = findEdgeRow(lumaBuf, xLeft, xRight, bandStart, bandEnd);
       internalRowScratch[i] = row === null ? Number.NaN : row;
     }
-    // TEMP DEBUG pass1
-    __dbg.calls++;
-    for (let i = 0; i < nInternal; i++) {
-      __dbg.pass1Total++;
-      const v = internalRowScratch[i];
-      if (v === undefined || Number.isNaN(v)) __dbg.pass1Nan++;
-    }
-    if (nInternal >= 12 && __dbg.bigCalls < 25) {
-      __dbg.bigCalls++;
-      console.log('[PROFDBG-BIG] call', __dbg.calls, 'nInternal', nInternal, 'domainW', domainWidthPx, 'boxH', boxHeightPx,
-        'raw', Array.from(internalRowScratch.slice(0, nInternal)).map((v) => Number.isNaN(v) ? 'NaN' : v.toFixed(1)).join(','));
-    }
 
     // Pass 2: reject interior bins whose candidate disagrees sharply with
     // BOTH immediate neighbours — see PROFILE_OUTLIER_REJECT_FRACTION_OF_BOX.
@@ -583,11 +569,7 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
       const med = medianOf3(a, v, b);
       if (Math.abs(v - med) > outlierThresholdPx) {
         internalRowScratch[i] = Number.NaN;
-        __dbg.outlierRejected++;
       }
-    }
-    if (__dbg.calls % 200 === 0) {
-      console.log('[PROFDBG] SUMMARY calls', __dbg.calls, 'pass1NanRate', (__dbg.pass1Nan / __dbg.pass1Total).toFixed(3), 'outlierRejected', __dbg.outlierRejected);
     }
 
     // Pass 3: fill every gap by interpolating between the nearest surviving
@@ -729,7 +711,6 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
 
     tickCounter++;
     const step = Math.max(0, Math.min(dt, 1));
-    const __t0 = performance.now();
 
     try {
       ctx.drawImage(video, 0, 0, ROI_CANVAS_WIDTH, ROI_CANVAS_HEIGHT);
@@ -870,14 +851,6 @@ export function createSurfaceProfileFinder(): SurfaceProfileFinder {
       }
 
       sweepStaleTracks();
-      // TEMP DEBUG timing
-      const __elapsed = performance.now() - __t0;
-      __dbg.tickCostSum += __elapsed;
-      __dbg.tickCostCount++;
-      __dbg.tickCostMax = Math.max(__dbg.tickCostMax, __elapsed);
-      if (__dbg.tickCostCount % 100 === 0) {
-        console.log('[PROFDBG-COST] n', __dbg.tickCostCount, 'avgMs', (__dbg.tickCostSum / __dbg.tickCostCount).toFixed(4), 'maxMs', __dbg.tickCostMax.toFixed(4), 'objectsThisTick', objects.length);
-      }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'SecurityError') {
         disabledBySecurityError = true;
