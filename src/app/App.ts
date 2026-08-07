@@ -42,6 +42,12 @@ import { createMotionSensor } from '../motion/MotionSensor.ts';
 import { createUIController } from '../ui/UIController.ts';
 import { createObjectDetector } from '../vision/ObjectDetector.ts';
 import { createSceneAnalyser } from '../vision/SceneAnalyser.ts';
+// Type-only — erased entirely at compile time, exactly like detector.worker.ts's
+// types being imported into ObjectDetector.ts. Does NOT pull InstanceSegmenter,
+// onnxruntime-web or the segmentation worker into this file or the main bundle;
+// only the literal `if (import.meta.env.DEV)` dynamic `import()` below does
+// that, and only in a dev build. See initSegBridgeIfRequested()'s own doc.
+import type { SegDebugInfo, SegGameBridge } from '../vision/experimental/SegGameBridge.ts';
 
 /**
  * Internal app state. Distinct from `ScreenName`: `requestingCamera` is a real
@@ -142,6 +148,20 @@ export async function createApp(root: HTMLElement): Promise<App> {
       game.onTrackedObjects(objects);
     },
   });
+
+  /**
+   * DEV-ONLY: the experimental YOLO instance-segmentation prototype (see
+   * src/vision/experimental/), gated behind `?seg=yolo` and constructed (if
+   * at all) by initSegBridgeIfRequested() during start(). `segModeActive`
+   * flips true only when that flag was actually read on a dev build, and is
+   * what makes syncDetector()/syncSegBridge() below mutually exclusive: the
+   * shipped detector and this prototype never both drive `game.onTrackedObjects`
+   * at once. Left `null`/`false` in every production build and in dev
+   * whenever the query param is absent — the default, unflagged path is
+   * untouched by any of this.
+   */
+  let segBridge: SegGameBridge | null = null;
+  let segModeActive = false;
 
   /**
    * The phone's own movement. Two uses: damping hand-shake out of platform
@@ -372,6 +392,15 @@ export async function createApp(root: HTMLElement): Promise<App> {
    * for any state where there's no gameplay reason to examine them.
    */
   function syncDetector(): void {
+    if (segModeActive) {
+      // Dev-only ?seg=yolo override active — never let the shipped detector
+      // also drive game.onTrackedObjects; see initSegBridgeIfRequested()'s
+      // doc for why the two are mutually exclusive. False in every
+      // production build and in dev without the flag, so this is a no-op
+      // there and the line above never returns early.
+      detector.stop();
+      return;
+    }
     if (!preferences.getVisionEnabled()) {
       detector.stop();
       return;
@@ -387,11 +416,29 @@ export async function createApp(root: HTMLElement): Promise<App> {
     void detector.start();
   }
 
+  /**
+   * DEV-ONLY: mirrors syncDetector()'s own gating (live source AND actually
+   * playing) for the experimental seg bridge — see
+   * initSegBridgeIfRequested()'s doc. A no-op whenever `segBridge` was never
+   * constructed, i.e. every production build and every dev run without
+   * `?seg=yolo`.
+   */
+  function syncSegBridge(): void {
+    if (!segBridge) return;
+    const liveSource = camera.state.status === 'live' || usingDevVideo;
+    if (state === 'playing' && liveSource) {
+      void segBridge.start();
+      return;
+    }
+    segBridge.stop();
+  }
+
   function handleCameraStateChange(next: CameraState): void {
     // A camera that drops out must also stop the analyser.
     if (next.status !== 'live') {
       syncSceneAnalysis();
       syncDetector();
+      syncSegBridge();
     }
     // A camera that dies mid-run (unplugged, seized by another app, iOS
     // reclaiming it) must degrade into a playable game, never a black screen.
@@ -491,6 +538,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     // Every transition re-evaluates whether we should be reading frames at all.
     syncSceneAnalysis();
     syncDetector();
+    syncSegBridge();
   }
 
   /* ---------------------------------------------------------------- */
@@ -603,6 +651,48 @@ export async function createApp(root: HTMLElement): Promise<App> {
     void audio.unlock();
   }
 
+  /**
+   * DEV-ONLY: constructs the experimental YOLO instance-segmentation bridge
+   * (src/vision/experimental/SegGameBridge.ts) when `?seg=yolo` is present
+   * on a dev build. Called once from start(), before the first `go()`.
+   *
+   * The `if (import.meta.env.DEV)` check below MUST be the literal, outer
+   * guard at this exact call site — Vite/Rollup only tree-shakes the
+   * dynamically-imported module (and everything it pulls in: onnxruntime-web,
+   * the ONNX model fetch, the segmentation worker) out of a production build
+   * when the branch containing the `import()` is provably dead at build
+   * time, which requires `import.meta.env.DEV` to appear literally inline
+   * here, not behind a runtime helper that merely returns a boolean — that
+   * exact mistake was already made and fixed once for VideoBackdrop.ts's
+   * devVideoSource() (see its own doc), and this follows the same proven
+   * shape. See docs/dev-instance-segmentation.md for how the resulting
+   * `dist/` output was actually verified, not assumed, to be clean.
+   */
+  async function initSegBridgeIfRequested(): Promise<void> {
+    if (import.meta.env.DEV) {
+      const mode = devSegMode();
+      if (mode === 'yolo') {
+        segModeActive = true;
+        const { createSegGameBridge } = await import('../vision/experimental/SegGameBridge.ts');
+        const bridgeOptions: Parameters<typeof createSegGameBridge>[0] = {
+          video,
+          onTrackedObjects(objects: readonly TrackedObject[]): void {
+            game.onTrackedObjects(objects);
+          },
+          onDebugInfo(info: SegDebugInfo): void {
+            if (isDebugEnabled()) ui.setDebugText(formatSegDebugText(info));
+          },
+        };
+        const hz = devSegHz();
+        if (hz !== null) bridgeOptions.hz = hz;
+        segBridge = createSegGameBridge(bridgeOptions);
+        console.warn(
+          '[glassy] dev-only YOLO instance-segmentation prototype active (?seg=yolo) — never present in a production build.',
+        );
+      }
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /* Wiring                                                            */
   /* ---------------------------------------------------------------- */
@@ -615,6 +705,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
   document.addEventListener('visibilitychange', handleVisibility);
 
   async function start(): Promise<void> {
+    await initSegBridgeIfRequested();
     ui.setMuted(audio.isMuted());
     ui.setBest(preferences.getBestScore());
     ui.setScore(0);
@@ -647,6 +738,7 @@ export async function createApp(root: HTMLElement): Promise<App> {
     document.removeEventListener('visibilitychange', handleVisibility);
     scene.stop();
     detector.dispose();
+    segBridge?.dispose();
     motion.stop();
     if (motionTimer !== null) {
       window.clearInterval(motionTimer);
@@ -678,6 +770,55 @@ function nextFrame(): Promise<void> {
   return new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
   });
+}
+
+/**
+ * Dev-only: `?seg=yolo` swaps the shipped EfficientDet+SurfaceProfileFinder
+ * pipeline for the experimental YOLO instance-segmentation prototype (see
+ * src/vision/experimental/ and docs/dev-instance-segmentation.md). Off by
+ * default even in dev — this is a measurement tool, not a feature. Follows
+ * the same `?video=` convention as devVideoSource() in VideoBackdrop.ts, and
+ * mirrors its internal `import.meta.env.DEV` check for defense in depth —
+ * but the guard that actually keeps the segmentation code out of the
+ * production bundle is the literal `if (import.meta.env.DEV)` at the call
+ * site in initSegBridgeIfRequested(), not this function itself.
+ */
+function devSegMode(): 'yolo' | null {
+  if (!import.meta.env.DEV) return null;
+  try {
+    return new URLSearchParams(window.location.search).get('seg') === 'yolo' ? 'yolo' : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Dev-only: `?segHz=<n>` overrides the segmentation cadence (passes/second)
+ * without a code edit — see SegGameBridge.ts's DEFAULT_HZ doc for why this
+ * is the one lever worth exposing here: cadence is what has to be tuned per
+ * device, everything else about the prototype is fixed for the evaluation.
+ */
+function devSegHz(): number | null {
+  if (!import.meta.env.DEV) return null;
+  try {
+    const raw = new URLSearchParams(window.location.search).get('segHz');
+    const n = raw === null ? Number.NaN : Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Dev-only: renders SegGameBridge's per-pass cost/status onto the existing
+ * `?debug` DOM overlay (UIController.setDebugText — otherwise unused today).
+ * Only ever called while `devSegMode()` returned non-null on a dev build. */
+function formatSegDebugText(info: SegDebugInfo): string {
+  return (
+    `seg=yolo  status=${info.status}  hz=${info.cadenceHz.toFixed(1)}  instances=${info.instanceCount}\n` +
+    `pre=${info.lastPreprocessMs.toFixed(0)}ms  inf=${info.lastInferenceMs.toFixed(0)}ms  ` +
+    `post=${info.lastPostprocessMs.toFixed(0)}ms  total=${info.lastTotalMs.toFixed(0)}ms\n` +
+    `ticks=${info.ticks}  errors=${info.errors}`
+  );
 }
 
 /** Dev-only: `?debug` or `#debug` turns on the in-canvas FPS readout. */
