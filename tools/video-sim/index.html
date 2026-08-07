@@ -38,7 +38,7 @@
 
       /** Everything observed, drained by the Node runner at the end. */
       const log = { horizon: [], detections: [], tracked: [], detectorStates: [], errors: [], carriageway: [],
-                    flow: null, flowRegions: [], flowCost: [] };
+                    flow: null, flowRegions: [], flowCost: [], ego: [], labels: [], inferenceCost: [] };
       let tracked = [];
       window.__simLog = log;
       window.__simDone = false;
@@ -55,6 +55,11 @@
       let rejected = [];
       let rejectedReasons = [];
       let carriagewayHorizonY = null;
+
+      // Ego-motion gate diagnostics (OpticalFlow, via ObjectDetector's own
+      // debug hook — see onEgoMotionDebug below).
+      let latestEgo = { magnitude: 0, confidence: 0 };
+      let latestMoving = false;
 
       // Motion-mask diagnostics (FlowSupport via SurfaceProfileFinder).
       // `?mask=1` paints the per-cell classification over the video so the
@@ -269,17 +274,29 @@
           `horizon=${h.y === null ? 'null' : h.y.toFixed(3)} conf=${h.confidence.toFixed(2)}   ` +
           `detections=${latest.length}   detector=${detector.state.status}   ` +
           `carriageway: kept=${tracked.length} rejected=${rejected.length}   ` +
+          `ego: mag=${latestEgo.magnitude.toFixed(4)} conf=${latestEgo.confidence.toFixed(2)} moving=${latestMoving}   ` +
           (flowTotals ? `mask: ${flowTotals.boxesDecided}/${flowTotals.boxesSeen} decided, ${flowTotals.lastCostMs.toFixed(2)}ms` : 'mask: -');
 
         if (!window.__simDone) requestAnimationFrame(draw);
       }
 
-      const MODE = new URLSearchParams(location.search).get('mode') === 'windscreen'
-        ? 'windscreen' : 'window';
+      // `?model=lite2int8|lite2float16` swaps the model ObjectDetector fetches
+      // at start() — diagnostic-only (`modelPath`, see ObjectDetector.ts's
+      // ObjectDetectorDebugOptions), so an A/B against Lite0 is the same
+      // build, not a git checkout apart. Defaults to whatever ObjectDetector
+      // itself ships (Lite0 float16).
+      const MODEL_OVERRIDES = {
+        lite2int8: '/vision/efficientdet_lite2_int8.tflite',
+        lite2float16: '/vision/efficientdet_lite2_float16.tflite',
+      };
+      const modelParam = new URLSearchParams(location.search).get('model');
+      const modelPath = modelParam ? MODEL_OVERRIDES[modelParam] : undefined;
+      if (modelParam && !modelPath) console.warn(`unknown ?model= value: ${modelParam}`);
+
       const analyser = createSceneAnalyser({ video, sampleHz: 6 });
       const detector = createObjectDetector({
         video,
-        mode: MODE,
+        modelPath,
         sampleHz: 4,
         onStateChange: (s) => log.detectorStates.push({ t: video.currentTime, ...s }),
         onTrackedObjects: (objs) => {
@@ -347,11 +364,35 @@
               stable: o.stable, reason: null, horizonY, kept: true });
           }
         },
-        onDetections: (dets) => {
-          // The array is reused — copy what we keep.
+        // Diagnostic-only, same escape hatch as onCarriagewayDebug/
+        // onSurfaceFlowDebug: the array handed over is `output`, reused by
+        // ObjectDetector every tick, so copy what we keep. This is the ONLY
+        // way to get a raw (pre-tracking) detections/sec number and see which
+        // labels actually fired, now that `onDetections` no longer exists on
+        // the real (frozen) ObjectDetectorOptions.
+        onRawDetections: (dets) => {
           latest = dets.map((d) => ({ ...d }));
           for (const d of latest) log.detections.push({ t: +video.currentTime.toFixed(2), ...d });
         },
+        // Diagnostic-only: the ego-motion sample CarriagewayFilter's gate is
+        // reading this tick, and its resulting moving/not-moving decision —
+        // see CarriagewayFilter.ts's "EGO-MOTION GATE" section.
+        onEgoMotionDebug: (ego, isMoving, costMs) => {
+          latestEgo = { magnitude: ego.magnitude, confidence: ego.confidence };
+          latestMoving = isMoving;
+          log.ego.push({ t: +video.currentTime.toFixed(2), magnitude: +ego.magnitude.toFixed(5),
+            confidence: +ego.confidence.toFixed(3), moving: isMoving, costMs: +costMs.toFixed(3) });
+        },
+        // Diagnostic-only: the ORIGINAL COCO label, before ObjectDetector
+        // collapses it to `kind` — see LABEL_TO_KIND in ObjectDetector.ts.
+        onRawLabelsDebug: (raw) => {
+          for (const d of raw) {
+            log.labels.push({ t: +video.currentTime.toFixed(2), label: d.categoryName, score: +d.score.toFixed(3) });
+          }
+        },
+        // Diagnostic-only: wall-clock cost of one detect round-trip — the
+        // number that decides whether a model fits the sample budget.
+        onInferenceCostDebug: (ms) => log.inferenceCost.push(+ms.toFixed(2)),
       });
 
       window.addEventListener('error', (e) => log.errors.push(String(e.message)));

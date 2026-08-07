@@ -36,6 +36,10 @@ const playbackRate = flag('rate', 1);
 const maxSeconds = flag('seconds', 60);
 const shotCount = flag('shots', 8);
 const mode = args.includes('--windscreen') ? 'windscreen' : 'window';
+/** `--model lite2int8` swaps in an alternate detector model for this run —
+ * see MODEL_OVERRIDES in index.html and `modelPath` in ObjectDetector.ts's
+ * diagnostic-only debug options. Never affects what App.ts ships. */
+const modelOverride = strFlag('model', '');
 /**
  * `--tag before` prefixes every written PNG so an A/B pair survives two runs
  * instead of the second overwriting the first. `--at 12.3,20` additionally
@@ -96,7 +100,8 @@ page.on('pageerror', (e) => console.error('  page error:', e.message));
 page.on('console', (m) => { if (m.type() === 'error') console.error('  console:', m.text().slice(0, 200)); });
 
 const maskQuery = (args.includes('--mask') ? '&mask=1' : '') + (args.includes('--nomask') ? '&nomask=1' : '');
-await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}${maskQuery}`, { waitUntil: 'load' });
+const modelQuery = modelOverride ? `&model=${modelOverride}` : '';
+await page.goto(`${base}/tools/video-sim/index.html?mode=${mode}${maskQuery}${modelQuery}`, { waitUntil: 'load' });
 
 const meta = await page.evaluate(
   ([src, rate]) => window.__simStart(src, rate),
@@ -183,6 +188,29 @@ if (Object.keys(byKind).length === 0) {
 }
 if (log.errors?.length) console.log(`\n  page errors: ${log.errors.slice(0, 5).join(' | ')}`);
 
+// Per-inference wall-clock cost — what decides whether a model fits the
+// sample budget, measured, not taken from a vendor spec sheet.
+const infCost = (log.inferenceCost ?? []).slice().sort((a, b) => a - b);
+if (infCost.length) {
+  const infAt = (q) => infCost[Math.min(infCost.length - 1, Math.floor(q * infCost.length))];
+  console.log(`  inference cost (ms) : median ${infAt(0.5).toFixed(1)}  p90 ${infAt(0.9).toFixed(1)}  max ${infCost[infCost.length - 1].toFixed(1)}  (n=${infCost.length})`);
+}
+
+// Raw COCO label breakdown — what actually fired, before collapsing to kind.
+const labels = log.labels ?? [];
+if (labels.length) {
+  const byLabel = {};
+  for (const l of labels) {
+    byLabel[l.label] ??= { count: 0, scoreSum: 0 };
+    byLabel[l.label].count++;
+    byLabel[l.label].scoreSum += l.score;
+  }
+  console.log('\n  by COCO label:');
+  for (const [label, v] of Object.entries(byLabel).sort((a, b) => b[1].count - a[1].count)) {
+    console.log(`   ${label.padEnd(16)} ${String(v.count).padStart(4)}  mean score ${(v.scoreSum / v.count).toFixed(2)}`);
+  }
+}
+
 // Tracking report
 const tracked = log.tracked ?? [];
 const ids = new Map();
@@ -224,6 +252,30 @@ const cwTracksKeptOnly = [...cwById.values()].filter((e) => e.everKept && !e.eve
 const cwTracksRejectedOnly = [...cwById.values()].filter((e) => e.everRejected && !e.everKept).length;
 const cwTracksBoth = [...cwById.values()].filter((e) => e.everKept && e.everRejected).length;
 console.log(`  distinct vehicle tracks: ${cwById.size}  (kept-only ${cwTracksKeptOnly}, rejected-only ${cwTracksRejectedOnly}, flipped ${cwTracksBoth})`);
+
+// Ego-motion gate report — is CarriagewayFilter actually engaging (or
+// staying off) when it should?
+const ego = log.ego ?? [];
+console.log('\n══════════ EGO-MOTION GATE ══════════');
+if (!ego.length) {
+  console.log('  no ego-motion samples');
+} else {
+  const mags = ego.map((e) => e.magnitude).sort((a, b) => a - b);
+  const magAt = (q) => mags[Math.min(mags.length - 1, Math.floor(q * mags.length))];
+  const movingSamples = ego.filter((e) => e.moving).length;
+  const meanConf = ego.reduce((a, b) => a + b.confidence, 0) / ego.length;
+  console.log(`  samples              : ${ego.length}`);
+  console.log(`  magnitude (frame-diagonals/s): p10 ${magAt(0.1).toFixed(4)}  p50 ${magAt(0.5).toFixed(4)}  p90 ${magAt(0.9).toFixed(4)}  max ${mags[mags.length - 1].toFixed(4)}`);
+  console.log(`  mean confidence      : ${meanConf.toFixed(2)}`);
+  console.log(`  gate ON (moving)     : ${movingSamples} / ${ego.length}  (${((100 * movingSamples) / ego.length).toFixed(1)}%)`);
+  // Flip count — how often the gate changed state, a rough chatter check.
+  let flips = 0;
+  for (let i = 1; i < ego.length; i++) if (ego[i].moving !== ego[i - 1].moving) flips++;
+  console.log(`  gate transitions     : ${flips}  ${flips > ego.length * 0.05 ? '← chattering' : '← steady'}`);
+  const costs = ego.map((e) => e.costMs ?? 0).sort((a, b) => a - b);
+  const costAt2 = (q) => costs[Math.min(costs.length - 1, Math.floor(q * costs.length))];
+  console.log(`  OpticalFlow cost/sample: median ${costAt2(0.5).toFixed(2)}ms  p90 ${costAt2(0.9).toFixed(2)}ms  max ${costs[costs.length - 1].toFixed(2)}ms`);
+}
 
 // Surface profile report: how much shape is actually being found (spread
 // between the highest and lowest column per sample, i.e. does the polyline

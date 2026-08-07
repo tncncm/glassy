@@ -16,7 +16,7 @@
  *     path, success or failure (see detector.worker.ts)
  *   - what comes back per tick is a handful of numbers (label, box score)
  *     written into a small object POOL that is reused forever and handed to
- *     `onDetections` — the array and its objects are mutated in place on
+ *     `onTrackedObjects` — the array and its objects are mutated in place on
  *     the next tick, so nothing about a past frame is retained anywhere,
  *     and nothing is ever written to storage
  *   - the ONLY network calls in this file are the one-time, same-origin
@@ -33,6 +33,16 @@
  * actually starts one. A user who never opts into vision never spawns the
  * worker and never downloads a byte of the wasm runtime or the model.
  *
+ * As of the ego-motion gate (see CarriagewayFilter.ts), this file ALSO owns
+ * one `OpticalFlow` instance — the fourth place in Glassy that reads camera
+ * pixels, after SceneAnalyser, SurfaceProfileFinder and this file's own
+ * bitmap capture. It is used ONLY for `egoMotion` (a magnitude and a
+ * confidence number, nothing else) so CarriagewayFilter knows whether to
+ * apply its road-specific reasoning at all this tick; its `candidates`/
+ * `focusOfExpansion` outputs are never read here. Same discipline, same
+ * discard-per-tick guarantee — see OpticalFlow.ts's own PRIVACY comment for
+ * the full accounting of what it reads and drops.
+ *
  * If you are tempted to draw a video frame into a canvas, keep a detection
  * result beyond the tick that produced it, or add any network call outside
  * the one-time model fetch, stop — read the matching PRIVACY comment above
@@ -44,6 +54,7 @@ import { createDetectionTracker, type DetectionTracker } from './DetectionTracke
 import { createSurfaceProfileFinder, type SurfaceFlowDebug, type SurfaceProfileFinder } from './SurfaceProfileFinder.ts';
 import { createSceneAnalyser } from './SceneAnalyser.ts';
 import { createCarriagewayFilter, type CarriagewayFilter, type CarriagewayRejectReason } from './CarriagewayFilter.ts';
+import { createOpticalFlow, type EgoMotion, type OpticalFlow } from './OpticalFlow.ts';
 import type {
   ObjectDetector,
   ObjectDetectorOptions,
@@ -79,6 +90,33 @@ interface ObjectDetectorDebugOptions {
     rejectedReasons: readonly CarriagewayRejectReason[],
     horizonY: number | null,
   ) => void;
+  /** Diagnostic only: the ego-motion sample CarriagewayFilter's road-specific
+   * reasoning is gated on this tick, whether the gate judged us to be
+   * moving, and OpticalFlow's own measured per-sample cost (ms) — the main-
+   * thread cost this feature actually adds. Lets the harness measure/
+   * calibrate the gate against real and synthetic footage instead of
+   * trusting the thresholds by eye. Never set by App.ts. */
+  onEgoMotionDebug?: (ego: EgoMotion, isMoving: boolean, costMs: number) => void;
+  /** Diagnostic only: every accepted-but-unfiltered `Detection` this tick
+   * (post-allowlist, pre-tracking, already collapsed to `kind`), so the
+   * harness can report a true detections/sec rate. Never set by App.ts —
+   * the game only ever wants `onTrackedObjects`. */
+  onRawDetections?: (detections: readonly Detection[]) => void;
+  /** Diagnostic only: the worker's raw per-tick result BEFORE it collapses
+   * to `kind` — still carries the original COCO `categoryName` (`umbrella`,
+   * `chair`, …) — so the harness can confirm exactly which labels are
+   * firing, not just which of the three coarse buckets they landed in.
+   * Never set by App.ts. */
+  onRawLabelsDebug?: (detections: readonly RawDetection[]) => void;
+  /** Diagnostic only: overrides the model fetched at `start()`, so the
+   * harness can A/B EfficientDet-Lite0 against a differently-sized model
+   * without changing what App.ts ships. Never set by App.ts. */
+  modelPath?: string;
+  /** Diagnostic only: wall-clock round-trip of one detect request (capture +
+   * postMessage + worker inference + postMessage back), milliseconds — the
+   * number that actually matters for "does this model fit the sample
+   * budget", vs trusting a vendor-published figure. Never set by App.ts. */
+  onInferenceCostDebug?: (elapsedMs: number) => void;
 }
 
 // Type-only — erased entirely at compile time. Does NOT pull the worker or
@@ -150,15 +188,87 @@ const PROGRESS_REPORT_STEP = 0.05;
  * consumes. Everything else the model reports is discarded immediately.
  * Passed to the worker as `categoryAllowlist` too, so the model itself
  * filters early, before a single extra byte crosses back to this thread.
+ *
+ * WIDENED FROM "TRAFFIC" TO "ANYTHING YOU COULD LAND ON". Glassy started as
+ * a windscreen game and the allowlist only ever held road classes, but the
+ * game is really "hop across the real objects in front of you" — a passenger
+ * on a beach asking to jump between parasols is the same game as a passenger
+ * in a car jumping onto the car ahead. EfficientDet-Lite0 already reports
+ * `umbrella`, `chair`, `bench`, `couch`, `boat`, `surfboard`, `dining table`,
+ * `potted plant`, `bed`, `suitcase` — COCO classes we were simply throwing
+ * away. Nothing about the model changed; only what we keep from it did.
+ *
+ * `DetectedKind` (src/types.ts, frozen) still only has three buckets, and its
+ * own doc comment describes them by original example ("car/truck/bus/
+ * motorcycle → a hazard rolls in", etc). Nothing downstream actually
+ * branches on `kind` for gameplay — grepped across src/game, src/ui and
+ * src/app: the only real dependency on it is inside THIS layer
+ * (SurfaceProfileFinder profiles the silhouette of `'vehicle'`-kind objects
+ * only; CarriagewayFilter's road-geometry/motion reasoning applies to
+ * `'vehicle'`-kind objects only, and is now gated on ego-motion — see
+ * CarriagewayFilter.ts). So the mapping below is chosen for what it turns ON
+ * in THIS layer, not for label accuracy:
+ *
+ *   - 'vehicle': anything with a top wide/flat/solid enough to plausibly
+ *     land ON — existing road vehicles, plus every landable COCO class the
+ *     brief called out (parasols, chairs, benches, couches, boats,
+ *     surfboards, tables, planters, beds, suitcases). These get the full
+ *     treatment: SurfaceProfileFinder traces their actual silhouette instead
+ *     of a flat box (a parasol canopy's dome, a couch's armrests, a table's
+ *     edge all benefit from the same bonnet/windscreen/roof-style scan a car
+ *     gets), and CarriagewayFilter's road-specific checks apply — but ONLY
+ *     while ego-motion says we're actually travelling through the world;
+ *     stationary, that filter is a no-op (see CarriagewayFilter.ts) so a
+ *     beach chair is never held to a "same carriageway" standard that was
+ *     only ever meaningful for a car on a road.
+ *   - 'person': unchanged — a person or a bicycle, a collectible, never a
+ *     landing surface.
+ *   - 'sign': unchanged — narrow, human-scale-or-smaller street furniture
+ *     (traffic light, stop sign, parking meter, fire hydrant) nobody would
+ *     try to land on; flat-profiled and never carriageway-filtered, same as
+ *     before this change.
+ *
+ * EXCLUDED, deliberately, and why: food and place-settings (banana, pizza,
+ * fork, cup, wine glass, bowl, …) — never a solid obstacle, and a fork
+ * misdetected mid-frame would be a bizarre platform; small handheld/personal
+ * items (cell phone, remote, backpack, handbag, tie, book, scissors, teddy
+ * bear, toothbrush, hair drier, vase, clock, …) — too small to plausibly
+ * land on and too easy to false-positive on skin/fabric texture; sports gear
+ * (frisbee, kite, skis, snowboard, skateboard, tennis racket, baseball
+ * bat/glove, sports ball) — small, fast-moving, not "solid obstacle"-shaped;
+ * kitchen/bathroom appliances (toilet, microwave, oven, toaster, sink,
+ * fridge, TV, laptop, mouse, keyboard) — never appear outdoors in a way that
+ * would read as a real obstacle; animals (bird, cat, dog, horse, sheep, cow,
+ * elephant, bear, zebra, giraffe) — not landable, not a person, and mapping
+ * them to any of the three buckets would misrepresent what they are; and
+ * `airplane` — technically "solid", never at ground level where a landing
+ * surface would make sense.
  */
 const LABEL_TO_KIND: Readonly<Record<string, DetectedKind>> = {
+  // Big, solid, plausibly-landable — road vehicles and everyday furniture/
+  // structure alike. See the module comment above for why these all share
+  // one bucket regardless of literal "vehicle-ness".
   car: 'vehicle',
   truck: 'vehicle',
   bus: 'vehicle',
   motorcycle: 'vehicle',
   train: 'vehicle',
+  boat: 'vehicle',
+  bench: 'vehicle',
+  chair: 'vehicle',
+  couch: 'vehicle',
+  bed: 'vehicle',
+  'dining table': 'vehicle',
+  umbrella: 'vehicle', // beach parasol — the motivating case
+  surfboard: 'vehicle',
+  suitcase: 'vehicle',
+  'potted plant': 'vehicle', // planter
+
+  // People — a collectible, never a landing surface.
   person: 'person',
   bicycle: 'person',
+
+  // Narrow, human-scale-or-smaller street furniture — not landable.
   'traffic light': 'sign',
   'stop sign': 'sign',
   'parking meter': 'sign',
@@ -196,6 +306,7 @@ function environmentSupportsWorkerPipeline(): boolean {
 
 export function createObjectDetector(options: ObjectDetectorOptions): ObjectDetector {
   const { video } = options;
+  const debugOptions = options as ObjectDetectorOptions & ObjectDetectorDebugOptions;
   /**
    * There is one framing now — through the windscreen — where objects hold
    * still in frame. That both benefits from and can afford a faster rate:
@@ -210,7 +321,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
 
   const tracker: DetectionTracker = createDetectionTracker();
   const surfaceFinder: SurfaceProfileFinder = createSurfaceProfileFinder({
-    disableFlowMask: (options as ObjectDetectorOptions & ObjectDetectorDebugOptions).disableFlowMask === true,
+    disableFlowMask: debugOptions.disableFlowMask === true,
   });
   /**
    * ObjectDetector owns its own SceneAnalyser instance rather than taking
@@ -225,6 +336,26 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
    */
   const laneAnalyser: SceneAnalyser = createSceneAnalyser({ video });
   const carriagewayFilter: CarriagewayFilter = createCarriagewayFilter();
+  /**
+   * Ego-motion only — see the file-header PRIVACY note and CarriagewayFilter's
+   * own comment for why. `candidates`/`focusOfExpansion` are never read here;
+   * this exists purely so CarriagewayFilter knows whether we are actually
+   * travelling through the world this tick before it applies any
+   * road-specific reasoning to a `'vehicle'`-kind object. Same start/stop
+   * lifecycle as `laneAnalyser` — both are cheap, both are useless (and
+   * switched off) whenever the detector itself isn't running.
+   *
+   * `sampleHz: 2`, well under OpticalFlow's own 5Hz default: the gate only
+   * needs a slowly-changing, hysteresis-smoothed "are we moving at all"
+   * verdict, not a fresh number every detector tick, and each sample is a
+   * synchronous main-thread block-matching pass — measured on desktop
+   * Chromium at ~2ms median, ~6ms worst-case per sample (see the report;
+   * unverified on-device, and iPhone JSC can run 2-4x slower on tight scalar
+   * loops per this project's own performance notes). Halving the rate from
+   * the module default roughly halves the time this feature spends on the
+   * main thread for the same worst-case per-sample cost.
+   */
+  const egoFlow: OpticalFlow = createOpticalFlow({ video, sampleHz: 2 });
   let lastTrackUpdateMs = 0;
 
   let currentState: DetectorState = { status: 'idle' };
@@ -236,8 +367,8 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   // Fixed-size pool, sized once from the constant default (never resized by
   // an untrusted option value) — this is the only allocation of Detection
   // objects for the life of the controller. `output` is the single array
-  // identity ever handed to `onDetections`; it is cleared and refilled with
-  // references into `pool`, never replaced.
+  // identity ever handed to `emitTracked`/`onRawDetections`; it is cleared
+  // and refilled with references into `pool`, never replaced.
   const maxResults = DEFAULT_MAX_RESULTS;
   const pool: Detection[] = Array.from({ length: maxResults }, () => ({
     kind: 'vehicle' as DetectedKind,
@@ -357,6 +488,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       output.push(slot);
     }
 
+    debugOptions.onRawDetections?.(output);
     emitTracked();
   }
 
@@ -365,8 +497,14 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
    * Both arrays are reused; consumers read them synchronously.
    */
   function emitTracked(): void {
-    const debugOptions = options as ObjectDetectorOptions & ObjectDetectorDebugOptions;
-    if (!options.onTrackedObjects && !debugOptions.onCarriagewayDebug && !debugOptions.onSurfaceFlowDebug) return;
+    if (
+      !options.onTrackedObjects &&
+      !debugOptions.onCarriagewayDebug &&
+      !debugOptions.onSurfaceFlowDebug &&
+      !debugOptions.onEgoMotionDebug
+    ) {
+      return;
+    }
     const now = performance.now();
     const dt = lastTrackUpdateMs === 0 ? intervalMs / 1000 : (now - lastTrackUpdateMs) / 1000;
     lastTrackUpdateMs = now;
@@ -377,15 +515,20 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     // the tracker) on any failure.
     surfaceFinder.refine(video, trackedObjects, dt);
     debugOptions.onSurfaceFlowDebug?.(surfaceFinder.flowDebug);
-    // Keep only vehicles plausibly travelling with us on our own
-    // carriageway (see CarriagewayFilter.ts for the full reasoning).
+    // Keep only 'vehicle'-kind objects plausibly travelling with us on our
+    // own carriageway (see CarriagewayFilter.ts for the full reasoning).
     // person/sign objects pass through untouched. Falls back to the
     // unfiltered list on any internal failure — a cluttered world beats an
-    // empty one.
+    // empty one. Gated on ego-motion: CarriagewayFilter's road-specific
+    // reasoning is only meaningful while we're actually travelling through
+    // the world (a car), and is a deliberate no-op standing still (a beach) —
+    // see CarriagewayFilter.ts.
     const horizonY = laneAnalyser.horizon.y;
-    const kept = carriagewayFilter.filter(trackedObjects, horizonY, dt);
+    const ego = egoFlow.egoMotion;
+    const kept = carriagewayFilter.filter(trackedObjects, horizonY, dt, ego);
 
     debugOptions.onCarriagewayDebug?.(kept, carriagewayFilter.rejected, carriagewayFilter.rejectedReasons, horizonY);
+    debugOptions.onEgoMotionDebug?.(ego, carriagewayFilter.isMoving, egoFlow.lastSampleCostMs);
     options.onTrackedObjects?.(kept);
   }
 
@@ -394,8 +537,11 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
     inflight = false;
     if (currentState.status !== 'ready') return; // stopped/disposed while this was in flight
     consecutiveErrors = 0;
+    debugOptions.onRawLabelsDebug?.(data.detections);
     publishDetections(data.detections, data.bitmapWidth, data.bitmapHeight);
-    trackTiming(performance.now() - pendingStartedAt);
+    const elapsedMs = performance.now() - pendingStartedAt;
+    debugOptions.onInferenceCostDebug?.(elapsedMs);
+    trackTiming(elapsedMs);
   }
 
   function handleDetectError(data: Extract<WorkerToMainMessage, { type: 'detect-error' }>): void {
@@ -570,7 +716,10 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
   }
 
   async function fetchModelWithProgress(signal: AbortSignal): Promise<Uint8Array> {
-    const response = await fetch(MODEL_PATH, { signal });
+    // `modelPath` is diagnostic-only (see ObjectDetectorDebugOptions) — a
+    // real caller (App.ts) built against the frozen ObjectDetectorOptions
+    // never sets it, so this is always MODEL_PATH in production.
+    const response = await fetch(debugOptions.modelPath ?? MODEL_PATH, { signal });
     if (!response.ok || !response.body) {
       throw new Error(`model fetch failed: HTTP ${response.status}`);
     }
@@ -654,6 +803,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       lastTimestamp = -1;
       setState({ status: 'ready' });
       laneAnalyser.start();
+      egoFlow.start();
       scheduleNext();
       return currentState;
     } catch (err) {
@@ -702,6 +852,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
         lastTimestamp = -1;
         setState({ status: 'ready' });
         laneAnalyser.start();
+        egoFlow.start();
         scheduleNext();
         return Promise.resolve(currentState);
       }
@@ -723,6 +874,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       loadAbort?.abort();
       stopInference();
       laneAnalyser.stop();
+      egoFlow.stop();
       carriagewayFilter.reset();
       if (currentState.status === 'loading') {
         // loadAndStart()'s in-flight promise will observe stopRequested and
@@ -747,6 +899,7 @@ export function createObjectDetector(options: ObjectDetectorOptions): ObjectDete
       output.length = 0;
       surfaceFinder.stop();
       laneAnalyser.stop();
+      egoFlow.stop();
       carriagewayFilter.reset();
       setState({ status: 'idle' });
     },

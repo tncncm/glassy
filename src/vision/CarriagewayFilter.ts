@@ -56,9 +56,44 @@
  * expected, a track too young to have a velocity yet — and in every one of
  * those cases this file KEEPS the object rather than drops it. An empty
  * world is a worse failure than a cluttered one; see `filter()`.
+ *
+ * THE EGO-MOTION GATE. Every signal above — the corridor, the perspective
+ * size check, the motion signature — is reasoning that only makes sense for
+ * a camera travelling down a road. Once the allowlist widened past traffic
+ * (see ObjectDetector.ts) to "anything you could land on", this filter would
+ * otherwise run its "own carriageway" logic on a beach chair or a parasol,
+ * which has no carriageway to be on or off. So `filter()` now takes the
+ * live `EgoMotion` estimate from `OpticalFlow` — already computed for
+ * exactly this purpose, and the single most direct "are we actually moving
+ * through the world" signal Glassy has, since it is a property of the
+ * WHOLE SCENE (the static world sweeping past) rather than any one box —
+ * and uses it to decide whether the rest of this file's reasoning applies
+ * at all THIS TICK:
+ *
+ *   - MOVING (confidently, above threshold, sustained — see MOVING_ENTER/
+ *     EXIT below): the geometry and motion checks run exactly as documented
+ *     above. This is a car on a road.
+ *   - NOT MOVING, or not confidently: every `'vehicle'`-kind object is kept
+ *     unconditionally, no geometry or motion check applied at all. This is
+ *     a beach, a stopped car, a room — anywhere "our own carriageway" is
+ *     meaningless, so the filter gets out of the way entirely rather than
+ *     invent a road that isn't there.
+ *
+ * Hysteresis (two thresholds, not one) and a confidence floor exist for the
+ * same reason the motion signature above requires two consecutive ticks: a
+ * single noisy `EgoMotion` sample right at a threshold must not flip the
+ * WHOLE FILTER on and off every tick — that would make vehicles kept one
+ * frame and rejected the next as the estimate wobbles, which is worse than
+ * either state held steady. Missing/low-confidence evidence holds the
+ * PREVIOUS state rather than guessing, and the filter starts in the
+ * "not moving" state — the same "empty world is a worse failure than a
+ * cluttered one" bias this file already applies everywhere else: on cold
+ * start, before OpticalFlow has accumulated enough evidence to say
+ * otherwise, nothing is filtered.
  */
 
 import type { DetectedKind, TrackedObject } from '../types.ts';
+import type { EgoMotion } from './OpticalFlow.ts';
 
 /* ------------------------------------------------------------------ */
 /* Corridor                                                             */
@@ -197,6 +232,60 @@ const MIN_HEIGHT_FOR_GROWTH = 0.01;
  * every live vehicle track always gets a slot without ever allocating one. */
 const MAX_CARRIAGEWAY_TRACKS = 16;
 
+/* ------------------------------------------------------------------ */
+/* Ego-motion gate                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * `EgoMotion.magnitude` (see OpticalFlow.ts) is normalised to "frame
+ * diagonals per second" — resolution/aspect independent, which is what
+ * makes a single constant here meaningful across devices. Measured with
+ * `tools/video-sim` at the sample rate this actually ships at (see
+ * ObjectDetector.ts's `egoFlow`, 2Hz — see the report for full numbers):
+ *
+ *   - genuinely stationary — a frozen real dashcam frame (a car stopped at
+ *     a light) AND a synthetic near-static handheld sway over a still photo
+ *     of a beach — read 0.0000 at every percentile, max 0.0007-0.0013.
+ *     Sensor/compression noise never got close to real scene motion.
+ *   - real driving, including dense stop-and-go traffic, sits at p10
+ *     0.040-0.046 within a couple of seconds of moving and climbs to
+ *     0.08-0.10 at p90. Nowhere near the stationary numbers above.
+ *
+ * The two thresholds below sit in the wide gap between those, with real
+ * headroom on the stationary side. ENTER is set high enough that engine
+ * idle vibration or a hand adjusting grip cannot alone cross it. EXIT sits
+ * below ENTER on purpose — see the hysteresis note in the module header —
+ * so the gate doesn't chatter right at "just started rolling" or "just
+ * stopped at a light".
+ *
+ * KNOWN LIMITATION, measured not guessed: a FAST deliberate pan across a
+ * still scene (not driving — someone quickly scanning their view) also
+ * produces real per-block flow and can cross ENTER (measured max 0.044 on
+ * a ~6-second corner-to-corner pan across a photo, versus real driving's
+ * 0.040-0.046 p10 — the two ranges border each other). Magnitude alone
+ * cannot fully tell a fast pan from a slow drive-off; nothing here claims
+ * it can. What was verified is that this stays a SOFT, SELF-CORRECTING
+ * failure: the gate only engages for the seconds the pan is actually in
+ * motion, drops back to OFF within one hysteresis step once it settles
+ * (confirmed on the test clip: 2 gate transitions, not sustained
+ * chatter), and even while engaged the geometry checks it turns on kept
+ * the large majority of objects (91.5% on that clip) — a slow/gentle pan,
+ * which is what aiming a phone at a specific parasol actually looks like,
+ * never approached ENTER at all.
+ */
+const MOVING_ENTER_MAGNITUDE = 0.018;
+const MOVING_EXIT_MAGNITUDE = 0.01;
+
+/**
+ * Below this confidence (see `EgoMotion.confidence` — driven by how many
+ * blocks the estimate is based on), a sample is too thin to move the gate
+ * either way: too little texture this tick, a resolution/aspect change that
+ * just rebuilt OpticalFlow's buffers, or the first tick or two after
+ * `start()`. The gate holds whatever state it was already in rather than
+ * react to a handful of blocks.
+ */
+const MIN_EGO_CONFIDENCE_FOR_GATE = 0.3;
+
 /** Why an object was dropped, for diagnostics only (see `rejectedReasons`).
  * Never consumed by production code — App/Game only ever see the kept list. */
 export type CarriagewayRejectReason = 'corridor' | 'size' | 'near-horizon' | 'motion';
@@ -220,14 +309,23 @@ export interface CarriagewayFilter {
    * isn't constrained by lane geometry the same way, so both pass through
    * untouched. `horizonY` is SceneAnalyser's horizon estimate (0..1, or
    * `null` when there isn't a trustworthy one this tick); `dt` is seconds
-   * since the previous call, for the motion signal.
+   * since the previous call, for the motion signal. `ego` is OpticalFlow's
+   * live ego-motion estimate, or `null` when it isn't running — see the
+   * "EGO-MOTION GATE" section of the module comment: while not confidently
+   * moving, every `'vehicle'`-kind object is kept unconditionally and none
+   * of the geometry/motion reasoning below runs at all.
    *
    * Returns a REUSED array — read synchronously, never retain, exactly like
    * DetectionTracker's own `update()`. Never throws: any internal
    * inconsistency degrades to returning `objects` unfiltered rather than an
    * empty list — a cluttered world beats an empty one.
    */
-  filter(objects: readonly TrackedObject[], horizonY: number | null, dt: number): readonly TrackedObject[];
+  filter(
+    objects: readonly TrackedObject[],
+    horizonY: number | null,
+    dt: number,
+    ego: EgoMotion | null,
+  ): readonly TrackedObject[];
   /**
    * Diagnostics only, valid until the next `filter()` call — the vehicle
    * objects `filter()` just dropped, paired with why in the same-indexed
@@ -236,7 +334,13 @@ export interface CarriagewayFilter {
    */
   readonly rejected: readonly TrackedObject[];
   readonly rejectedReasons: readonly CarriagewayRejectReason[];
-  /** Forget all per-object motion history. Used when the scene changes. */
+  /** Diagnostics only: whether the ego-motion gate currently judges us to be
+   * moving — i.e. whether the last `filter()` call actually applied its
+   * road-specific reasoning. Not read by production code. */
+  readonly isMoving: boolean;
+  /** Forget all per-object motion history AND the ego-motion gate's held
+   * state (back to "not moving" — see the module comment). Used when the
+   * scene changes. */
   reset(): void;
 }
 
@@ -280,6 +384,24 @@ export function createCarriagewayFilter(): CarriagewayFilter {
     suspiciousStreak: 0,
   }));
   let tickCounter = 0;
+  // Starts "not moving" — see the module comment's ego-motion-gate section:
+  // on cold start, before OpticalFlow has accumulated enough evidence to say
+  // otherwise, nothing is filtered.
+  let movingState = false;
+
+  /** Hysteresis update for the ego-motion gate. Missing or low-confidence
+   * evidence holds the PREVIOUS state rather than guessing either way. */
+  function updateMovingState(ego: EgoMotion | null): boolean {
+    if (!ego || !Number.isFinite(ego.magnitude) || ego.confidence < MIN_EGO_CONFIDENCE_FOR_GATE) {
+      return movingState;
+    }
+    if (movingState) {
+      if (ego.magnitude < MOVING_EXIT_MAGNITUDE) movingState = false;
+    } else {
+      if (ego.magnitude > MOVING_ENTER_MAGNITUDE) movingState = true;
+    }
+    return movingState;
+  }
 
   // Reused output buffers — arrays of REFERENCES into the caller's own
   // TrackedObject pool (DetectionTracker's), never copies, never new
@@ -370,7 +492,12 @@ export function createCarriagewayFilter(): CarriagewayFilter {
     return null;
   }
 
-  function filter(objects: readonly TrackedObject[], horizonY: number | null, dt: number): readonly TrackedObject[] {
+  function filter(
+    objects: readonly TrackedObject[],
+    horizonY: number | null,
+    dt: number,
+    ego: EgoMotion | null,
+  ): readonly TrackedObject[] {
     kept.length = 0;
     rejectedList.length = 0;
     rejectedReasonsList.length = 0;
@@ -378,13 +505,28 @@ export function createCarriagewayFilter(): CarriagewayFilter {
     try {
       tickCounter++;
       const step = clamp(dt, 0, 1);
-      const hasHorizon = horizonY !== null && Number.isFinite(horizonY) && horizonY < 1;
+      const moving = updateMovingState(ego);
+      const hasHorizon = moving && horizonY !== null && Number.isFinite(horizonY) && horizonY < 1;
 
       for (let i = 0; i < objects.length; i++) {
         const obj = objects[i];
         if (!obj) continue;
 
         if ((obj.kind as DetectedKind) !== 'vehicle') {
+          kept.push(obj);
+          continue;
+        }
+
+        // The ego-motion gate: not confidently moving through the world (a
+        // beach, a stopped car, indoors) means "our own carriageway" is
+        // meaningless, so every vehicle-kind object is kept unconditionally
+        // and no per-object geometry/motion track work happens at all — see
+        // the module comment's "EGO-MOTION GATE" section. Tracks are simply
+        // left untouched; `sweepStaleTracks` retires them below exactly as
+        // it would for any object that stopped appearing, and a fresh claim
+        // once moving resumes starts clean (no stale, possibly-stale-by-
+        // minutes velocity history feeding a false motion rejection).
+        if (!moving) {
           kept.push(obj);
           continue;
         }
@@ -422,6 +564,9 @@ export function createCarriagewayFilter(): CarriagewayFilter {
     filter,
     rejected: rejectedList,
     rejectedReasons: rejectedReasonsList,
+    get isMoving(): boolean {
+      return movingState;
+    },
     reset(): void {
       for (let i = 0; i < tracks.length; i++) {
         const t = tracks[i];
@@ -430,6 +575,7 @@ export function createCarriagewayFilter(): CarriagewayFilter {
           t.hasPrev = false;
         }
       }
+      movingState = false;
       kept.length = 0;
       rejectedList.length = 0;
       rejectedReasonsList.length = 0;
