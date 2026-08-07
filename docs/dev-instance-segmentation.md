@@ -248,3 +248,70 @@ this prototype exists to measure. A real merge would need them back.
   its own header) gives the mask-quality numbers on desktop, and the
   `?seg=yolo&debug` overlay on a real phone gives the number this whole
   exercise exists to produce.
+
+---
+
+## The licence problem, and the second export worth doing
+
+YOLOv8n-seg's weights are **AGPL-3.0**. A PWA downloads the model into every
+visitor's browser, which is distribution — so deploying it publicly triggers
+the licence regardless of whether anyone is charged. Local and LAN testing
+distributes to nobody, which is why the flag above is dev-only.
+
+A survey of the permissively-licensed alternatives was run and measured. The
+short version, so nobody repeats it:
+
+| Candidate | Licence | Verdict |
+| --- | --- | --- |
+| **RTMDet-Ins-tiny** (OpenMMLab) | Apache-2.0 | **The only real contender. Untested — see below.** |
+| MobileSAM | Apache-2.0 | **Measured, fails.** Encoder alone 1.8s/frame on an M4 Max — ~28x what YOLOv8n-seg needs for a *whole* frame. Masks blocky; one prompt locked onto a bike rack and a signpost instead of the car. |
+| EdgeSAM | NTU S-Lab 1.0 | **Non-commercial.** Architecturally the best fit of the SAM family, which is the frustrating part. |
+| EfficientSAM | Apache-2.0 | Not run. Structurally *larger* than MobileSAM, which already fails by 28x. |
+| SAM 2 | Apache-2.0 | Not run. Heavier backbone than MobileSAM, plus dynamic control flow that exports badly. |
+| YOLACT | MIT | 2019 architecture, materially lower mask AP, same export blocker. |
+| SOLOv2 | Non-commercial | Ruled out on the first line of its LICENSE. |
+| RF-DETR-Seg | Apache-2.0 | Transformer. ~180ms for *detection only* at 320px — already 3x YOLO's full-mask cost. |
+
+So: **on everything actually measured, AGPL + YOLOv8n-seg is categorically the
+best quality/cost/size combination available.** The gap to the permissive
+alternatives is real and large, not a matter of taste.
+
+### RTMDet-Ins is worth exporting at the same time
+
+It is the one candidate not ruled out by evidence: Apache-2.0, CNN-based (the
+architecture family WASM/CPU actually handles), 5.6M params and 11.8 GFLOPs for
+the `tiny` variant — the same ballpark as YOLOv8n-seg, unlike everything else
+above. Nobody has measured it here because its export needs the same
+pickle-deserializing step as YOLO's.
+
+**If you are running the YOLO export anyway, run this one too** — identical
+risk profile, and it is the only path that could give comparable quality with a
+licence that can actually ship:
+
+```bash
+# In a disposable environment. Hand back ONLY the .onnx, never the .pth.
+pip install openmim && mim install mmdet mmdeploy
+python tools/deploy.py \
+  configs/mmdet/instance-seg/instance-seg_onnxruntime_static.py \
+  <rtmdet-ins-tiny config> <rtmdet-ins-tiny checkpoint.pth> \
+  <a test image> --device cpu
+mv end2end.onnx tools/video-sim/models/rtmdet-ins-tiny-320.onnx
+```
+
+Then compare the two under the same harness:
+
+```bash
+node tools/video-sim/run-seg.mjs video <clip> --model tools/video-sim/models/rtmdet-ins-tiny-320.onnx
+```
+
+`InstanceSegmenter.ts` was written model-path-agnostic on purpose, but RTMDet's
+output tensor layout differs from YOLO's, so the decode step will need adapting
+— budget for that rather than expecting a drop-in swap.
+
+### If RTMDet does not close the gap
+
+The remaining option is not technical: **licence Glassy itself under AGPL-3.0
+and publish its source.** The repository already exists publicly; for a
+prototype the cost is close to zero, and it unblocks the best model measured
+without accepting a quality regression. That is a decision for the project
+owner, not something to resolve in code.
