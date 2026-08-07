@@ -12,6 +12,15 @@ public/vision/
 tools/video-sim/.tmp/
 tools/video-sim/out/
 tools/video-sim/node_modules/
+# Prototype instance-segmentation ONNX models (see src/vision/experimental/) —
+# exported locally with the Ultralytics CLI, never committed, same reasoning
+# as public/vision/ below: these are binaries, not source.
+tools/video-sim/models/
+# Prototype-only ONNX Runtime Web wasm runtime — see scripts/fetch-seg-assets.mjs.
+tools/video-sim/ort/
+# Prototype test images (desk/beach, not real Glassy footage) — see the report.
+tools/video-sim/test-images/
+tools/video-sim/.tmp-seg-clips/
 
 # NOTE: public/demo/ IS committed. The demo clip is deliberately published —
 # it ships with the app so windscreen mode can be tried without a camera.

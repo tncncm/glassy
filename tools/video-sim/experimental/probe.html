@@ -1,0 +1,71 @@
+<!doctype html><html><body style="background:#111;color:#eee;font:12px monospace">
+<!--
+  EXPERIMENTAL / RESEARCH — dev-only diagnostic, never shipped.
+
+  Minimal, dependency-free isolation harness that reproduces a real
+  @mediapipe/tasks-vision@1.0.1 bug found while building the MagicTouch
+  interactive-segmenter prototype: `InteractiveSegmenterLegacy.
+  createFromOptions({ baseOptions: { modelAssetBuffer, delegate } })` throws
+  "INVALID_ARGUMENT: ExternalFile must specify at least one of 'file_content',
+  'file_name', ..." — even on a plain main-thread call, no worker, no
+  transfer involved. `{ baseOptions: { modelAssetPath, delegate } }` (letting
+  MediaPipe do its own same-origin fetch instead of handing it bytes we
+  already fetched) works fine. See magicTouchSegmenter.worker.ts's
+  SegWorkerInitMessage doc and the report for what this costs a real
+  integration (no byte-level download-progress reporting for this asset,
+  unlike the shipped detector).
+
+  Kept here, not deleted, as a standing repro in case a future
+  @mediapipe/tasks-vision upgrade is evaluated — run it via a small Playwright
+  driver against `/tools/video-sim/experimental/probe.html` and call
+  `window.__probe(modelUrl, useBuffer, delegate)` with `useBuffer: true`.
+-->
+<pre id="out">…</pre>
+<script type="module">
+import { FilesetResolver, InteractiveSegmenterLegacy } from '@mediapipe/tasks-vision';
+
+window.__probe = async (modelUrl, useBuffer, delegate) => {
+  const log = [];
+  try {
+    const fileset = await FilesetResolver.forVisionTasks('/vision/wasm');
+    log.push('fileset ok');
+    let baseOptions;
+    if (useBuffer) {
+      const resp = await fetch(modelUrl);
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      log.push('fetched bytes: ' + buf.byteLength);
+      baseOptions = { modelAssetBuffer: buf, delegate };
+    } else {
+      baseOptions = { modelAssetPath: modelUrl, delegate };
+    }
+    const seg = await InteractiveSegmenterLegacy.createFromOptions(fileset, {
+      baseOptions,
+      outputConfidenceMasks: true,
+      outputCategoryMask: false,
+    });
+    log.push('segmenter created OK');
+    const img = new Image();
+    img.src = '/tools/video-sim/.tmp/experimental/office_desk_laptop.jpg';
+    await img.decode();
+    log.push('image decoded ' + img.naturalWidth + 'x' + img.naturalHeight);
+    const result = seg.segment(img, { keypoint: { x: 0.365, y: 0.234 } });
+    log.push('segment() returned');
+    const mask = result.confidenceMasks?.[0];
+    log.push('mask: ' + (mask ? mask.width + 'x' + mask.height : 'none'));
+    if (mask) {
+      const arr = mask.getAsFloat32Array();
+      let sum = 0, max = 0;
+      for (const v of arr) { sum += v; if (v > max) max = v; }
+      log.push('mask mean=' + (sum/arr.length).toFixed(4) + ' max=' + max.toFixed(4));
+      mask.close();
+    }
+    result.close();
+    seg.close();
+  } catch (err) {
+    log.push('ERROR: ' + (err?.message ?? String(err)));
+    log.push(err?.stack ?? '');
+  }
+  document.getElementById('out').textContent = log.join('\n');
+  return log;
+};
+</script></body></html>

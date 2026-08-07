@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Glassy — MagicTouch segmenter probe (real driving footage)</title>
+    <style>
+      body { margin: 0; background: #05060a; color: #f4f6fb; font: 13px -apple-system, sans-serif; }
+      #wrap { position: relative; display: inline-block; }
+      video { display: block; max-width: 100vw; }
+      canvas { position: absolute; inset: 0; pointer-events: none; }
+      #hud { padding: 8px 12px; font-variant-numeric: tabular-nums; white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <video id="v" muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="hud">idle</div>
+
+    <script type="module">
+      /**
+       * EXPERIMENTAL / RESEARCH — dev-only diagnostic, never shipped.
+       *
+       * Runs the REAL, shipped ObjectDetector + DetectionTracker (unchanged)
+       * against recorded driving footage, and the EXPERIMENTAL
+       * MagicTouchSegmenter alongside it: every time a tracked object first
+       * reaches `stable`, this fires ONE segment() call at its box centre —
+       * exactly the brief's "segment once when an object first stabilises"
+       * design — then re-segments the same object every REFRESH_SECONDS
+       * while it stays alive, to measure the amortised/steady-state cost
+       * too. Also tags every EfficientDet inference sample with whether a
+       * MagicTouch segment call was in flight at that moment, so "do two
+       * CPU models resident at once fight each other" gets a measured
+       * answer instead of a guess.
+       *
+       * The video never leaves this machine — same discipline as
+       * tools/video-sim/index.html.
+       */
+      import { createObjectDetector } from '/src/vision/ObjectDetector.ts';
+      import { createMagicTouchSegmenter } from '/src/vision/experimental/MagicTouchSegmenter.ts';
+
+      const video = document.getElementById('v');
+      const overlay = document.getElementById('overlay');
+      const ctx = overlay.getContext('2d');
+      const hud = document.getElementById('hud');
+
+      const log = {
+        detectorInferenceCost: [], // { t, ms, magicTouchInFlight }
+        segmentEvents: [],         // { t, id, kind, reason: 'stabilise'|'refresh', ok, ms, roundTripMs, maskCoverage }
+        stabiliseCount: 0,
+      };
+      window.__simLog = log;
+      window.__simDone = false;
+
+      const REFRESH_SECONDS = 4;
+      const BITMAP_WIDTH = 512;
+
+      let tracked = [];
+      /** id -> { lastSegAt, mask, maskW, maskH, box: {x,y,w,h} at segmentation time } */
+      const objectState = new Map();
+      let magicTouchInFlight = 0;
+
+      const segmenter = createMagicTouchSegmenter({ delegate: 'CPU' });
+
+      async function segmentObject(obj, reason) {
+        magicTouchInFlight++;
+        const t0 = performance.now();
+        try {
+          const bw = BITMAP_WIDTH;
+          const bh = Math.round((bw * video.videoHeight) / video.videoWidth);
+          const bitmap = await createImageBitmap(video, { resizeWidth: bw, resizeHeight: bh, resizeQuality: 'medium' });
+          const result = await segmenter.segmentAt(bitmap, obj.x, obj.y);
+          const dt = performance.now() - t0;
+          if (result) {
+            let above = 0;
+            for (let i = 0; i < result.mask.length; i++) if (result.mask[i] >= 0.5) above++;
+            const coverage = above / result.mask.length;
+            objectState.set(obj.id, {
+              mask: result.mask, maskW: result.width, maskH: result.height,
+              box: { x: obj.x, y: obj.y, w: obj.width, h: obj.height },
+              lastSegAt: video.currentTime,
+            });
+            log.segmentEvents.push({
+              t: +video.currentTime.toFixed(2), id: obj.id, kind: obj.kind, reason,
+              ok: true, ms: +result.inferenceMs.toFixed(1), roundTripMs: +dt.toFixed(1),
+              maskCoverage: +coverage.toFixed(3),
+            });
+          } else {
+            log.segmentEvents.push({ t: +video.currentTime.toFixed(2), id: obj.id, kind: obj.kind, reason, ok: false, ms: null, roundTripMs: +dt.toFixed(1), maskCoverage: null });
+          }
+        } catch (err) {
+          log.segmentEvents.push({ t: +video.currentTime.toFixed(2), id: obj.id, kind: obj.kind, reason, ok: false, ms: null, roundTripMs: null, maskCoverage: null, error: String(err?.message ?? err) });
+        } finally {
+          magicTouchInFlight--;
+        }
+      }
+
+      const previouslyStable = new Set();
+
+      function draw() {
+        overlay.width = video.clientWidth;
+        overlay.height = video.clientHeight;
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        for (const o of tracked) {
+          const x = (o.x - o.width / 2) * overlay.width;
+          const y = (o.y - o.height / 2) * overlay.height;
+          const w = o.width * overlay.width;
+          const h = o.height * overlay.height;
+          ctx.strokeStyle = o.stable ? '#39ff88' : 'rgba(255,255,255,0.35)';
+          ctx.lineWidth = o.stable ? 2 : 1;
+          ctx.setLineDash(o.stable ? [] : [4, 4]);
+          ctx.strokeRect(x, y, w, h);
+          ctx.setLineDash([]);
+
+          const st = objectState.get(o.id);
+          if (st) {
+            // Draw the mask at the FIXED box it was computed against (no
+            // affine carry — this prototype judges mask quality, not a
+            // production "carry the mask with the moving box" renderer).
+            const off = document.createElement('canvas');
+            off.width = st.maskW;
+            off.height = st.maskH;
+            const octx = off.getContext('2d');
+            const imageData = octx.createImageData(st.maskW, st.maskH);
+            for (let i = 0; i < st.mask.length; i++) {
+              const conf = st.mask[i];
+              const o4 = i * 4;
+              imageData.data[o4] = 57; imageData.data[o4 + 1] = 255; imageData.data[o4 + 2] = 136;
+              imageData.data[o4 + 3] = conf >= 0.5 ? Math.round(150 * Math.min(1, conf * 1.2)) : 0;
+            }
+            octx.putImageData(imageData, 0, 0);
+            ctx.drawImage(off, 0, 0, overlay.width, overlay.height);
+          }
+
+          if (o.stable) {
+            ctx.fillStyle = '#39ff88';
+            ctx.font = 'bold 12px monospace';
+            ctx.fillText(`#${o.id} ${o.kind}${st ? ' [masked]' : ''}`, x + 3, y - 4);
+          }
+        }
+
+        hud.textContent =
+          `t=${video.currentTime.toFixed(1)}s/${(video.duration || 0).toFixed(1)}s  tracked=${tracked.length}  ` +
+          `stabilised(total)=${log.stabiliseCount}  segEvents=${log.segmentEvents.length}  magicTouchInFlight=${magicTouchInFlight}`;
+
+        if (!window.__simDone) requestAnimationFrame(draw);
+      }
+
+      const detector = createObjectDetector({
+        video,
+        sampleHz: 6,
+        onTrackedObjects: (objs) => {
+          tracked = objs.map((o) => ({ ...o }));
+          for (const o of tracked) {
+            if (o.stable && !previouslyStable.has(o.id)) {
+              previouslyStable.add(o.id);
+              log.stabiliseCount++;
+              void segmentObject(o, 'stabilise');
+            } else if (o.stable) {
+              const st = objectState.get(o.id);
+              if (st && video.currentTime - st.lastSegAt >= REFRESH_SECONDS) {
+                void segmentObject(o, 'refresh');
+              }
+            }
+          }
+          // Drop state for ids no longer present, so a reused id starts clean.
+          const liveIds = new Set(tracked.map((o) => o.id));
+          for (const id of [...previouslyStable]) if (!liveIds.has(id)) previouslyStable.delete(id);
+          for (const id of [...objectState.keys()]) if (!liveIds.has(id)) objectState.delete(id);
+        },
+        // Diagnostic-only escape hatch — see ObjectDetector.ts's
+        // ObjectDetectorDebugOptions. Tags every EfficientDet sample with
+        // whether MagicTouch had a segment call in flight at that instant.
+        onInferenceCostDebug: (ms) => {
+          log.detectorInferenceCost.push({ t: +video.currentTime.toFixed(2), ms: +ms.toFixed(2), magicTouchInFlight: magicTouchInFlight > 0 });
+        },
+      });
+
+      window.addEventListener('error', (e) => { (log.errors ??= []).push(String(e.message)); });
+
+      window.__simStart = async (src, playbackRate) => {
+        video.src = src;
+        await new Promise((res, rej) => {
+          video.onloadeddata = res;
+          video.onerror = () => rej(new Error('video failed to load'));
+        });
+        video.playbackRate = playbackRate ?? 1;
+
+        await segmenter.start();
+        await detector.start();
+
+        video.onended = () => {
+          detector.stop();
+          segmenter.dispose();
+          window.__simDone = true;
+        };
+
+        await video.play();
+        draw();
+        return { width: video.videoWidth, height: video.videoHeight, duration: video.duration };
+      };
+
+      window.__simFreezeAt = async (t) => {
+        window.__simFreeze = true;
+        video.pause();
+        await new Promise((res) => {
+          const done = () => { video.removeEventListener('seeked', done); res(); };
+          video.addEventListener('seeked', done);
+          video.currentTime = t;
+        });
+        // One extra draw at the parked frame so the overlay matches it.
+        draw();
+        return +video.currentTime.toFixed(3);
+      };
+      window.__simResume = async () => {
+        window.__simFreeze = false;
+        await video.play();
+        draw();
+      };
+    </script>
+  </body>
+</html>

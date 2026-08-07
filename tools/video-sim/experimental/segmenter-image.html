@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Glassy — MagicTouch interactive segmenter probe (static image)</title>
+    <style>
+      body { margin: 0; background: #05060a; color: #f4f6fb; font: 13px -apple-system, sans-serif; }
+      #wrap { position: relative; display: inline-block; }
+      img { display: block; max-width: 100vw; }
+      canvas { position: absolute; inset: 0; pointer-events: none; }
+      #hud { padding: 8px 12px; font-variant-numeric: tabular-nums; white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <div id="wrap">
+      <img id="src" />
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="hud">idle</div>
+
+    <script type="module">
+      /**
+       * EXPERIMENTAL / RESEARCH — dev-only diagnostic, never shipped. Runs
+       * the REAL src/vision/experimental/MagicTouchSegmenter.ts against a
+       * static image with a fixed list of point prompts, so "does a
+       * box-centre point actually recover the right silhouette" gets looked
+       * at instead of assumed. See src/vision/experimental/*.ts for the full
+       * privacy accounting — same discipline as the shipped detector.
+       *
+       * The image never leaves this machine — read from the local dev
+       * server (a stock/CC photo copied into the gitignored .tmp dir for
+       * this test only, never the shipped app's asset path) and analysed
+       * in-page exactly as a camera frame would be.
+       */
+      import { createMagicTouchSegmenter } from '/src/vision/experimental/MagicTouchSegmenter.ts';
+
+      const img = document.getElementById('src');
+      const overlay = document.getElementById('overlay');
+      const ctx = overlay.getContext('2d');
+      const hud = document.getElementById('hud');
+
+      const PALETTE = ['#39ff88', '#ff5d5d', '#5be8ff', '#ffe234', '#ff8a3d', '#c86bff', '#ff5dfa', '#7dd3ff'];
+
+      function drawMaskLayer(mask, maskW, maskH, color, threshold) {
+        // Build the mask as its own small ImageData (model's own output
+        // resolution), then let drawImage scale it onto the overlay — cheap
+        // and avoids a manual bilinear loop for a diagnostic tool.
+        const off = document.createElement('canvas');
+        off.width = maskW;
+        off.height = maskH;
+        const octx = off.getContext('2d');
+        const imageData = octx.createImageData(maskW, maskH);
+        const [r, g, b] = hexToRgb(color);
+        for (let i = 0; i < maskW * maskH; i++) {
+          const conf = mask[i] ?? 0;
+          const o = i * 4;
+          imageData.data[o] = r;
+          imageData.data[o + 1] = g;
+          imageData.data[o + 2] = b;
+          imageData.data[o + 3] = conf >= threshold ? Math.round(140 * Math.min(1, conf * 1.2)) : 0;
+        }
+        octx.putImageData(imageData, 0, 0);
+        return off;
+      }
+
+      function hexToRgb(hex) {
+        const n = parseInt(hex.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+      }
+
+      /**
+       * Runs one still image through N point prompts.
+       *   points: [{ name, x, y }] — x/y normalised 0..1
+       *   opts: { delegate, resizeWidth, concurrent, threshold }
+       */
+      window.__runImage = async (src, points, opts = {}) => {
+        const delegate = opts.delegate ?? 'CPU';
+        const resizeWidth = opts.resizeWidth ?? 512;
+        const threshold = opts.threshold ?? 0.5;
+        const concurrent = opts.concurrent === true;
+
+        img.src = src;
+        await new Promise((res, rej) => {
+          img.onload = res;
+          img.onerror = () => rej(new Error('image failed to load'));
+        });
+        overlay.width = img.naturalWidth;
+        overlay.height = img.naturalHeight;
+        img.style.width = img.naturalWidth + 'px';
+
+        const segmenter = createMagicTouchSegmenter({ delegate });
+        const loadStart = performance.now();
+        const status = await segmenter.start();
+        const loadMs = performance.now() - loadStart;
+        if (status !== 'ready') {
+          hud.textContent = `segmenter unavailable (status=${status})`;
+          return { status, loadMs, results: [] };
+        }
+
+        const resizeHeight = Math.round((resizeWidth * img.naturalHeight) / img.naturalWidth);
+
+        async function makeBitmap() {
+          return createImageBitmap(img, { resizeWidth, resizeHeight, resizeQuality: 'medium' });
+        }
+
+        const results = [];
+        const wallStart = performance.now();
+
+        if (concurrent) {
+          // Fire every prompt without waiting — the "several new objects
+          // appear on the same tick" worst case. The single worker still
+          // services them one at a time underneath (segment() is
+          // synchronous per call inside the worker's event loop), so this
+          // measures real queueing cost, not parallelism that doesn't exist.
+          const bitmaps = await Promise.all(points.map(() => makeBitmap()));
+          const promises = points.map((p, i) => segmenter.segmentAt(bitmaps[i], p.x, p.y));
+          const settled = await Promise.all(promises);
+          for (let i = 0; i < points.length; i++) results.push({ point: points[i], result: settled[i] });
+        } else {
+          for (const p of points) {
+            const bitmap = await makeBitmap();
+            const result = await segmenter.segmentAt(bitmap, p.x, p.y);
+            results.push({ point: p, result });
+          }
+        }
+        const wallMs = performance.now() - wallStart;
+
+        // Draw.
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+        const log = [];
+        for (let i = 0; i < results.length; i++) {
+          const { point, result } = results[i];
+          const color = PALETTE[i % PALETTE.length];
+          if (result) {
+            const layer = drawMaskLayer(result.mask, result.width, result.height, color, threshold);
+            ctx.drawImage(layer, 0, 0, overlay.width, overlay.height);
+          }
+          // Crosshair at the prompt point.
+          const px = point.x * overlay.width;
+          const py = point.y * overlay.height;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(px - 10, py);
+          ctx.lineTo(px + 10, py);
+          ctx.moveTo(px, py - 10);
+          ctx.lineTo(px, py + 10);
+          ctx.stroke();
+          ctx.fillStyle = color;
+          ctx.font = 'bold 13px monospace';
+          const label = result
+            ? `${point.name} q=${result.qualityScore.toFixed(2)} ${result.inferenceMs.toFixed(0)}ms`
+            : `${point.name} FAILED`;
+          ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+          ctx.lineWidth = 3;
+          ctx.strokeText(label, px + 12, py - 12);
+          ctx.fillText(label, px + 12, py - 12);
+
+          log.push({
+            name: point.name,
+            x: point.x,
+            y: point.y,
+            ok: !!result,
+            qualityScore: result?.qualityScore ?? null,
+            inferenceMs: result ? +result.inferenceMs.toFixed(1) : null,
+            roundTripMs: result ? +result.roundTripMs.toFixed(1) : null,
+            maskWidth: result?.width ?? null,
+            maskHeight: result?.height ?? null,
+          });
+        }
+
+        hud.textContent =
+          `delegate=${delegate}  loadMs=${loadMs.toFixed(0)}  points=${points.length}  ` +
+          `concurrent=${concurrent}  wallMs=${wallMs.toFixed(0)}  bitmap=${resizeWidth}x${resizeHeight}`;
+
+        segmenter.dispose();
+        window.__lastLog = { delegate, loadMs: +loadMs.toFixed(1), wallMs: +wallMs.toFixed(1), resizeWidth, resizeHeight, concurrent, points: log };
+        return window.__lastLog;
+      };
+    </script>
+  </body>
+</html>
